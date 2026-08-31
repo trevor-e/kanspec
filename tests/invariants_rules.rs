@@ -360,6 +360,14 @@ fn accepting_a_decision_rewrites_the_architecture_projection() {
         .contains("Sessions live in Redis"));
 }
 
+/// A committed generated file must be a pure function of the git-tracked sources of the
+/// same commit — otherwise two people on one SHA hold different bytes, and the file
+/// conflicts on merge and misleads in a PR diff.
+///
+/// Re-running `scan` proves only that the renderer is a function; it holds the disposable
+/// cache fixed, which is the input that actually differs between clones. So the second
+/// half wipes `cache/` AND deletes the projections, forcing a full regeneration from a
+/// cold cache, and demands the same bytes back. That is what a colleague's fresh clone is.
 #[test]
 fn regeneration_is_idempotent_so_a_checkout_does_not_dirty_the_tree() {
     let repo = TestRepo::new();
@@ -367,20 +375,151 @@ fn regeneration_is_idempotent_so_a_checkout_does_not_dirty_the_tree() {
     repo.ks(["scan"]).ok();
     repo.git(&["add", "-A"]);
     repo.git(&["commit", "--quiet", "-m", "projections"]);
+    let files = ["KANSPEC-FEATURES.md", "KANSPEC-ARCHITECTURE.md"];
 
     // The post-merge / post-checkout hooks run this on every checkout.
     repo.ks(["scan"]).ok();
     repo.ks(["scan"]).ok();
-    let dirty = repo.git(&[
-        "status",
-        "--porcelain",
-        "--",
-        "KANSPEC-FEATURES.md",
-        "KANSPEC-ARCHITECTURE.md",
-    ]);
+    let dirty = repo.git(&["status", "--porcelain", "--", files[0], files[1]]);
     assert!(
         dirty.trim().is_empty(),
         "a scan that changed nothing rewrote the projections: {dirty}"
+    );
+
+    // Now the harder half: the same commit, on a machine that has never scanned.
+    std::fs::remove_dir_all(repo.root.join(".kanspec/cache")).expect("a cache to wipe");
+    for f in files {
+        std::fs::remove_file(repo.root.join(f)).unwrap();
+    }
+    // A knowledge verb, NOT `scan` — so nothing repopulates the cache first and the
+    // renderer really does run against an empty `GitState`.
+    repo.ks([
+        "quirk",
+        "add",
+        "Webhook retries are not idempotent",
+        "--paths",
+        "src/billing/**",
+        "--sev",
+        "landmine",
+    ])
+    .ok();
+    let dirty = repo.git(&["status", "--porcelain", "--", files[0]]);
+    assert!(
+        dirty.trim().is_empty(),
+        "the same commit regenerated different bytes with a cold cache — a committed \
+         projection may not depend on `cache/gitstate.json`:\n{}\n{dirty}",
+        repo.git(&["diff", "--", files[0]])
+    );
+    let features = repo.read(files[0]);
+    for cache_state in ["never scanned", "dead globs", "STALE:"] {
+        assert!(
+            !features.contains(cache_state),
+            "`{cache_state}` is disposable cache state and cannot be committed:\n{features}"
+        );
+    }
+}
+
+/// D-20, mechanically: a handler that writes a spec, a decision or a quirk must also
+/// republish the pages those entities are projected onto.
+///
+/// A grep, because this half of the rule is not observable from outside *today*: `done`
+/// mints its quirks `gotcha` and its decisions `proposed`, and neither grade reaches
+/// `KANSPEC-ARCHITECTURE.md` — so a behavioural test would have passed while the wiring was
+/// missing, and would have kept passing right up until the day `render_architecture`
+/// widened by one line and a landmine captured at close-out went unpublished. The rule is
+/// structural, so the check is. Read off the directory rather than a hand-kept list,
+/// because a hand-kept list is the thing that drifts.
+#[test]
+fn every_handler_that_writes_a_projected_entity_republishes_the_projections() {
+    // `CARGO_MANIFEST_DIR` is baked in at compile time, so this cannot pass by looking in
+    // the wrong tree.
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
+    let mut checked: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .expect("src/cmd is readable")
+        .flatten()
+    {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "rs") {
+            continue;
+        }
+        let src = std::fs::read_to_string(&path).expect("a readable handler");
+        let touches_a_projected_entity = ["Spec(", "Decision(", "Quirk("]
+            .iter()
+            .any(|t| src.contains(&format!("EntityRef::{t}")));
+        if !touches_a_projected_entity {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        checked.push(name.clone());
+        if !src.contains("project::regenerate(") {
+            missing.push(name);
+        }
+    }
+    assert!(
+        checked.len() >= 4,
+        "the scan stopped finding handlers — it found {checked:?}"
+    );
+    assert!(
+        missing.is_empty(),
+        "{} change a spec, a decision or a quirk without republishing \
+         KANSPEC-FEATURES.md / KANSPEC-ARCHITECTURE.md, so the committed page rots until \
+         somebody happens to run `scan`",
+        missing.join(", ")
+    );
+}
+
+/// The behavioural half of the same rule. DESIGN.md's sanctioned workflow edits specs on
+/// the implementation branch and reviews them as an ordinary diff: if only `scan`
+/// republished the map, the reviewer of that very PR would read the old prose. The `scan`
+/// path is covered further up; this is the verb path, and what it really asserts is that
+/// the projection lands in the SAME `git status` as the source that moved it.
+#[test]
+fn a_knowledge_verb_republishes_the_root_projections_without_waiting_for_a_scan() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--quiet", "-m", "seed"]);
+
+    repo.ks([
+        "spec",
+        "new",
+        "search",
+        "--feature",
+        "Full-text search over tickets",
+        "--code",
+        "src/search/**",
+    ])
+    .ok();
+    let features = repo.read("KANSPEC-FEATURES.md");
+    assert!(
+        features.contains("Full-text search over tickets"),
+        "a brand-new spec is missing from the committed map until someone scans:\n{features}"
+    );
+    // …and it is dirty in the SAME `git status` the spec is, which is the whole point: the
+    // reviewer of this branch sees both files in one diff.
+    let dirty = repo.git(&["status", "--porcelain"]);
+    assert!(dirty.contains("KANSPEC-FEATURES.md"), "{dirty}");
+    assert!(dirty.contains(".kanspec/specs/search.md"), "{dirty}");
+
+    // A quirk retired through a verb leaves the architecture page too.
+    let listed: serde_json::Value = repo.json(&["quirks", "--paths", "src/billing/**"]);
+    let qid = listed["rows"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the seeded landmine should be listed: {listed}"))
+        .to_string();
+    let ticket: serde_json::Value = repo.json(&["new", "Make webhook handling idempotent"]);
+    let tid = ticket["id"].as_str().expect("the minted id").to_string();
+    assert!(repo
+        .read("KANSPEC-ARCHITECTURE.md")
+        .contains("Stripe webhooks replay in staging"));
+    repo.ks(["quirk", "fix", &qid, "--by", &tid]).ok();
+    assert!(
+        !repo
+            .read("KANSPEC-ARCHITECTURE.md")
+            .contains("Stripe webhooks replay in staging"),
+        "a retired landmine still warns the team from the committed page"
     );
 }
 

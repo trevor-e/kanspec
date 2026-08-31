@@ -398,6 +398,39 @@ fn trace(method: Method, cmd: &str, exit: i32, saw: &str, verdict: &'static str)
     }
 }
 
+/// What the `cmd` column says when the rung ran no command at all. Deliberately not
+/// command-shaped: `--explain` is read as a list of things that were done, and a line in
+/// that list that was never done is the defect this constant exists to prevent.
+const NOT_QUERIED: &str = "(gh not queried)";
+
+/// Rung 2's trace when `gh` declined **before a query was ever spawned**.
+///
+/// [`Gh::available`] collapses three different refusals into one `false` — `[git] gh =
+/// "never"`, an `origin` `gh` cannot speak for, and a `gh auth status` that failed or
+/// found no `gh` — and this rung used to report the third for all three. `--explain` is
+/// the audit surface a user reads *precisely* when the tool has disappointed them, so that
+/// is the worst possible place to guess: told `gh auth status / exit 1 / unavailable`, a
+/// user whose config says `never`, or whose origin is GitLab, runs `gh auth status`
+/// themselves, watches it exit 0, and concludes kanspec is lying about the rest too.
+///
+/// So the reason is READ BACK from the gate every live query starts with, in `gh`'s own
+/// words, instead of being restated here where it can drift. With `available()` false that
+/// gate refuses from config plus an already-cached probe: it spawns nothing, reads no
+/// fixture, and costs exactly what the hardcoded string it replaces cost.
+fn gh_declined(gh: &Gh, t: &Ticket) -> RungTrace {
+    let refused = match (t.fm.pr, t.fm.branch.as_deref()) {
+        (Some(n), _) => gh.pr_view(n).map(|_| ()),
+        (None, b) => gh.pr_for_head(b.unwrap_or_default()).map(|_| ()),
+    };
+    let why = match refused {
+        Err(GhUnavailable(why)) => why,
+        // Unreachable while `available()` is false — the gate refuses first. If that ever
+        // stops being true, say so rather than inventing a reason for the audit trail.
+        Ok(()) => "`gh` declined without saying why".to_string(),
+    };
+    trace(Method::GhPr, NOT_QUERIED, 1, &why, "inconclusive")
+}
+
 /// THE LADDER, in the recon-corrected order. Every rung returns a verdict; **exit 128
 /// anywhere is Unknown, never No.**
 ///
@@ -584,13 +617,7 @@ pub fn ladder(
             },
         }
     } else {
-        tr.push(trace(
-            Method::GhPr,
-            "gh auth status",
-            1,
-            "unavailable",
-            "inconclusive",
-        ));
+        tr.push(gh_declined(gh, t));
     }
 
     // ── rung 3: TRAILER — unanchored + boundary-terminated ───────────────────
@@ -1060,6 +1087,7 @@ fn confirm_note_sha(note: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::gh::GhCfg;
     use crate::logentry::LogEntry;
     use crate::transitions::State;
 
@@ -1205,6 +1233,99 @@ mod tests {
             .note
             .unwrap()
             .contains("github squash, verified by hand"));
+    }
+
+    // ── rung 2's silence has three different reasons ─────────────────────────
+
+    /// A real repo whose branch is genuinely not on `main`, so the ladder falls past rung 1
+    /// and actually reaches rung 2. `origin` is a host `gh` cannot speak for, so nothing
+    /// here depends on whether THIS machine happens to be logged into GitHub.
+    fn repo_off_main(dir: &std::path::Path) -> (crate::git::Git, Ticket) {
+        let git = crate::git::Git::bind(dir);
+        let sh = |args: &[&str]| {
+            let out = git.run(args).expect("git runs");
+            assert_eq!(out.code, 0, "git {args:?}: {}", out.err);
+            out.out
+        };
+        sh(&["init", "--quiet", "--initial-branch=main", "."]);
+        for (k, v) in [
+            ("user.email", "t@kanspec.invalid"),
+            ("user.name", "t"),
+            ("commit.gpgsign", "false"),
+        ] {
+            sh(&["config", k, v]);
+        }
+        sh(&["remote", "add", "origin", "https://gitlab.com/acme/x.git"]);
+        sh(&["commit", "--quiet", "--allow-empty", "-m", "base"]);
+        sh(&["checkout", "--quiet", "-b", "ks/t-9c41-thing"]);
+        sh(&["commit", "--quiet", "--allow-empty", "-m", "work"]);
+
+        let mut t = ticket("t-9c41");
+        t.fm.branch = Some("ks/t-9c41-thing".into());
+        t.fm.head = Some(sh(&["rev-parse", "HEAD"]).trim().to_string());
+        (git, t)
+    }
+
+    /// `--explain` is the surface a user reads *precisely* when the ladder has already
+    /// disappointed them, so it is the worst possible place to guess. Rung 2 used to
+    /// report `gh auth status / exit 1 / unavailable` for all three of `gh`'s refusals: a
+    /// user on `gh = "never"` or a GitLab origin would run `gh auth status`, watch it exit
+    /// 0, and conclude the tool was lying about the rest too.
+    #[test]
+    fn a_declining_gh_reports_its_real_reason_and_names_no_command_it_did_not_run() {
+        assert!(
+            std::env::var_os("KANSPEC_GH_FIXTURES").is_none(),
+            "this test asserts the un-mocked gate; unset KANSPEC_GH_FIXTURES to run it"
+        );
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (git, t) = repo_off_main(dir.path());
+
+        // Read off the REAL ladder, not off the helper: the rung is what has to tell the
+        // truth, and wiring it back to a hardcoded string must fail here.
+        let rung2 = |gh: &Gh| {
+            let d = ladder(&git, gh, &t, "main", None, at());
+            d.explain()
+                .iter()
+                .find(|r| r.method == Method::GhPr)
+                .unwrap_or_else(|| panic!("the ladder never reached rung 2: {:?}", d.explain()))
+                .clone()
+        };
+
+        // 1. the POLICY. Nothing was asked of `gh`, and nothing was asked about auth.
+        let never = Gh::detect(&git, &GhCfg::Never);
+        assert!(!never.available());
+        let policy = rung2(&never);
+        assert!(policy.saw.contains(r#"gh = "never""#), "{}", policy.saw);
+
+        // 2. the REMOTE. Also not an auth problem, and also not the same sentence.
+        let elsewhere = Gh::detect(&git, &GhCfg::Auto);
+        assert!(!elsewhere.available());
+        let remote = rung2(&elsewhere);
+        assert!(remote.saw.contains("not a GitHub remote"), "{}", remote.saw);
+        assert_ne!(
+            policy.saw, remote.saw,
+            "three refusals collapsed back into one message"
+        );
+
+        for tr in [&policy, &remote] {
+            // Invariant 2: a `gh` that would not answer is never a NO.
+            assert_eq!(tr.verdict, "inconclusive");
+            assert_eq!(
+                tr.cmd, NOT_QUERIED,
+                "the audit trail may not name a command that was not run"
+            );
+            assert!(
+                !tr.cmd.contains("auth status") && !tr.saw.contains("unavailable"),
+                "the hardcoded auth guess is back: {tr:?}"
+            );
+        }
+
+        // The other arm of the query — no PR number — explains itself the same way, and a
+        // ticket with neither a PR nor a branch still gets a reason rather than a shrug.
+        let mut with_pr = t.clone();
+        with_pr.fm.pr = Some(142);
+        assert_eq!(gh_declined(&never, &with_pr).saw, policy.saw);
+        assert_eq!(gh_declined(&never, &ticket("t-dddd")).saw, policy.saw);
     }
 
     #[test]

@@ -96,20 +96,30 @@ fn title_of(md: &str) -> String {
 // The agent contract snippet
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// DESIGN.md's agent contract, verbatim. Ten lines of permanent context: everything
-/// longer lives behind `kanspec instructions` and versions with the binary.
+/// DESIGN.md's agent contract. Ten lines of permanent context: everything longer lives
+/// behind `kanspec instructions` and versions with the binary.
 ///
 /// Do not "improve" the wording without changing DESIGN.md first — this text is the
 /// product's entire behavioural contract with an agent, and it was written to be short
 /// enough that nobody deletes it to save tokens.
+///
+/// **One deliberate deviation from DESIGN.md's block, reported to F.** DESIGN.md's snippet
+/// prescribes `kanspec comments --unresolved --json` and `kanspec comment resolve <cm-id>
+/// --note "…"`. Both are v0.2: `#[command(hide = true)]`, absent from `--help`, and they
+/// exit 1. A contract is only worth its most obeyed line, and every session that followed
+/// this one literally hit a refusal on the first command it ran from it — which is how an
+/// agent learns to stop trusting the whole block. The line is replaced by `kanspec status`,
+/// which is the v0.1 verb that actually answers "what do I owe next"; the review pair
+/// returns here when `comments`/`comment` ship. `setup.rs`'s
+/// `the_snippet_only_prescribes_commands_the_binary_actually_has` walks the clap tree and
+/// fails the build if a hidden or non-existent verb ever creeps back in.
 const AGENT_SNIPPET: &str = r#"## kanspec
 This repo tracks work, specs, and standing rules with kanspec. `kanspec prime` is auto-injected
 at session start; run it yourself if context feels missing.
 - Find work: `kanspec ready --json`. Claim before coding: `kanspec start <id>` (creates branch/worktree).
 - Diff ready: `kanspec ship <id> --pr <n>`. Finish: `kanspec done <id>` — it will gate you; answer its flags.
 - Never state whether something is merged. Merge state is git-detected; report `kanspec show <id>` output.
-- Review feedback is work: `kanspec comments --unresolved --json`; address each item, then
-  `kanspec comment resolve <cm-id> --note "what changed"`.
+- Unsure what you owe, or whether you are stuck: `kanspec status` — every line names its own fix.
 - Standing rules are `kanspec rules` output ONLY. Closed proposals bind nothing — never read
   .kanspec/proposals/closed/. Never edit an accepted decision; propose one with `kanspec decide`.
 - Out-of-scope work you uncover (>5 min): `kanspec new "..."` — one command; it auto-links

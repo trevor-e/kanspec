@@ -166,6 +166,12 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     let committed = Store::open(ctx).transact(Some(Verb::Done), &ctx.invocation(), |s, m| {
         plan_done(s, &f, &triage, a, m)
     })?;
+    // D-20. The knowledge checkpoint above mints quirks and decisions, so `done` is a verb
+    // that mutates the sources `KANSPEC-ARCHITECTURE.md` is projected from — and it is the
+    // LAST verb of the daily loop, so a landmine captured here would otherwise sit unseen
+    // in the committed page until somebody happened to run `scan`. See
+    // `project::regenerate` for why this is a second transaction rather than more ops.
+    crate::project::regenerate(ctx)?;
 
     // ── step 4: what the close-out actually produced ─────────────────────────
     let snap = &committed.snapshot;
