@@ -89,6 +89,82 @@ pub struct NewDecision {
     pub scope: Vec<String>,
 }
 
+/// The answers ALREADY supplied, re-rendered as flags, with a leading space when non-empty.
+///
+/// Every `done` gate suggests the flag that answers IT. Suggesting that flag alone is a
+/// command that discards every answer already given, and the gates are checked in order, so
+/// the advice rang:
+///
+/// ```text
+/// $ kanspec done t-9c41                   ✗ followups_unanswered → done t-9c41 --no-followups
+/// $ kanspec done t-9c41 --no-followups    ✗ quirks_unanswered    → done t-9c41 --no-quirks
+/// $ kanspec done t-9c41 --no-quirks       ✗ followups_unanswered → done t-9c41 --no-followups
+/// ```
+///
+/// A human sees the loop on the third line; an agent whose contract is "run the suggested
+/// command" does not, and this is the ORDINARY close-out, not an edge case. So every
+/// suggestion below is built as *what you already said* + *the answer this gate wants*.
+///
+/// `adds` names the flags the suggestion is about to append, because three pairs are
+/// declared `conflicts_with` in `cli.rs` — `--spawn`/`--no-followups`,
+/// `--quirk`/`--no-quirks`, `--decision`/`--no-decisions`. Carrying the negative into a
+/// suggestion that supplies the positive would emit a command clap REFUSES, which is a
+/// worse failure than the ring: it does not even parse.
+fn carried(a: &DoneArgs, adds: &[&str]) -> String {
+    // Symmetric: naming either half suppresses the other.
+    const OPPOSED: &[(&str, &str)] = &[
+        ("--spawn", "--no-followups"),
+        ("--quirk", "--no-quirks"),
+        ("--decision", "--no-decisions"),
+    ];
+    let blocked = |flag: &str| {
+        adds.iter().any(|add| {
+            OPPOSED
+                .iter()
+                .any(|(x, y)| (*x == flag && *y == *add) || (*y == flag && *x == *add))
+        })
+    };
+
+    let mut f: Vec<String> = Vec::new();
+    for (name, on) in [
+        ("--no-followups", a.no_followups),
+        ("--no-quirks", a.no_quirks),
+        ("--no-decisions", a.no_decisions),
+        ("--no-code", a.no_code),
+    ] {
+        if on && !blocked(name) {
+            f.push(name.to_string());
+        }
+    }
+    for (name, vals) in [
+        ("--spawn", &a.spawn),
+        ("--drop-step", &a.drop_step),
+        ("--quirk", &a.quirk),
+        ("--quirk-paths", &a.quirk_paths),
+        ("--decision", &a.decision),
+    ] {
+        if blocked(name) {
+            continue;
+        }
+        for v in vals {
+            f.push(format!("{name} \"{v}\""));
+        }
+    }
+    for n in &a.actually_done {
+        f.push(format!("--actually-done {n}"));
+    }
+    for (name, v) in [("--spec-unchanged", &a.spec_unchanged), ("--why", &a.why)] {
+        if let Some(v) = v {
+            f.push(format!("{name} \"{v}\""));
+        }
+    }
+    if f.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", f.join(" "))
+    }
+}
+
 impl Triage {
     /// Non-interactive. REFUSES with a typed error naming BOTH flags when neither
     /// `--spawn` nor `--no-followups` is present: clap cannot express "required iff
@@ -115,8 +191,14 @@ impl Triage {
                      even if none does"
                 ),
                 fixes![
-                    fix!("kanspec done {id} --no-followups"),
-                    fix!("kanspec done {id} --spawn \"what is left\""),
+                    fix!(
+                        "kanspec done {id}{} --no-followups",
+                        carried(a, &["--no-followups"])
+                    ),
+                    fix!(
+                        "kanspec done {id}{} --spawn \"what is left\"",
+                        carried(a, &["--spawn"])
+                    ),
                     fix!("kanspec show {id}"),
                 ],
             ));
@@ -129,8 +211,14 @@ impl Triage {
                      whether you hit one"
                 ),
                 fixes![
-                    fix!("kanspec done {id} --no-quirks"),
-                    fix!("kanspec done {id} --quirk \"what bites\" --quirk-paths \"src/**\""),
+                    fix!(
+                        "kanspec done {id}{} --no-quirks",
+                        carried(a, &["--no-quirks"])
+                    ),
+                    fix!(
+                        "kanspec done {id}{} --quirk \"what bites\" --quirk-paths \"src/**\"",
+                        carried(a, &["--quirk"])
+                    ),
                 ],
             ));
         }
@@ -145,8 +233,8 @@ impl Triage {
                 scope: default_scope(touched, s),
             })
             .collect();
-        let spec = spec_check(t, a.spec_unchanged.as_deref(), touched, s)?;
-        assemble(t, steps, quirks, decisions, spec)
+        let spec = spec_check(t, a.spec_unchanged.as_deref(), touched, s, a)?;
+        assemble(t, steps, quirks, decisions, spec, a)
     }
 
     /// Interactive. Same value, prompted one key at a time.
@@ -198,7 +286,7 @@ impl Triage {
         // ── the knowledge checkpoint ─────────────────────────────────────────
         let matched = specs_matching(touched, s);
         let edited = specs_edited(touched, s);
-        let spec = match spec_check(t, a.spec_unchanged.as_deref(), touched, s) {
+        let spec = match spec_check(t, a.spec_unchanged.as_deref(), touched, s, a) {
             Ok(c) => {
                 if let SpecCheck::EditedOnBranch { specs } = &c {
                     io.say(&format!(
@@ -275,7 +363,7 @@ impl Triage {
             }
         }
 
-        assemble(t, steps, quirks, decisions, spec)
+        assemble(t, steps, quirks, decisions, spec, a)
     }
 
     /// Which specs the branch's changed paths belong to — the input to both front doors.
@@ -340,6 +428,10 @@ fn assemble(
     quirks: Vec<NewQuirk>,
     decisions: Vec<NewDecision>,
     spec: SpecCheck,
+    // The answers already supplied. These gates all fire AFTER the followups and quirks
+    // gates have passed, so a suggestion that named only its own flag would discard the two
+    // answers that got the caller this far and ring straight back. See [`carried`].
+    a: &DoneArgs,
 ) -> Result<Triage> {
     let id = &t.fm.id;
     let open = unchecked(t);
@@ -389,9 +481,18 @@ fn assemble(
                 if orphans.len() == 1 { "" } else { "s" }
             ),
             fixes![
-                fix!("kanspec done {id} --spawn \"what is left\""),
-                fix!("kanspec done {id} --drop-step \"{first}:superseded\""),
-                fix!("kanspec done {id} --actually-done {first}"),
+                fix!(
+                    "kanspec done {id}{} --spawn \"what is left\"",
+                    carried(a, &["--spawn"])
+                ),
+                fix!(
+                    "kanspec done {id}{} --drop-step \"{first}:superseded\"",
+                    carried(a, &["--drop-step"])
+                ),
+                fix!(
+                    "kanspec done {id}{} --actually-done {first}",
+                    carried(a, &["--actually-done"])
+                ),
             ],
         ));
     }
@@ -401,7 +502,10 @@ fn assemble(
             StepDisposition::Spawn { title, .. } if title.trim().is_empty() => {
                 return Err(KsError::invalid(
                     format!("{id}: a spawned followup needs a title"),
-                    fixes![fix!("kanspec done {id} --spawn \"what is left\"")],
+                    fixes![fix!(
+                        "kanspec done {id}{} --spawn \"what is left\"",
+                        carried(a, &["--spawn"])
+                    )],
                 ))
             }
             StepDisposition::Drop { index, why } if why.trim().is_empty() => {
@@ -409,7 +513,8 @@ fn assemble(
                     "step_dropped_without_reason",
                     format!("{id}: step {index} was dropped without a reason"),
                     fixes![fix!(
-                        "kanspec done {id} --drop-step \"{index}:why it will never be done\""
+                        "kanspec done {id}{} --drop-step \"{index}:why it will never be done\"",
+                        carried(a, &["--drop-step"])
                     )],
                 ))
             }
@@ -421,7 +526,10 @@ fn assemble(
         if q.title.trim().is_empty() {
             return Err(KsError::invalid(
                 format!("{id}: a quirk needs a title"),
-                fixes![fix!("kanspec done {id} --quirk \"what bites\"")],
+                fixes![fix!(
+                    "kanspec done {id}{} --quirk \"what bites\"",
+                    carried(a, &["--quirk"])
+                )],
             ));
         }
         // A quirk with no paths never fires: the PostToolUse hook and `prime` both reach
@@ -435,7 +543,8 @@ fn assemble(
                     q.title
                 ),
                 fixes![fix!(
-                    "kanspec done {id} --quirk \"{}\" --quirk-paths \"src/**\"",
+                    "kanspec done {id}{} --quirk \"{}\" --quirk-paths \"src/**\"",
+                    carried(a, &["--quirk"]),
                     q.title
                 )],
             ));
@@ -446,7 +555,10 @@ fn assemble(
         if d.title.trim().is_empty() {
             return Err(KsError::invalid(
                 format!("{id}: a decision needs a title"),
-                fixes![fix!("kanspec done {id} --decision \"what was decided\"")],
+                fixes![fix!(
+                    "kanspec done {id}{} --decision \"what was decided\"",
+                    carried(a, &["--decision"])
+                )],
             ));
         }
     }
@@ -572,6 +684,8 @@ fn spec_check(
     waiver: Option<&str>,
     touched: &[ChangedPath],
     s: &Snapshot,
+    // The answers already supplied — this gate is reached last of all. See [`carried`].
+    a: &DoneArgs,
 ) -> Result<SpecCheck> {
     let id = &t.fm.id;
     let matched = specs_matching(touched, s);
@@ -602,7 +716,10 @@ fn spec_check(
         ),
         fixes![
             fix!("edit .kanspec/specs/{}.md on this branch", first.as_str()),
-            fix!("kanspec done {id} --spec-unchanged \"no behaviour change\""),
+            fix!(
+                "kanspec done {id}{} --spec-unchanged \"no behaviour change\"",
+                carried(a, &["--spec-unchanged"])
+            ),
             fix!("kanspec spec show {}", first.as_str()),
         ],
     ))
@@ -866,6 +983,93 @@ mod tests {
             Ok(t) => panic!("expected a refusal, got {t:?}"),
             Err(e) => e.code().unwrap_or(e.kind()),
         }
+    }
+
+    /// `"a b"` is one argument.
+    fn split(cmd: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let (mut q, mut any) = (false, false);
+        for c in cmd.chars() {
+            match c {
+                '"' => {
+                    q = !q;
+                    any = true;
+                }
+                ' ' if !q => {
+                    if any || !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        any = false;
+                    }
+                }
+                _ => cur.push(c),
+            }
+        }
+        if any || !cur.is_empty() {
+            out.push(cur);
+        }
+        out
+    }
+
+    /// THE regression. Each `done` gate suggests the flag that answers IT; when the
+    /// suggestion named only that flag it discarded every answer already given, and since
+    /// the gates are checked in order the advice rang:
+    ///
+    /// ```text
+    /// done t-9c41                  → done t-9c41 --no-followups
+    /// done t-9c41 --no-followups   → done t-9c41 --no-quirks      ← drops --no-followups
+    /// done t-9c41 --no-quirks      → done t-9c41 --no-followups   ← step 2 again, for ever
+    /// ```
+    ///
+    /// Verified on the REAL binary over a genuinely merged ticket before the fix: this is
+    /// the ordinary daily close-out, not an edge case. The property is not "each arrow
+    /// parses" (`tests/cli_well_formed.rs` owns that) but that FOLLOWING them terminates.
+    #[test]
+    fn following_the_suggested_fix_through_the_done_gates_terminates() {
+        // A ticket with an unchecked step, so the step gate is reached too and the walk
+        // passes through more than the two flag gates.
+        let t = ticket(&[(false, "wire the thing")]);
+        let s = snap_with_spec();
+        let touched = changed(&["src/auth/login.rs"]);
+
+        let mut extra: Vec<String> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut trail = String::new();
+        for step in 1..=10 {
+            let key = extra.join(" ");
+            trail.push_str(&format!("\n  {step}. kanspec done t-9c41 {key}"));
+            assert!(
+                !seen.contains(&key),
+                "the `done` gates ring — an agent whose contract is \"run the suggested \
+                 command\" never gets out:{trail}"
+            );
+            seen.push(key);
+
+            let a = args(&extra.iter().map(String::as_str).collect::<Vec<_>>());
+            let e = match Triage::from_args(&t, &a, &touched, &s) {
+                // Terminated in a SUCCESS, not merely by giving up.
+                Ok(_) => {
+                    assert!(
+                        step > 1,
+                        "the fixture refused nothing — the walk proved nothing"
+                    );
+                    return;
+                }
+                Err(e) => e,
+            };
+            trail.push_str(&format!("\n       ✗ {}", e.code().unwrap_or(e.kind())));
+
+            // What an agent does: run the first suggestion that is a `done` command.
+            let next = e
+                .fixes()
+                .iter()
+                .map(|f| f.as_str().to_string())
+                .find(|f| f.starts_with("kanspec done t-9c41"))
+                .unwrap_or_else(|| panic!("no `done` suggestion to follow:{trail}"));
+            trail.push_str(&format!("\n       → {next}"));
+            extra = split(&next).split_off(3);
+        }
+        panic!("the suggested fixes did not terminate in 10 steps:{trail}");
     }
 
     /// The binding correction, as a test: an omission is not a claim.

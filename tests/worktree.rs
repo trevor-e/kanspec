@@ -629,7 +629,11 @@ fn the_sync_fix_is_runnable_from_a_linked_worktree_and_names_the_projections() {
         .current_dir(&wt)
         .output()
         .unwrap();
-    assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+    assert!(
+        ran.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
     let after = repo.ks_in(&wt, ["status", "--json"]);
     let v2: serde_json::Value = serde_json::from_str(&after.stdout).unwrap();
     assert_eq!(

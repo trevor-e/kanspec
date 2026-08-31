@@ -668,22 +668,28 @@ impl Git {
         if e.contains("already used by worktree at") {
             return Err(KsError::conflict(
                 format!("branch `{branch}` is checked out in another worktree"),
-                fixes![fix!("git worktree list"), fix!("kanspec where {branch}"),],
+                // `where` takes `--branch <BRANCH>`, never a positional — the spelling the
+                // sibling refusal in `cmd/flow.rs::create_branch` already gets right.
+                fixes![
+                    fix!("git worktree list"),
+                    fix!("kanspec where --branch {branch}"),
+                ],
             ));
         }
         if e.contains("a branch named") && e.contains("already exists") {
             return Err(KsError::conflict(
                 format!("branch `{branch}` already exists"),
-                fixes![
-                    fix!("git branch -D {branch}"),
-                    fix!("kanspec start --no-worktree"),
-                ],
+                // There is no `--no-worktree` flag: a worktree is opt-in via `--worktree`
+                // (`cmd/flow.rs` branches on `a.worktree` alone), so claiming WITHOUT the
+                // flag is the "no worktree" path and reuses the branch that already exists.
+                fixes![fix!("git branch -D {branch}"), fix!("kanspec start <id>"),],
             ));
         }
         if e.contains("already exists") {
             return Err(KsError::conflict(
                 format!("{p} already exists and is not empty"),
-                fixes![fix!("rm -rf {p}"), fix!("kanspec start --no-worktree")],
+                // Same phantom flag as above: plain `start` is the no-worktree claim.
+                fixes![fix!("rm -rf {p}"), fix!("kanspec start <id>")],
             ));
         }
         Err(self.git_err(format!("cannot create worktree: {e}"), cmd, o.code, &o.err))

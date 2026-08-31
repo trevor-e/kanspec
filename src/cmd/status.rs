@@ -120,6 +120,15 @@ pub fn status(ctx: &Ctx, a: &StatusArgs) -> Result<StatusReport> {
     // into a linked one — where a bare `git add` finds a clean tree, exits 1, and leaves
     // the primary dirty. The remediation has to name the tree it applies to.
     let sync_fix = {
+        // DO NOT "fix" the `kanspec` in `-m "kanspec: sync"` or in the `.kanspec` pathspec
+        // when the D-44 sweep routes the remaining hardcoded command strings through
+        // `invoked_as()`. Neither is a command word: one is a commit MESSAGE and the other
+        // is a directory that is spelled `.kanspec` for a `ks` user too. `out::spoken`
+        // rewrites only in command position precisely so it cannot reach them, and
+        // `spoken_rewrites_the_command_word_and_nothing_else` pins both against a naive
+        // `replace`. This string is a report field, not a `Fix`, so nothing rewrites it at
+        // all today.
+        //
         // Name a projection only when it is on disk: `git add` treats a pathspec matching
         // neither a file nor an index entry as fatal, so advice that named an
         // ungenerated projection would abort before staging anything at all.

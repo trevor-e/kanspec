@@ -534,7 +534,11 @@ fn worktree_add_classifies_its_failures_by_stderr_not_by_exit_code() {
 fn dirty_kanspec_counts_pending_tracker_changes_and_ignores_the_cache() {
     let repo = TestRepo::new();
     let ctx = common::ctx_at(&repo.root);
-    assert_eq!(ctx.git.dirty_kanspec(&[]).unwrap(), 0, "the fixture is clean");
+    assert_eq!(
+        ctx.git.dirty_kanspec(&[]).unwrap(),
+        0,
+        "the fixture is clean"
+    );
 
     repo.write(".kanspec/tickets/t-9c41.md", "---\nid: t-9c41\n---\n");
     assert_eq!(
@@ -554,7 +558,11 @@ fn dirty_kanspec_counts_pending_tracker_changes_and_ignores_the_cache() {
 
     // The disposable cache is gitignored, so a `scan` every 60s never inflates the count.
     repo.write(".kanspec/cache/gitstate.json", "{\"version\":1}");
-    assert_eq!(ctx.git.dirty_kanspec(&[]).unwrap(), 2, "cache/ is invisible");
+    assert_eq!(
+        ctx.git.dirty_kanspec(&[]).unwrap(),
+        2,
+        "cache/ is invisible"
+    );
     assert!(ctx.git.is_ignored(&repo.root.join(".kanspec/cache")));
     assert!(ctx
         .git

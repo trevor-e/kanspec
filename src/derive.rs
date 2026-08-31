@@ -1595,8 +1595,7 @@ mod tests {
         let mut s = snap();
         let mut t = closed("t-0003");
         t.log.last_mut().unwrap().note = Some("no-code: docs only".into());
-        t.body =
-            "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
+        t.body = "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
         put(&mut s, t);
         assert_eq!(
             close_evidence(&s, &s.tickets[&tid("t-0003")]),
