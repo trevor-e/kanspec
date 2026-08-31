@@ -31,8 +31,18 @@ use crate::transitions::{State, Verb};
 pub struct Fix(String);
 
 impl Fix {
+    /// The command word is rewritten to the binary the user actually typed —
+    /// [`crate::out::spoken`], which rewrites `kanspec` ONLY in command position and so
+    /// cannot corrupt the fixes that name a path under `.kanspec/` or quote a commit
+    /// message.
+    ///
+    /// It happens HERE, at construction, for two reasons: every one of the ~123
+    /// `fix!("kanspec …")` call sites is covered without being edited, and `as_str`,
+    /// `Display` and the `#[serde(transparent)]` `--json` fix list stay in exact agreement
+    /// — a rewrite applied per surface would let the human and JSON refusals name
+    /// different commands, which is the one drift this crate's whole output design forbids.
     pub fn cmd(s: impl Into<String>) -> Fix {
-        Fix(s.into())
+        Fix(crate::out::spoken(&s.into()))
     }
     pub fn as_str(&self) -> &str {
         &self.0

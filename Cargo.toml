@@ -50,6 +50,11 @@ tokio         = { version = "1.53.1", features = [
                   "rt-multi-thread", "macros", "signal", "time", "net", "fs", "sync"] }
 tokio-stream  = { version = "0.1", features = ["sync"] }   # wrappers::BroadcastStream
 toml          = "1.1.4"                    # NOTE: 1.x, not 0.8
+# ZERO new supply chain: `comfy-table` already pulls this exact crate, so the board's
+# columns and `out::visible_len` now measure width with the SAME table instead of two
+# disagreeing ones. It is the East Asian Width table (UAX #11) plus the emoji rules —
+# the thing `chars().count()` is not (ARCHITECTURE D-50).
+unicode-width = "0.2.2"
 rusqlite      = { version = "0.40.2", features = ["bundled"], optional = true }
 
 # DELIBERATELY ABSENT:
