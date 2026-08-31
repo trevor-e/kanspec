@@ -553,3 +553,83 @@ fn prime_stamps_the_merge_state_it_is_reporting_from() {
         "prime's throttled scan never ran"
     );
 }
+
+/// INVARIANT 8, THE AGENT HALF — end to end, on the real binary.
+///
+/// "Agents never self-accept standing rules." The mechanism is `HumanActor`, whose
+/// constructor refuses an `Actor::Agent`, and which `plan_accept` / `plan_revoke` /
+/// `plan_supersede` take by reference (D-18). Until round C this could only be proven at
+/// unit level, because the harness hard-coded `KANSPEC_ACTOR_KIND=human` with no override —
+/// so the refusal that the entire propose-then-human-accept design rests on had never once
+/// been observed coming out of the actual binary. `TestRepo::ks_env` exists for this.
+///
+/// The positive control matters as much as the refusals: the same three commands, same
+/// repo, same ids, run as a HUMAN, must succeed. Otherwise this test would still pass if
+/// `accept` were broken for everyone.
+#[test]
+fn an_agent_cannot_accept_revoke_or_supersede_a_standing_rule() {
+    let repo = TestRepo::new();
+    repo.ks(["spec", "new", "auth", "--code", "src/auth/**"])
+        .ok();
+
+    // An AGENT may propose — that half must keep working, or agents cannot record anything.
+    let agent = &[
+        ("KANSPEC_ACTOR", "claude/sess-a91"),
+        ("KANSPEC_ACTOR_KIND", "agent"),
+    ];
+    let proposed = repo.ks_env(
+        [
+            "decide",
+            "rate limits live in middleware",
+            "--scope",
+            "src/auth/**",
+        ],
+        agent,
+    );
+    assert_eq!(
+        proposed.code, 0,
+        "an agent must still be able to PROPOSE:\n{}",
+        proposed.stderr
+    );
+    let did = proposed
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("D-"))
+        .expect("the minted decision id")
+        .to_string();
+
+    // ...but it may not make its own proposal binding, retire one, or swap one out.
+    for args in [
+        vec!["accept", did.as_str()],
+        vec!["revoke", did.as_str(), "--why", "changed my mind"],
+        vec!["supersede", did.as_str(), "--with", "cap retries at three"],
+    ] {
+        let r = repo.ks_env(&args, agent);
+        assert_ne!(
+            r.code,
+            0,
+            "invariant 8: an agent session must not be able to `{}`:\n{}",
+            args.join(" "),
+            r.stdout
+        );
+        let said = format!("{}{}", r.stdout, r.stderr);
+        assert!(
+            said.contains("human") || said.contains("agent"),
+            "the refusal must say whose act this is — `{}` said: {said}",
+            args.join(" ")
+        );
+    }
+
+    // The record itself never moved: still `proposed`, and still not standing.
+    let after = repo.read(&format!(".kanspec/decisions/{did}.md"));
+    assert!(after.contains("status: proposed"), "{after}");
+    assert!(
+        !repo.ks(["rules"]).ok().stdout.contains("accepted"),
+        "a decision no human accepted must not appear as a standing rule"
+    );
+
+    // POSITIVE CONTROL: the same verb, as a human, works.
+    repo.ks(["accept", &did]).ok();
+    let after = repo.read(&format!(".kanspec/decisions/{did}.md"));
+    assert!(after.contains("status: accepted"), "{after}");
+}

@@ -24,7 +24,6 @@ use crate::out::{glyph, Color, Line, Render, Style, Table};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::project::{self, FeatureRow};
 use crate::store::Store;
-use crate::transitions::Verb;
 use crate::{fix, fixes};
 
 #[derive(Debug, Serialize)]
@@ -105,7 +104,7 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
         ("by".into(), Yv::s(ctx.actor.label())),
         ("why".into(), Yv::s(&why)),
     ]);
-    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         s.spec(&name)?;
         Ok(Plan::of(vec![Op::SetFields {
             entity: EntityRef::Spec(name.clone()),

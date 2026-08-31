@@ -205,6 +205,24 @@ impl TestRepo {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        self.ks_in_env(cwd, args, &[])
+    }
+
+    /// `ks_in` with the harness's fixed environment OVERRIDDEN per call.
+    ///
+    /// ROUND-C ADDITION (integration), reported as a gap by S6. The defaults below pin
+    /// `KANSPEC_ACTOR_KIND=human` and strip every agent session variable, which is right for
+    /// almost every test — but it also made the AGENT half of **invariant 8** unreachable
+    /// from an integration test: there was no way to run the real binary as an agent and
+    /// watch `accept` / `revoke` / `supersede` refuse. `HumanActor` is the mechanism the
+    /// whole invariant rests on (D-18), so it deserves an end-to-end proof and not only
+    /// `ctx.rs`'s unit test. Overrides are applied last, so a caller can replace any default
+    /// (pass an empty value to unset one).
+    pub fn ks_in_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &str)]) -> Run
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let args: Vec<String> = args.into_iter().map(|a| a.as_ref().to_string()).collect();
         let mut cmd = Command::new(kanspec_bin());
         cmd.current_dir(cwd)
@@ -223,12 +241,28 @@ impl TestRepo {
         if self.gh_fixtures().is_dir() {
             cmd.env("KANSPEC_GH_FIXTURES", self.gh_fixtures());
         }
+        for (k, v) in env {
+            if v.is_empty() {
+                cmd.env_remove(k);
+            } else {
+                cmd.env(k, v);
+            }
+        }
         let out = cmd.output().expect("the binary must be runnable");
         Run {
             code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         }
+    }
+
+    /// `ks` at the primary root, with environment overrides. See [`Self::ks_in_env`].
+    pub fn ks_env<I, S>(&self, args: I, env: &[(&str, &str)]) -> Run
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.ks_in_env(&self.root.clone(), args, env)
     }
 
     pub fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> T {

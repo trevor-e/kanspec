@@ -30,7 +30,6 @@ use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Facts, Op, Plan};
 use crate::project;
 use crate::store::{Committed, Store};
-use crate::transitions::Verb;
 use crate::{fix, fixes};
 
 // ── decide ───────────────────────────────────────────────────────────────────
@@ -54,9 +53,8 @@ pub fn decide(ctx: &Ctx, a: &DecideArgs) -> Result<DecideReport> {
     // steers nobody, and `prime` would silently never inject it.
     crate::rulesdoc::Scope::of(&a.scope)?;
     let f = facts(ctx);
-    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, m| {
-        plan_decide(s, &f, a, m)
-    })?;
+    let done =
+        Store::open(ctx).transact(None, &ctx.invocation(), |s, m| plan_decide(s, &f, a, m))?;
     let id = minted(&done)?;
     project::regenerate(ctx)?;
 
@@ -167,7 +165,7 @@ pub fn accept(ctx: &Ctx, a: &AcceptArgs) -> Result<DecisionReport> {
     let who = HumanActor::require(&ctx.actor, "accept")?;
     let id = DecisionId::parse(&a.id)?;
     let f = facts(ctx);
-    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         plan_accept(s, &f, &who, &id)
     })?;
     project::regenerate(ctx)?;
@@ -212,7 +210,7 @@ pub fn supersede(ctx: &Ctx, a: &SupersedeArgs) -> Result<DecisionReport> {
     let who = HumanActor::require(&ctx.actor, "supersede")?;
     let id = DecisionId::parse(&a.id)?;
     let f = facts(ctx);
-    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, m| {
         plan_supersede(s, &f, &who, &id, &a.with, m)
     })?;
     let replacement = minted(&done)?;
@@ -301,7 +299,7 @@ pub fn revoke(ctx: &Ctx, a: &RevokeArgs) -> Result<DecisionReport> {
     let who = HumanActor::require(&ctx.actor, "revoke")?;
     let id = DecisionId::parse(&a.id)?;
     let f = facts(ctx);
-    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         plan_revoke(s, &f, &who, &id, &a.why)
     })?;
     project::regenerate(ctx)?;

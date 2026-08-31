@@ -10,7 +10,6 @@ use crate::doctor::{self, Finding, Severity};
 use crate::error::{code, Result};
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::store::Store;
-use crate::transitions::Verb;
 
 #[derive(Debug, Serialize)]
 pub struct DoctorReport {
@@ -42,7 +41,9 @@ pub fn doctor(ctx: &Ctx, a: &DoctorArgs) -> Result<DoctorReport> {
         // snapshot, exactly like every verb. That is also why the findings are recomputed
         // in there — the ones gathered above were read without exclusivity.
         let store = Store::open(ctx);
-        let committed = store.transact(Verb::Repair, &ctx.invocation(), |snap, _minter| {
+        // `None`: `plan_fixes` pushes `Op::MoveDir` and never a ticket transition, so this
+        // is not a ticket verb act. Round C, when `transact` gained `Option<Verb>`.
+        let committed = store.transact(None, &ctx.invocation(), |snap, _minter| {
             let fresh = doctor::run_all(snap);
             doctor::plan_fixes(snap, &fresh)
         })?;

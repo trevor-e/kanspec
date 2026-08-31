@@ -144,8 +144,14 @@ impl Line {
         self.dim = Some(d.into());
         self
     }
+    /// An EMPTY fix is no fix. Every caller spells the owed verb
+    /// `next.first().cloned().unwrap_or_default()`, and a terminal ticket owes nothing — so
+    /// without this guard `Some("")` reached `write` and rendered a dangling `→` with
+    /// nothing after it (round C: `kanspec show` on a `done` ticket). Guarding here fixes
+    /// all eight call sites at once and keeps the ninth from having to remember.
     pub fn fix(mut self, f: impl Into<String>) -> Line {
-        self.fix = Some(f.into());
+        let f = f.into();
+        self.fix = (!f.trim().is_empty()).then_some(f);
         self
     }
     pub fn url(mut self, u: impl Into<String>) -> Line {
@@ -339,6 +345,32 @@ mod tests {
         let s = String::from_utf8(buf).unwrap();
         assert!(s.starts_with(" ⇂ t-31aa"), "{s:?}");
         assert!(s.contains("→ kanspec done t-31aa"), "{s:?}");
+    }
+
+    /// ROUND-C REGRESSION. A terminal ticket owes no verb, so every `.fix(next.first()
+    /// .cloned().unwrap_or_default())` call site hands `fix` an empty string. It must
+    /// render as no arrow at all — `kanspec show` on a `done` ticket printed a dangling
+    /// `→` with nothing after it.
+    #[test]
+    fn an_empty_fix_prints_no_arrow_at_all() {
+        for empty in ["", "   "] {
+            let mut buf: Vec<u8> = Vec::new();
+            Line::new('●', "Rate-limit login endpoint")
+                .id("t-63b9")
+                .fix(empty)
+                .write(&mut buf, &Style::plain())
+                .unwrap();
+            let s = String::from_utf8(buf).unwrap();
+            assert!(
+                !s.contains('→'),
+                "empty fix {empty:?} still drew an arrow: {s:?}"
+            );
+            assert_eq!(
+                s.trim_end(),
+                " ● t-63b9   Rate-limit login endpoint",
+                "{s:?}"
+            );
+        }
     }
 
     #[test]

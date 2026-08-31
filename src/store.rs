@@ -463,7 +463,17 @@ impl<'c> Store<'c> {
     ///
     /// gh/network calls MUST happen BEFORE `transact` (see `Facts`): a wedged subprocess
     /// inside the lock stalls the browser and every CLI verb for the lock timeout.
-    pub fn transact<F>(&self, verb: Verb, cmdline: &str, planner: F) -> Result<Committed>
+    ///
+    /// `verb` is `None` for a plan that transitions no ticket — a cache write, a projection
+    /// rewrite, or any knowledge verb (`spec new`, `decide`, `accept`, `quirk add`,
+    /// `features --confirm`). ROUND-C CONTRACT CHANGE, requested independently by S3, S5
+    /// and S6: `Verb` is a TICKET transition verb and reaches only this commit subject, so
+    /// ten of the crate's twenty call sites were passing `Verb::Confirm` purely to satisfy
+    /// the parameter — and under `sync = "commit"` that wrote `kanspec: confirm auth` into
+    /// git history for what was actually `spec new auth`. `Confirm` means a specific thing
+    /// (D-11, the human merge override); borrowing it as filler made the log lie. `None`
+    /// commits as `kanspec: update <id>`.
+    pub fn transact<F>(&self, verb: Option<Verb>, cmdline: &str, planner: F) -> Result<Committed>
     where
         F: FnOnce(&Snapshot, &Minter) -> Result<Plan>,
     {
@@ -583,8 +593,9 @@ impl<'c> Store<'c> {
                     _ => o.entity().map(EntityRef::id),
                 })
                 .unwrap_or_else(|| "store".to_string());
+            let label = verb.map_or("update", |v| v.as_str());
             ctx.git
-                .commit_kanspec(&format!("kanspec: {verb} {subject}"))?;
+                .commit_kanspec(&format!("kanspec: {label} {subject}"))?;
         }
 
         // 11 — the post-write view, still under the lock, so the caller (and the server's

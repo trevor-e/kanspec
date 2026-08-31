@@ -194,6 +194,17 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     // freshly-started ticket reads back as MERGED by ancestry (§2.16).
     let head = ctx.git.head_sha(if existed { &branch } else { &base })?;
 
+    // Whether the primary is safe to move — measured NOW, before this verb writes a byte.
+    //
+    // ROUND-C FIX (integration). As shipped this ran a bare `git status --porcelain -uno`
+    // AFTER `transact` returned. In any repo that COMMITS `.kanspec/` — which DESIGN.md
+    // does — the ticket file this verb had just rewritten was then the only dirty entry, so
+    // the guard refused every time and `checked_out` was unreachable in practice; the
+    // dogfood run found it on the first claim. The load-bearing half of the fix is the
+    // `.kanspec/**` exclusion in `primary_is_movable`; hoisting the call above the write is
+    // the second half, and is what §2.16 asks of every other subprocess in this handler.
+    let movable = wt_abs.is_none() && primary_is_movable(ctx);
+
     let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {
@@ -206,7 +217,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
         worktree: wt_display.clone(),
         head,
     };
-    let committed = match Store::open(ctx).transact(Verb::Start, &ctx.invocation(), |s, m| {
+    let committed = match Store::open(ctx).transact(Some(Verb::Start), &ctx.invocation(), |s, m| {
         plan_start(s, &f, a, m)
     }) {
         Ok(c) => c,
@@ -228,7 +239,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
         id.as_str(),
     ]);
 
-    let checked_out = wt_abs.is_none() && switch_if_safe(ctx, &branch);
+    let checked_out = movable && switch_now(ctx, &branch);
 
     let t = committed.snapshot.ticket(&id)?;
     let cx = claim_context(&committed.snapshot, t);
@@ -572,23 +583,39 @@ fn unmake(ctx: &Ctx, made: &Made) {
     }
 }
 
-/// Move the PRIMARY worktree onto the ticket branch — but only when that cannot surprise
-/// anyone: no separate worktree was asked for, the caller is standing in the primary, and
-/// the tracked tree is clean. Otherwise the report names `git switch` and nothing moves.
-fn switch_if_safe(ctx: &Ctx, branch: &str) -> bool {
+/// May the PRIMARY worktree be moved onto the ticket branch without surprising anyone?
+///
+/// Only when the caller is standing in the primary and the tree carries no work of its own.
+/// **Call this BEFORE `transact`** — see the call site: after the write, the ticket file
+/// this verb just changed is itself the dirt, and the answer is permanently `false`.
+///
+/// `-uno` drops untracked files (they never block a checkout). `.kanspec/` is excluded on
+/// top of that because under the default `sync = "batch"` the tracker is *expected* to be
+/// dirty — that is what batching means — and those files are identical on a branch that was
+/// forked from `base` a moment ago, so carrying them across is exactly right. What must
+/// stop the switch is uncommitted work in the user's OWN source, and that is all this now
+/// looks at.
+fn primary_is_movable(ctx: &Ctx) -> bool {
     if ctx.repo.linked() {
         return false;
     }
-    // `-uno`: an untracked file never blocks a checkout, and the tracker's own pending
-    // edits under `sync = "batch"` are the normal resting state.
-    let clean = ctx
-        .git
-        .run(&["status", "--porcelain", "-uno"])
+    ctx.git
+        .run(&[
+            "status",
+            "--porcelain",
+            "-uno",
+            "--",
+            ".",
+            ":(exclude,glob,top).kanspec/**",
+        ])
         .map(|o| o.code == 0 && o.out.trim().is_empty())
-        .unwrap_or(false);
-    if !clean {
-        return false;
-    }
+        .unwrap_or(false)
+}
+
+/// The switch itself, run after the claim actually landed — an attribution to a claim that
+/// must have happened. Best effort: a refused checkout costs the report a line, never the
+/// claim.
+fn switch_now(ctx: &Ctx, branch: &str) -> bool {
     ctx.git
         .run(&["switch", branch])
         .map(|o| o.code == 0)
@@ -665,8 +692,9 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
         },
         head,
     };
-    let committed =
-        Store::open(ctx).transact(Verb::Ship, &ctx.invocation(), |s, m| plan_ship(s, &f, a, m))?;
+    let committed = Store::open(ctx).transact(Some(Verb::Ship), &ctx.invocation(), |s, m| {
+        plan_ship(s, &f, a, m)
+    })?;
 
     let t = committed.snapshot.ticket(&id)?;
     Ok(ShipReport {
@@ -761,8 +789,9 @@ pub fn park(ctx: &Ctx, a: &ParkArgs) -> Result<ParkReport> {
         at: ctx.now,
         invocation: ctx.invocation(),
     };
-    let committed =
-        Store::open(ctx).transact(Verb::Park, &ctx.invocation(), |s, m| plan_park(s, &f, a, m))?;
+    let committed = Store::open(ctx).transact(Some(Verb::Park), &ctx.invocation(), |s, m| {
+        plan_park(s, &f, a, m)
+    })?;
     let t = committed.snapshot.ticket(&id)?;
     Ok(ParkReport {
         title: t.fm.title.clone(),
@@ -799,7 +828,9 @@ impl Render for ParkReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, format!("{} — {}", self.title, self.why))
             .id(&self.id)
-            .dim("unclaimed")
+            // `· ` prefix like every other dim chip in the crate: without it the reason and
+            // the chip run together — `… — waiting on the limiter to land unclaimed`.
+            .dim("· unclaimed")
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)
     }
@@ -827,8 +858,9 @@ pub fn drop_ticket(ctx: &Ctx, a: &DropArgs) -> Result<DropReport> {
         at: ctx.now,
         invocation: ctx.invocation(),
     };
-    let committed =
-        Store::open(ctx).transact(Verb::Drop, &ctx.invocation(), |s, m| plan_drop(s, &f, a, m))?;
+    let committed = Store::open(ctx).transact(Some(Verb::Drop), &ctx.invocation(), |s, m| {
+        plan_drop(s, &f, a, m)
+    })?;
 
     let snap = &committed.snapshot;
     let t = snap.ticket(&id)?;

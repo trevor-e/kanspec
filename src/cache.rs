@@ -37,6 +37,12 @@ pub enum MergeStatus {
 
 /// One ticket's last ladder result. `why` carries `Unknown::badge()` so the card can
 /// explain itself without re-running anything.
+///
+/// ⚠ `why` is therefore the COMPLETE badge text — `"unknown (squash suspected, no gh)"`,
+/// wrapper included — not the bare reason. `cmd/scan.rs` prints it raw, which is correct;
+/// any consumer that supplies its own `unknown (…)` wrapper must strip this one first, or
+/// the word appears twice. `derive::bare_reason` is that unwrap, and round C's
+/// `kanspec ls` shipped the doubled form before it existed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MergeFact {
     pub status: MergeStatus,

@@ -900,3 +900,91 @@ fn the_close_out_transcript_reads_like_design_md_and_flags_the_settling_proposal
         assert!(log["violation"].is_null(), "{log}");
     }
 }
+
+/// ROUND-C REGRESSION (found by the integrator's dogfood run, fixed at integration).
+///
+/// `start` moves the primary worktree onto the ticket branch when — and only when — no
+/// separate worktree was asked for and the user's own source tree carries no uncommitted
+/// work. As shipped, that guard ran `git status` AFTER `transact`, so the only dirty file
+/// was the ticket `start` had itself just written: the branch was never checked out, on any
+/// repo, ever, and `checked_out` was unreachable. An agent following the CLAUDE.md snippet
+/// therefore kept committing to main, which is the exact failure the feature exists to stop.
+///
+/// Both directions are pinned, because a guard that always says yes is as wrong as one that
+/// always says no.
+#[test]
+fn start_moves_the_primary_onto_the_branch_only_when_the_source_tree_is_clean() {
+    let repo = TestRepo::new();
+    let root = repo.root.clone();
+
+    // ── clean source tree: the claim checks the branch out ───────────────────
+    let a = json_in(&repo, &root, &["new", "first claim"]);
+
+    // COMMIT THE TICKET BEFORE CLAIMING IT. This is the ordinary rhythm of a real repo —
+    // DESIGN.md commits `.kanspec/`, and `sync = "batch"` means a human or a hook sweeps it
+    // up between verbs — and it is exactly what the original guard could not survive: once
+    // the ticket file is TRACKED, the transition `start` writes into it makes
+    // `git status -uno` non-empty, so a guard running after `transact` reads the verb's own
+    // write as the user's uncommitted work and refuses every time. While the file is still
+    // untracked (a fresh `TestRepo` that never commits) `-uno` hides it and the bug cannot
+    // be seen — which is how it shipped green.
+    // Pushed as well as committed: `start` forks the ticket branch from `origin/main`, so
+    // a local `main` that is ahead of the remote genuinely cannot be switched away from
+    // while the tracker carries uncommitted edits — git itself refuses, and `start`
+    // correctly reports `checked_out: false` and names `git switch`. That is a THIRD,
+    // legitimate no-switch case; this test is about the two the guard decides.
+    repo.commit("kanspec: sync the tracker, as a real repo does");
+    repo.push("main");
+    let a_id = a["id"].as_str().expect("an id").to_string();
+    let started = json_in(&repo, &root, &["start", &a_id]);
+    let a_branch = started["branch"].as_str().expect("a branch").to_string();
+
+    assert_eq!(
+        started["checked_out"],
+        Value::Bool(true),
+        "a clean source tree must be moved onto the ticket branch: {started}"
+    );
+    assert_eq!(
+        repo.git(&["branch", "--show-current"]).trim(),
+        a_branch,
+        "the primary worktree is standing on the ticket branch"
+    );
+    // Having actually switched, the report must not also tell the user to switch.
+    let next = started["next"].as_array().expect("a next list");
+    assert!(
+        !next
+            .iter()
+            .any(|n| n.as_str().unwrap_or("").starts_with("git switch")),
+        "nothing left to switch — {next:?}"
+    );
+
+    // The tracker's own pending edits are the normal resting state under `sync = "batch"`
+    // and must NOT count as dirt; the switch above already proved that, since `start`
+    // itself wrote a ticket file before this point.
+
+    // ── real uncommitted source work: nothing moves ──────────────────────────
+    repo.git(&["switch", "main"]);
+    repo.write("src/half-written.rs", "fn t() { /* mid-thought */ }\n");
+    repo.git(&["add", "src/half-written.rs"]);
+
+    let b = json_in(&repo, &root, &["new", "second claim"]);
+    let b_id = b["id"].as_str().expect("an id").to_string();
+    let refused = json_in(&repo, &root, &["start", &b_id]);
+
+    assert_eq!(
+        refused["checked_out"],
+        Value::Bool(false),
+        "uncommitted work in the user's OWN source must keep HEAD where it is: {refused}"
+    );
+    assert_eq!(
+        repo.git(&["branch", "--show-current"]).trim(),
+        "main",
+        "the primary must not be moved out from under uncommitted work"
+    );
+    let next = refused["next"].as_array().expect("a next list");
+    assert!(
+        next.iter()
+            .any(|n| n.as_str().unwrap_or("").starts_with("git switch")),
+        "when it does not switch, it must say how — {next:?}"
+    );
+}

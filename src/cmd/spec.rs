@@ -18,7 +18,6 @@ use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::project;
 use crate::store::Store;
-use crate::transitions::Verb;
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "spec", rename_all = "snake_case")]
@@ -71,7 +70,7 @@ fn new(ctx: &Ctx, raw: &str, feature: Option<&str>, code: &[String]) -> Result<S
 
     let contents = scaffold(&name, feature.unwrap_or(raw), code);
     let entity = EntityRef::Spec(name.clone());
-    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |_s, _m| {
+    Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
         Ok(Plan::of(vec![Op::CreateEntity {
             entity: entity.clone(),
             contents: contents.clone(),

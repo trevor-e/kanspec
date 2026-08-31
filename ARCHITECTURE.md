@@ -840,10 +840,20 @@ pub enum Op {
 }
 impl Op {
     pub fn entity(&self) -> Option<&EntityRef>;
-    /// ROUND-B ADDITION. False for `WriteGitState` alone — `cache/` is gitignored,
-    /// disposable, and rebuilt from nothing by the next `scan`. `Store::transact`
-    /// step 9 reads this so `sync = "commit"` has nothing to commit for a scan
-    /// (§2.13). A future op that writes another gitignored path belongs here.
+    /// ROUND-B ADDITION, WIDENED IN ROUND C. False for `WriteGitState` — `cache/`
+    /// is gitignored, disposable, and rebuilt from nothing by the next `scan` —
+    /// and false for `WriteGenerated` too. `Store::transact` step 9 reads this so
+    /// `sync = "commit"` has nothing to commit for a scan (§2.13).
+    ///
+    /// `WriteGenerated` is excluded for the same reason arrived at from the other
+    /// side: it writes `KANSPEC-*.md` at the REPO ROOT, while `commit_kanspec`
+    /// scopes all three of its git calls to `:(glob,top).kanspec/**`. Counting it
+    /// therefore never commits the projection — it only makes `scan` (which
+    /// regenerates them, D-20) sweep a human's pending tracker edit into a commit
+    /// labelled after the scan, which is exactly the harm this predicate exists to
+    /// prevent. `scan_ladder.rs::a_scan_commits_nothing_under_sync_commit_…` fails
+    /// without the arm. If the projections should ever be auto-committed, widen
+    /// `commit_kanspec`'s pathspec; do not re-arm this predicate.
     pub fn writes_tracked_file(&self) -> bool;
 }
 
@@ -1126,16 +1136,26 @@ impl<'c> Store<'c> {
     /// `kanspec scan --quiet` reach for git's index in the middle of a merge.
     /// Pinned by `scan_ladder.rs::a_scan_commits_nothing_under_sync_commit_…`.
     ///
-    /// `verb` is a TICKET transition verb and reaches ONLY that commit subject,
-    /// so a plan that transitions nothing passes `Verb::Confirm` (the table's own
-    /// "non-transition, recorded" verb) purely to satisfy the parameter. With
-    /// step 9 skipped for cache-only plans it now reaches nothing at all, which
-    /// is why the signature stays as-is rather than growing an `Option<Verb>`
-    /// that every slice would have to be rewritten against mid-build.
+    /// ROUND-C CONTRACT CHANGE (granted; requested independently by S3, S5, S6).
+    /// `verb` is a TICKET transition verb and reaches ONLY that commit subject.
+    /// It is `Some(v)` when the transaction IS ticket verb `v` — every
+    /// `Op::Transition`, plus `new`'s genesis `CreateEntity` — and `None` when no
+    /// ticket verb happened: a cache write, a projection rewrite, `doctor --fix`,
+    /// and every knowledge verb (`spec new`, `decide`, `accept`, `supersede`,
+    /// `revoke`, `quirk add|fix`, `features --confirm`). `None` commits as
+    /// `kanspec: update <id>`.
+    ///
+    /// Round B left this as a bare `Verb` on the grounds that the value reached
+    /// nothing. It did: TEN of the crate's twenty call sites passed
+    /// `Verb::Confirm` as filler, so under `sync = "commit"` a `spec new auth`
+    /// was committed as `kanspec: confirm auth`. `Confirm` means one specific
+    /// thing — the human merge override (D-11) — and borrowing it as a filler
+    /// made git history state something false about who attested to what.
     ///
     /// gh/network calls MUST happen BEFORE `transact` (see `Facts`, §2.16): a
     /// wedged subprocess inside the lock stalls the browser and every CLI verb.
-    pub fn transact<F>(&self, verb: Verb, cmdline: &str, planner: F) -> Result<Committed>
+    pub fn transact<F>(&self, verb: Option<Verb>, cmdline: &str, planner: F)
+        -> Result<Committed>
     where F: FnOnce(&Snapshot, &Minter) -> Result<Plan>;
 }
 
@@ -1182,7 +1202,23 @@ pub fn split(src: &str) -> std::result::Result<MdDoc, FmError>;
 pub fn index(fm: &str) -> Vec<KeySpan>;                    // CRLF- and quote-aware
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum Yv { Null, Bool(bool), Int(i64), Str(String), List(Vec<Yv>) }
+pub enum Yv { Null, Bool(bool), Int(i64), Str(String), List(Vec<Yv>),
+              /// ROUND-C ADDITION (granted, S6). A one-line FLOW mapping —
+              /// `{sha: a1b9c3d, at: 2026-08-31T12:00:00Z, by: dev, why: …}`.
+              /// `spec.stale_ack` is the one v0.1 field whose value is a struct:
+              /// `SpecKey::StaleAck` and `model::StaleAck` were both already in
+              /// this contract with no `Yv` able to express them. Verified
+              /// empirically against serde_yaml_ng — the flow-map form
+              /// deserializes into `StaleAck`; a flow SEQUENCE is rejected; and
+              /// `Yv::Str("{…}")` is single-quoted by `emit`'s first-byte check
+              /// (`{` is in `plain_ok`'s deny list) so it reads back as a String,
+              /// which makes the WHOLE SPEC fail to load and takes `rules`,
+              /// `prime` and the feature map down with it.
+              /// FLOW style, never a block map, is load-bearing: it keeps the
+              /// value on ONE line, so `index` reports `multiline: false` and a
+              /// second `features --confirm` is an ordinary `SetOutcome::Replaced`
+              /// rather than R-9's hard refusal.
+              Map(Vec<(String, Yv)>) }
 impl Yv {
     pub fn s(v: impl Into<String>) -> Yv;
     pub fn opt_s(v: Option<impl Into<String>>) -> Yv;      // None -> Yv::Null
@@ -1421,7 +1457,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
     let head = ctx.git.head_sha(t.fm.branch.as_deref().unwrap_or("HEAD"))?;
     let f = ShipFacts { base: Facts { actor: ctx.actor.clone(), at: ctx.now,
                                       invocation: ctx.invocation() }, head };
-    let done = Store::open(ctx).transact(Verb::Ship, &ctx.invocation(),
+    let done = Store::open(ctx).transact(Some(Verb::Ship), &ctx.invocation(),
                                          |s, m| plan_ship(s, &f, a, m))?;
     Ok(ShipReport::from(&done, a))
 }
@@ -2125,7 +2161,7 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-17 | `ready` when a dep is in-main but not `done` | **Satisfied** by terminal *or* in-main. **Dropped counts as satisfied** (blocking forever is worse); `doctor::check_orphan_deps` warns on a dep pointing at a dropped ticket. |
 | D-18 | Invariant 8 ("agents never self-accept") had no mechanism | **`HumanActor`**: private field, constructor refuses `Actor::Agent`. `plan_accept`/`plan_revoke` take `&HumanActor`, so an agent session cannot call them. |
 | D-19 | `comments.jsonl` "id-dedupe on read" — dedupe key unspecified | **`(id, op, at)`**: one `cm-` id legitimately carries `comment` + `reply` + `resolve` rows. |
-| D-20 | `KANSPEC-*.md` regeneration timing | On `scan`, and on any `transact` that touched a spec or a decision (`Op::WriteGenerated`, inside the same lock). |
+| D-20 | `KANSPEC-*.md` regeneration timing | On `scan`, and on any `transact` that touched a spec or a decision (`Op::WriteGenerated`). **Amended in round C (see D-34): its OWN short transaction immediately after, not inside the caller's lock** — a planner sees the pre-plan snapshot, so regenerating inside would publish a projection permanently one write behind. |
 | D-21 | Branch / worktree naming | `ks/<id>-<slug>` (`branch_prefix` configurable), worktree `<worktree_dir>/<id>`. `worktree add --no-track` — without it a later `git push` from the ticket branch targets **main**. |
 | D-22 | Server snapshot freshness | `up` holds `Arc<Ctx>` and a `rev`-stamped memoized snapshot that `transact` **publishes synchronously** on write; the watcher only invalidates. A POST's own refetch can never see the pre-write snapshot. |
 | D-23 | SSE payload granularity | `{rev, n}` **only**; the SPA refetches `/api/board`. macOS FSEvents coalesces create+remove+modify for one delete, so any event-kind-derived delta is a bug farm. |
@@ -2141,6 +2177,19 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-28 | `doctor::check_dead_globs` covers spec `code:` globs only, while its registry `about` promised quirk `paths:` and decision `scope:` too. | **`about` corrected to match reality** in round B. `cache::SpecAnchor.dead_globs` is the only glob liveness `scan` records; covering the other two needs a glob-liveness map in `GitState` (S3's `cache.rs`) — v0.2. A registry that promises more than it checks is worse than one that checks less. |
 | D-29 | `doctor::check_immutable_decisions` needs a git diff of an accepted decision's body against its last commit, which `RunCheck = fn(&Snapshot)` cannot do. | **Deferred, half implemented.** The record half (accepted **and** `superseded_by` set) is checked purely; the body-diff half needs `scan` to record a per-decision body hash. Do not move the check off the pure registry — `purity.rs` holds `doctor.rs` to `fn(&Snapshot)` on purpose, and a check that shells out is a second, slower, un-unit-testable copy of `scan`. |
 | D-30 | The in-main and settling dwells anchor on ticket **activity** (last log entry / last branch commit), not on when the work actually landed. | **Correct as built.** The cache records `checked_at` — when the ladder *ran* — not a merge date, and anchoring on `checked_at` would let `up`'s 60s scan loop reset the tripwire forever, making it unfireable. `derive.rs` has a test named for exactly that. If `scan` ever records a real merge timestamp, switch the in-main dwell to it. |
+
+### Round-C resolutions (integration of S5 + S6 — the walking skeleton + knowledge)
+
+| # | Question | Decision |
+|---|---|---|
+| D-31 | `Store::transact(verb: Verb)` — S3, S5 and S6 each filed the same request for `Option<Verb>`, because a plan that transitions nothing had to pass `Verb::Confirm` as filler. | **Granted.** Not cosmetic, as round B assumed: **10 of 20** call sites were filler, so under `sync = "commit"` a `spec new auth` committed as `kanspec: confirm auth`. `Confirm` is the human merge override (D-11); borrowing it made git history assert something false. `Some(v)` iff the transaction IS ticket verb `v` (`Op::Transition`, plus `new`'s genesis); `None` otherwise, committing as `kanspec: update <id>`. §2.13 updated. |
+| D-32 | `Yv` cannot express `spec.stale_ack`, whose type `model::StaleAck { sha, at, by, why }` was already frozen in §2. S6 added `Yv::Map`. | **Granted, verified empirically.** No other spelling works: a flow SEQUENCE is rejected by serde, and `Yv::Str("{…}")` is single-quoted by `emit` (`{` is in `plain_ok`'s deny list) and reads back as a String — which makes the entire spec unloadable and takes `rules`, `prime` and the feature map with it. **Flow style, never a block map**, so `fm::index` reports `multiline: false` and a second `features --confirm` is a `Replaced` rather than R-9's refusal. §2.14 updated. |
+| D-33 | `Op::writes_tracked_file` returned true for `WriteGenerated`, which D-20's wiring surfaced. | **Granted, and load-bearing** — verified by reverting it, which fails `scan_ladder.rs::a_scan_commits_nothing_under_sync_commit_…` on the nose. `commit_kanspec` is scoped to `:(glob,top).kanspec/**`, so counting a repo-root projection never commits it; it only makes `scan` sweep a human's pending tracker edit into a commit labelled after the scan. §2.10 updated. |
+| D-34 | D-20 says regeneration rides "inside the same lock" as the write that changed a spec or decision. `project::regenerate` runs as its own short transaction immediately after. | **Deviation ACCEPTED; D-20 amended.** A planner sees the snapshot as it was BEFORE its own plan, so regenerating inside the closure would publish a feature map permanently one write behind — a brand-new spec missing until some later verb ran, and a post-`scan` `Fresh?` column computed from the pre-scan `GitState`. That is the exact rot the projections exist to prevent. Cost is R-1's window, one lock cycle wide, self-healing on the next verb. |
+| D-35 | S5 invented a non-DESIGN `ship` gate: refuse when the branch is 0 commits ahead of main. | **Kept.** Without it `start` → `ship` records main's own SHA as `head:`, and rung 1 then answers MERGED — a *verified false positive for work that never happened*, the single worst answer this tool can give. Guard 0b covers only the branch-tip case and cannot see this one by construction. It fires **only on a measured `Tri::Yes(0)`**; `Unknown` never refuses. It lives in the handler because the planner is pure and `ShipFacts` carries no commit count — safe today because `cmd::flow::ship` is the only caller, including from the server (§2.16). |
+| D-36 | S5 made `start` check the primary worktree out onto the ticket branch — not in DESIGN, which says only "creates branch (+ worktree)". | **Kept, and REPAIRED at integration.** Keeping it: without a checkout an agent following the CLAUDE.md snippet commits to main and the ticket-branch model breaks silently, which the dogfood run reproduced. Repairing it: as shipped the guard ran `git status --porcelain -uno` *after* `transact`, so in any repo that COMMITS `.kanspec/` (as DESIGN does) the ticket file the verb had just rewritten was the only dirty entry and the switch **never fired on any repo**. `.kanspec/**` is now excluded from the check and the check is hoisted above the write. Pinned both directions by `lifecycle.rs::start_moves_the_primary_onto_the_branch_only_when_the_source_tree_is_clean`, which commits AND pushes the tracker first — with an untracked `.kanspec/` the bug is invisible, which is how it shipped green. |
+| D-37 | `rules --adopt` needs an op that rewrites one line inside an entity BODY (`Op::ReplaceLine`). | **Rejected for v0.1; stays a typed refusal.** DESIGN's build plan puts `rules --audit/--adopt` in v0.2, and nothing else in v0.1 needs the op. S6 ships `--adopt` as an exit-1 gate naming three real fixes rather than a no-op exit 0 — an exit 0 that changed nothing is how a human comes to believe the audit is clean. `rulesdoc::ADOPTED_TOKEN` and the audit's `adoptable` flag are in place, so v0.2 needs only the op. |
+| D-38 | `cache::MergeFact.why` stores `git::Unknown::badge()` — the COMPLETE `unknown (…)` text — while `derive::Badge::text` supplies its own wrapper. | **Fixed at the seam (integration).** Round C's `ls` was the first surface to render a badge for a ticket with no branch, and it printed `unknown (unknown (no branch or head SHA recorded) · checked 7s ago)`. `derive::bare_reason` unwraps once, so exactly one layer owns the wrapper; it is total and idempotent, so it stays correct if the cache is ever changed to store the bare half. `cache.rs`'s doc now states the field is complete badge text. |
 
 ### Known limits carried forward, stated out loud
 

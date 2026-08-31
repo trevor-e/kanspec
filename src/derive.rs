@@ -154,6 +154,25 @@ pub fn in_main<'s>(s: &'s Snapshot, t: &Ticket) -> Option<&'s MergeFact> {
     merge_fact(s, t).filter(|f| f.status == MergeStatus::Merged)
 }
 
+/// THE SEAM between `cache::MergeFact.why` and `Badge::Unknown.why`, and the two disagree
+/// on purpose-built wording.
+///
+/// `cache::MergeFact.why` stores `git::Unknown::badge()`, which is already the COMPLETE
+/// card text — `"unknown (no branch or head SHA recorded)"` — because `cmd/scan.rs` prints
+/// it raw. `Badge::text` supplies its own `unknown (…)` wrapper so it can append
+/// `· checked <age>`. Handing the stored badge straight through therefore rendered
+/// `unknown (unknown (no branch or head SHA recorded) · checked 7s ago)`.
+///
+/// Round-C fix (integration): unwrap once here, so exactly one layer owns the wrapper.
+/// Total and idempotent — a reason that arrives bare is returned unchanged, so this stays
+/// correct if the cache is ever changed to store the bare half.
+fn bare_reason(why: &str) -> String {
+    why.strip_prefix("unknown (")
+        .and_then(|r| r.strip_suffix(')'))
+        .unwrap_or(why)
+        .to_string()
+}
+
 /// The badge every card carries — **never a guess**. Precedence is evidence-first: a
 /// recorded ladder verdict outranks the branch's push state, and "we have no fact" is
 /// `NeverScanned`, never `Unpushed`.
@@ -171,7 +190,11 @@ pub fn badge(s: &Snapshot, t: &Ticket) -> Badge {
                 checked_at: f.checked_at,
             },
             MergeStatus::Unknown => Badge::Unknown {
-                why: f.why.clone().unwrap_or_else(|| "unknown".to_string()),
+                why: f
+                    .why
+                    .as_deref()
+                    .map(bare_reason)
+                    .unwrap_or_else(|| "no reason recorded".to_string()),
                 checked_at: Some(f.checked_at),
             },
             MergeStatus::NotMerged => match f.pr.or(t.fm.pr) {
@@ -1223,6 +1246,32 @@ mod tests {
             },
         );
         assert!(matches!(badge(&s, t), Badge::Unknown { .. }));
+
+        // ROUND-C REGRESSION. `cache::MergeFact.why` stores `git::Unknown::badge()`, which
+        // is ALREADY `unknown (…)`; `Badge::text` adds that wrapper itself. Before the fix
+        // this rendered `unknown (unknown (no branch or head SHA recorded) · checked 1h
+        // ago)` on every unstarted ticket in `kanspec ls`. Exactly one layer owns it.
+        s.git.tickets.insert(
+            tid("t-0001"),
+            MergeFact {
+                status: MergeStatus::Unknown,
+                sha: None,
+                method: Method::None,
+                pr: None,
+                why: Some("unknown (no branch or head SHA recorded)".into()),
+                checked_at: ago(1),
+                changed: vec![],
+            },
+        );
+        let text = badge(&s, t).text(now());
+        assert!(
+            !text.contains("unknown (unknown"),
+            "the badge wrapper must be applied exactly once, got: {text}"
+        );
+        assert_eq!(
+            text,
+            "unknown (no branch or head SHA recorded · checked 1h ago)"
+        );
 
         // merged wins over everything
         s.git.tickets.insert(tid("t-0001"), merged(&[]));

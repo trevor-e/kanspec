@@ -57,7 +57,7 @@ pub fn new(ctx: &Ctx, a: &NewArgs) -> Result<NewReport> {
         at: ctx.now,
         invocation: ctx.invocation(),
     };
-    let committed = Store::open(ctx).transact(Verb::New, &ctx.invocation(), |s, m| {
+    let committed = Store::open(ctx).transact(Some(Verb::New), &ctx.invocation(), |s, m| {
         plan_new(s, &f, a, m, discovered_in.as_ref())
     })?;
 

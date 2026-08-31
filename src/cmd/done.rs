@@ -163,7 +163,7 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         landed,
         touched,
     };
-    let committed = Store::open(ctx).transact(Verb::Done, &ctx.invocation(), |s, m| {
+    let committed = Store::open(ctx).transact(Some(Verb::Done), &ctx.invocation(), |s, m| {
         plan_done(s, &f, &triage, a, m)
     })?;
 

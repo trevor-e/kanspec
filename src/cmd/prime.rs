@@ -32,7 +32,7 @@ use crate::plan::{Op, Plan};
 use crate::rulesdoc::{RulesDoc, Scope};
 use crate::scan::{self, ScanOpts};
 use crate::store::Store;
-use crate::transitions::{State, Verb};
+use crate::transitions::State;
 
 /// How many ready tickets and anomaly lines the payload carries. The budget is ~1.5k
 /// tokens for the WHOLE injection, and the standing rules are the half that earns its
@@ -253,7 +253,7 @@ fn refresh(ctx: &Ctx, snap: &Snapshot) -> bool {
         return false;
     };
     Store::open(ctx)
-        .transact(Verb::Confirm, &ctx.invocation(), move |_s, _m| {
+        .transact(None, &ctx.invocation(), move |_s, _m| {
             Ok(Plan::of(vec![Op::WriteGitState { token, state }]))
         })
         .is_ok()

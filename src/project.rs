@@ -215,10 +215,11 @@ pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<()> {
         return Ok(());
     }
     crate::store::Store::open(ctx).transact(
-        // A projection rewrite transitions no ticket; `Confirm` is the transition table's
-        // own "non-transition, recorded" verb and reaches only the `sync = "commit"`
-        // message (the same reason `cmd/scan.rs` passes it).
-        crate::transitions::Verb::Confirm,
+        // A projection rewrite transitions no ticket, which `transact` now says in the type
+        // (round C granted S3/S5/S6's shared request). Under `sync = "commit"` this commits
+        // as `kanspec: update <id>` rather than borrowing `Verb::Confirm`, whose meaning is
+        // the human merge override (D-11).
+        None,
         &ctx.invocation(),
         // Re-planned against the FRESH in-lock snapshot, never against the one read above:
         // that read happened without exclusivity, and trusting it is the TOCTOU

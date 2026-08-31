@@ -20,7 +20,6 @@ use crate::plan::{EntityRef, Op, Plan};
 use crate::project;
 use crate::rulesdoc::{severity_word, Scope};
 use crate::store::Store;
-use crate::transitions::Verb;
 use crate::{fix, fixes};
 
 #[derive(Debug, Serialize)]
@@ -77,7 +76,7 @@ fn add(
     let source = from.map(TicketId::parse).transpose()?;
 
     let title = title.trim().to_string();
-    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, m| {
         if let Some(t) = &source {
             // Provenance must point at a real ticket; `doctor` would otherwise find it.
             s.ticket(t)?;
@@ -112,7 +111,7 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
     let snap = ctx.snapshot()?;
     let title = snap.quirk(&id)?.fm.title.clone();
 
-    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         let q = s.quirk(&id)?;
         // "Retired only by evidence": the ticket that claims the fix must exist, and a
         // quirk already retired is not evidence of anything new.

@@ -102,7 +102,7 @@ fn a_transaction_run_from_a_linked_worktree_writes_the_primary_kanspec() {
 
     let done = Store::open(&ctx)
         .transact(
-            Verb::Start,
+            Some(Verb::Start),
             "kanspec start t-9c41",
             start_plan(
                 Verb::Start,
@@ -205,7 +205,7 @@ fn the_config_a_linked_worktree_reads_is_the_primarys() {
     // the worktree would have turned this transaction into a git commit.
     Store::open(&ctx)
         .transact(
-            Verb::Start,
+            Some(Verb::Start),
             "kanspec start t-9c41",
             start_plan(Verb::Start, vec![]),
         )
@@ -269,7 +269,7 @@ fn an_illegal_transition_is_refused_before_a_byte_moves() {
 
     // `ship` is legal only from `doing`; this ticket is `todo`.
     let e = refusal(Store::open(&ctx).transact(
-        Verb::Ship,
+        Some(Verb::Ship),
         "kanspec ship t-9c41",
         start_plan(Verb::Ship, vec![]),
     ));
@@ -301,7 +301,7 @@ fn a_hand_edited_state_is_caught_by_the_very_next_verb() {
     // proof the forged state would be laundered into a legal one and the edit would
     // disappear.
     let e = refusal(Store::open(&ctx).transact(
-        Verb::Start,
+        Some(Verb::Start),
         "kanspec start t-9c41",
         start_plan(Verb::Start, vec![]),
     ));
@@ -317,7 +317,7 @@ fn a_hand_edited_state_is_caught_by_the_very_next_verb() {
     // …and `repair` is the way out, precisely because its logged state is authoritative.
     let done = Store::open(&ctx)
         .transact(
-            Verb::Repair,
+            Some(Verb::Repair),
             "kanspec repair t-9c41 --why \"imported\"",
             move |_s: &Snapshot, _m: &Minter| {
                 Ok(Plan::of(vec![Op::Transition {
@@ -340,7 +340,7 @@ fn a_hand_edited_state_is_caught_by_the_very_next_verb() {
     // And the very next ordinary verb now works.
     Store::open(&ctx)
         .transact(
-            Verb::Start,
+            Some(Verb::Start),
             "kanspec start t-9c41",
             start_plan(Verb::Start, vec![]),
         )
@@ -360,7 +360,7 @@ fn a_transaction_that_cannot_be_edited_in_place_is_refused_by_type() {
     let before = repo.read(".kanspec/tickets/t-9c41.md");
     let ctx = common::ctx_at(&repo.root);
     let e = refusal(Store::open(&ctx).transact(
-        Verb::Start,
+        Some(Verb::Start),
         "kanspec start t-9c41",
         start_plan(Verb::Start, vec![]),
     ));
@@ -375,7 +375,7 @@ fn a_missing_kanspec_directory_is_an_environment_refusal_not_a_panic() {
     std::fs::remove_dir_all(repo.root.join(".kanspec")).unwrap();
     let ctx = common::ctx_at(&repo.root);
     let e = refusal(Store::open(&ctx).transact(
-        Verb::Start,
+        Some(Verb::Start),
         "kanspec start t-9c41",
         start_plan(Verb::Start, vec![]),
     ));
@@ -407,7 +407,7 @@ Retries are not idempotent before the ledger write.
     let e = entity.clone();
     let c = contents.to_string();
     let done = Store::open(&ctx)
-        .transact(Verb::New, "kanspec quirk add", move |_s, _m| {
+        .transact(Some(Verb::New), "kanspec quirk add", move |_s, _m| {
             Ok(Plan::of(vec![Op::CreateEntity {
                 entity: e.clone(),
                 contents: c.clone(),
@@ -421,31 +421,36 @@ Retries are not idempotent before the ledger write.
     // The same plan a second time must be refused rather than overwrite the file.
     let e = entity.clone();
     let c = contents.to_string();
-    let err = refusal(
-        Store::open(&ctx).transact(Verb::New, "kanspec quirk add", move |_s, _m| {
-            Ok(Plan::of(vec![Op::CreateEntity {
-                entity: e.clone(),
-                contents: c.clone(),
-            }]))
-        }),
-    );
+    let err =
+        refusal(
+            Store::open(&ctx).transact(Some(Verb::New), "kanspec quirk add", move |_s, _m| {
+                Ok(Plan::of(vec![Op::CreateEntity {
+                    entity: e.clone(),
+                    contents: c.clone(),
+                }]))
+            }),
+        );
     assert_eq!(err.kind(), "conflict");
 
     // `SetFields` edits it in place, surgically.
     let e = entity.clone();
     Store::open(&ctx)
-        .transact(Verb::Confirm, "kanspec quirk fix q-11ba", move |_s, _m| {
-            Ok(Plan::of(vec![Op::SetFields {
-                entity: e.clone(),
-                sets: vec![
-                    (Key::Quirk(kanspec::keys::QuirkKey::Status), Yv::s("fixed")),
-                    (
-                        Key::Quirk(kanspec::keys::QuirkKey::FixedBy),
-                        Yv::s("t-9c41"),
-                    ),
-                ],
-            }]))
-        })
+        .transact(
+            Some(Verb::Confirm),
+            "kanspec quirk fix q-11ba",
+            move |_s, _m| {
+                Ok(Plan::of(vec![Op::SetFields {
+                    entity: e.clone(),
+                    sets: vec![
+                        (Key::Quirk(kanspec::keys::QuirkKey::Status), Yv::s("fixed")),
+                        (
+                            Key::Quirk(kanspec::keys::QuirkKey::FixedBy),
+                            Yv::s("t-9c41"),
+                        ),
+                    ],
+                }]))
+            },
+        )
         .expect("a quirk edit");
     let after = repo.read(".kanspec/quirks/q-11ba.md");
     assert!(after.contains("status: fixed"));
@@ -464,7 +469,9 @@ fn an_empty_plan_commits_nothing_and_is_still_a_success() {
     let before = repo.read(".kanspec/tickets/t-9c41.md");
     let ctx = common::ctx_at(&repo.root);
     let done = Store::open(&ctx)
-        .transact(Verb::Confirm, "kanspec scan", |_s, _m| Ok(Plan::empty()))
+        .transact(Some(Verb::Confirm), "kanspec scan", |_s, _m| {
+            Ok(Plan::empty())
+        })
         .expect("nothing to do is not a failure");
     assert!(done.touched.is_empty());
     assert_eq!(repo.read(".kanspec/tickets/t-9c41.md"), before);
@@ -485,7 +492,7 @@ fn sync_commit_makes_the_transaction_a_git_commit_of_the_tracker_alone() {
     let ctx = common::ctx_at(&repo.root);
     Store::open(&ctx)
         .transact(
-            Verb::Start,
+            Some(Verb::Start),
             "kanspec start t-9c41",
             start_plan(Verb::Start, vec![]),
         )

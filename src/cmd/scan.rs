@@ -137,11 +137,9 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
     // A SHORT transaction, holding the lock only for the write itself. `ScanToken` is what
     // makes "gitstate.json is written by scan and nothing else" a type fact.
     Store::open(ctx).transact(
-        // `Verb` is a TICKET transition verb and a scan transitions nothing; it reaches
-        // only the `sync = "commit"` message. `Confirm` is the table's own "non-transition,
-        // recorded" verb, which is the closest honest fit. (Request to F: `transact` wants
-        // an `Option<Verb>`, or a `Verb::Scan` that the transition table never accepts.)
-        Verb::Confirm,
+        // A scan transitions nothing, and `transact` now says so in the type — round C
+        // granted the `Option<Verb>` request S3 filed here and S5 and S6 filed again.
+        None,
         &ctx.invocation(),
         move |_s, _m| Ok(Plan::of(vec![Op::WriteGitState { token, state }])),
     )?;
@@ -180,7 +178,9 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
         why: a.why.clone().unwrap_or_default(),
         invocation: ctx.invocation(),
     };
-    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+    // A genuine ticket verb act, unlike the cache write above: `plan_confirm` pushes
+    // `Op::Transition { verb: Confirm }` and the attestation lands in the `## Log` (D-11).
+    let done = Store::open(ctx).transact(Some(Verb::Confirm), &ctx.invocation(), |s, _m| {
         scan::plan_confirm(s, &f, &id)
     })?;
 

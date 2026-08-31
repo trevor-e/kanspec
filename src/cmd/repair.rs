@@ -52,7 +52,7 @@ pub fn repair(ctx: &Ctx, a: &RepairArgs) -> Result<RepairReport> {
         at: ctx.now,
         invocation: ctx.invocation(),
     };
-    let done = Store::open(ctx).transact(Verb::Repair, &ctx.invocation(), |s, m| {
+    let done = Store::open(ctx).transact(Some(Verb::Repair), &ctx.invocation(), |s, m| {
         plan_repair(s, &f, a, m)
     })?;
 
