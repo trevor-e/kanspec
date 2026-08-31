@@ -162,6 +162,9 @@ pub struct StartReport {
     pub next: Vec<String>,
     /// whether the primary worktree was switched onto the ticket branch
     pub checked_out: bool,
+    /// The one-line hazard notice a `--worktree`-less claim earns under `sync = "batch"`.
+    /// See [`tracker_note`].
+    pub tracker_note: Option<String>,
 }
 
 pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
@@ -254,6 +257,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     Ok(StartReport {
         title: t.fm.title.clone(),
         state: t.fm.state,
+        tracker_note: tracker_note(ctx, a, &branch, &base),
         branch,
         worktree: wt_display.map(|p| p.display().to_string()),
         claimed_by: t.fm.claimed_by.clone().unwrap_or_else(|| ctx.actor.label()),
@@ -343,6 +347,14 @@ impl Render for StartReport {
         writeln!(w, "  context  {}", self.context_line())?;
         if let Some(u) = &self.url {
             writeln!(w, "  board    {u}")?;
+        }
+        if let Some(note) = &self.tracker_note {
+            writeln!(
+                w,
+                "  {} {}",
+                crate::out::paint("⚠ tracker", Color::Yellow, st.color),
+                note
+            )?;
         }
         for n in &self.next {
             writeln!(w, "  {} {n}", glyph::FIX)?;
@@ -615,6 +627,33 @@ fn primary_is_movable(ctx: &Ctx) -> bool {
         ])
         .map(|o| o.code == 0 && o.out.trim().is_empty())
         .unwrap_or(false)
+}
+
+/// The one line a `--worktree`-less claim earns, said at claim time rather than discovered
+/// three commands later.
+///
+/// Without `--worktree` the PRIMARY worktree — the tree that owns `.kanspec/` — ends up on
+/// the ticket branch, either because `start` switched it or because the report just told the
+/// agent to. Under `sync = "batch"` (the default, D-13) the tracker is deliberately left
+/// dirty there, so the near-universal `git add -A && git commit` sweeps
+/// `.kanspec/tickets/t-xxxx.md` onto the feature branch. main's board freezes, and the next
+/// verb re-dirties the file so `git checkout main` starts refusing outright.
+///
+/// kanspec does not own the user's git commands, so this cannot be *prevented* — the honest
+/// move is to name the hazard and the alternative in one line, and to make `status` able to
+/// see and undo it afterwards ([`crate::cmd::status::TrackerDrift`]).
+///
+/// Deliberately carries no `→ fix`: the only command that would swap this claim for the
+/// worktree arrangement is `start --worktree`, and `start` on a `doing` ticket is an illegal
+/// transition. A fix line that refuses when you run it is worse than no fix line.
+fn tracker_note(ctx: &Ctx, a: &StartArgs, branch: &str, base: &str) -> Option<String> {
+    if a.worktree || ctx.cfg.sync != crate::config::SyncMode::Batch {
+        return None;
+    }
+    Some(format!(
+        "`git add -A` on {branch} commits .kanspec/ where {base} never sees it \
+         — `--worktree` keeps the tracker on {base}"
+    ))
 }
 
 /// The switch itself, run after the claim actually landed — an attribution to a claim that
@@ -1194,6 +1233,7 @@ mod tests {
             url: None,
             next: Vec::new(),
             checked_out: false,
+            tracker_note: None,
         };
         // DESIGN.md's transcript, verbatim.
         assert_eq!(
