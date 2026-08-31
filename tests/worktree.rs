@@ -170,6 +170,96 @@ fn the_lock_is_the_primary_worktrees_lock_however_many_worktrees_there_are() {
     }
 }
 
+/// A linked worktree has a `.kanspec/config.toml` of its own — it is a tracked file, so
+/// `git worktree add` checks one out — and it is not the one that governs. If config
+/// resolution ever slipped from the primary to the cwd, an agent in a worktree would
+/// auto-commit while the human batched (or push to a different `main`, or mint IDs at a
+/// different width) and the two halves of one repo would silently disagree.
+#[test]
+fn the_config_a_linked_worktree_reads_is_the_primarys() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let wt = repo.worktree("t-9c41");
+    assert!(
+        wt.join(".kanspec/config.toml").exists(),
+        "the fixture is only honest if the worktree really has a config of its own"
+    );
+    // Two configs that disagree about something with a visible consequence.
+    std::fs::write(
+        wt.join(".kanspec/config.toml"),
+        "main = \"origin/main\"\nsync = \"commit\"\nid_width = 8\n",
+    )
+    .unwrap();
+    let head = repo.sha("HEAD");
+
+    let ctx = common::ctx_at(&wt);
+    assert!(ctx.repo.linked());
+    assert_eq!(
+        ctx.cfg.sync,
+        kanspec::config::SyncMode::Batch,
+        "the primary's config governs, not the one under the cwd"
+    );
+    assert_eq!(ctx.cfg.id_width, 4);
+
+    // And the consequence is real, not just a field read: a `sync = "commit"` config in
+    // the worktree would have turned this transaction into a git commit.
+    Store::open(&ctx)
+        .transact(
+            Verb::Start,
+            "kanspec start t-9c41",
+            start_plan(Verb::Start, vec![]),
+        )
+        .expect("the transaction must commit");
+    assert_eq!(
+        repo.sha("HEAD"),
+        head,
+        "batch sync leaves the tracker dirty; the worktree's `commit` must not have won"
+    );
+}
+
+/// Hermeticity, and the tri-state, at the `Ctx` level.
+///
+/// Every `TestRepo` has a bare local path for an `origin`, so `gh` has nothing it could
+/// answer about it — and must say so *without spawning anything*. This is what keeps the
+/// whole suite deterministic on a developer machine where `gh auth status` succeeds: a
+/// `Gh` that probed first and asked questions later would put a live network call inside
+/// every scan test.
+///
+/// The refusal shape matters as much as the refusal. `pr_for_head` declines with a reason
+/// rather than answering `Ok(vec![])`, because an empty list is a real observation
+/// ("GitHub knows of no PR for this branch") and reading "gh is not usable here" as one
+/// would be the first step down the road to a confident wrong "not merged".
+#[test]
+fn gh_is_unavailable_over_a_non_github_origin_and_says_why_rather_than_answering() {
+    assert!(
+        std::env::var_os("KANSPEC_GH_FIXTURES").is_none(),
+        "this test asserts the un-mocked behaviour; unset KANSPEC_GH_FIXTURES to run it"
+    );
+    let repo = TestRepo::new();
+    let wt = repo.worktree("reader");
+    let ctx = common::ctx_at(&wt);
+
+    assert!(
+        !ctx.gh.available(),
+        "`origin` is a bare local path — `gh` cannot have an opinion about it"
+    );
+
+    let view = ctx.gh.pr_view(142).unwrap_err().to_string();
+    assert!(
+        view.contains("not a GitHub remote"),
+        "the badge needs the reason, not an empty answer: {view}"
+    );
+
+    match ctx.gh.pr_for_head("ks/t-9c41-rate-limit-login") {
+        Ok(list) => panic!(
+            "an unusable `gh` must decline, not report {} PRs — an empty list is an \
+             observation about GitHub, and this is an observation about `gh`",
+            list.len()
+        ),
+        Err(e) => assert!(e.to_string().contains("not a GitHub remote"), "{e}"),
+    }
+}
+
 #[test]
 fn an_illegal_transition_is_refused_before_a_byte_moves() {
     let repo = TestRepo::new();
