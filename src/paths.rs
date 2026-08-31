@@ -222,6 +222,15 @@ impl KanspecDir {
 
 #[derive(Clone, Debug)]
 pub struct Layout {
+    /// The primary worktree root, carried explicitly.
+    ///
+    /// It used to be derived as `features_md.parent()`, on the reasoning that the
+    /// projections live at the repo root. That reasoning is only true while `[paths]
+    /// features` names a bare filename: `features = "docs/FEATURES.md"` made `repo_root()`
+    /// return `<root>/docs` and `gitattributes()` point at `<root>/docs/.gitattributes`,
+    /// i.e. a configurable path silently relocated a fixed one. The root is an input, so
+    /// it is stored rather than inferred.
+    root: PathBuf,
     ks: KanspecDir,
     features_md: PathBuf,
     architecture_md: PathBuf,
@@ -233,6 +242,7 @@ impl Layout {
     pub(crate) fn open(repo: &Repo, cfg: &Config) -> Layout {
         let root = repo.primary_root();
         Layout {
+            root: root.to_path_buf(),
             ks: KanspecDir::resolve(repo),
             features_md: root.join(&cfg.paths.features),
             architecture_md: root.join(&cfg.paths.architecture),
@@ -304,15 +314,12 @@ impl Layout {
     /// `.gitattributes` at the repo root — `init` writes the `merge=union` line for
     /// `comments.jsonl` there.
     pub fn gitattributes(&self) -> PathBuf {
-        // The projections live at the repo root, so their parent IS the repo root.
-        self.repo_root().join(".gitattributes")
+        self.root.join(".gitattributes")
     }
-    /// The primary worktree root, reachable only through the paths `Layout` already owns.
-    pub fn repo_root(&self) -> PathBuf {
-        self.features_md
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
+    /// The primary worktree root. Fixed at `open()` from `Repo::primary_root`, never
+    /// derived from a configurable path — see the field's note.
+    pub fn repo_root(&self) -> &Path {
+        &self.root
     }
 
     /// The `Op` applier's dispatch. Proposals are directories whose name carries a slug,
@@ -348,8 +355,12 @@ mod tests {
     use super::*;
 
     fn layout_at(root: &Path) -> Layout {
-        let cfg = Config::default();
+        layout_with(root, &Config::default())
+    }
+
+    fn layout_with(root: &Path, cfg: &Config) -> Layout {
         Layout {
+            root: root.to_path_buf(),
             ks: KanspecDir(root.join(".kanspec")),
             features_md: root.join(&cfg.paths.features),
             architecture_md: root.join(&cfg.paths.architecture),
@@ -389,6 +400,22 @@ mod tests {
         assert_eq!(l.gitattributes(), Path::new("/repo/.gitattributes"));
     }
 
+    /// `repo_root()` is an input, not something inferred from a configurable path. It was
+    /// once `features_md.parent()`, so `[paths] features = "docs/FEATURES.md"` moved the
+    /// repo root — and `.gitattributes`, which `init` writes the `merge=union` line to —
+    /// into `docs/`. Renaming a projection must not relocate a fixed path.
+    #[test]
+    fn a_projection_in_a_subdirectory_does_not_move_the_repo_root() {
+        let mut cfg = Config::default();
+        cfg.paths.features = "docs/FEATURES.md".into();
+        cfg.paths.architecture = "docs/deep/ARCH.md".into();
+        let l = layout_with(Path::new("/repo"), &cfg);
+
+        assert_eq!(l.features_md(), Path::new("/repo/docs/FEATURES.md"));
+        assert_eq!(l.repo_root(), Path::new("/repo"));
+        assert_eq!(l.gitattributes(), Path::new("/repo/.gitattributes"));
+    }
+
     #[test]
     fn path_for_dispatches_over_every_entity_kind() {
         let l = layout_at(Path::new("/repo"));
@@ -404,18 +431,46 @@ mod tests {
         );
     }
 
+    /// kanspec's own checkout is a git repo, which is the cheapest honest fixture — but it
+    /// is a *primary* worktree only when the suite runs from the main checkout. Every agent
+    /// working in a `.claude/worktrees/` linked worktree runs it from a linked one, so the
+    /// shape assertions branch instead of assuming. Both arms assert, so neither is a
+    /// vacuous pass: the properties that must hold everywhere are checked unconditionally,
+    /// and each shape's distinguishing fact is checked in its own arm.
     #[test]
     fn discover_finds_this_very_repository() {
-        // kanspec's own checkout is a git repo, which is the cheapest honest fixture.
         let here = std::env::current_dir().unwrap();
         let repo = Repo::discover(&here, None).expect("kanspec's own checkout is a git repo");
+
+        // True in both shapes, and the whole point of `Repo`: the primary root is the
+        // crate's own checkout, and the store hangs off it and not off the linked worktree.
         assert!(repo.primary_root().join(".git").exists());
-        assert!(!repo.linked(), "the crate root is the primary worktree");
-        assert_eq!(repo.git_dir(), repo.common_dir());
+        assert!(
+            repo.primary_root().join("Cargo.toml").is_file(),
+            "primary_root must resolve to the crate root, not to a linked worktree: {}",
+            repo.primary_root().display()
+        );
         assert_eq!(
             KanspecDir::resolve(&repo).config_toml(),
             repo.primary_root().join(".kanspec/config.toml")
         );
+
+        if repo.linked() {
+            // A linked worktree has its own git dir *inside* the shared common dir.
+            assert_ne!(
+                repo.git_dir(),
+                repo.common_dir(),
+                "a linked worktree's git dir is its own"
+            );
+            assert!(
+                repo.git_dir().starts_with(repo.common_dir()),
+                "{} is not under {}",
+                repo.git_dir().display(),
+                repo.common_dir().display()
+            );
+        } else {
+            assert_eq!(repo.git_dir(), repo.common_dir());
+        }
     }
 
     #[test]

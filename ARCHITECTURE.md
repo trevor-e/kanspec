@@ -902,8 +902,13 @@ impl Git {
     pub fn grep_trailer(&self, base: &str, id: &TicketId) -> Tri<Vec<Sha>>;
     pub fn cherry(&self, base: &str, head: &Sha) -> Tri<Vec<CherryLine>>;
     pub fn changed_paths(&self, base: &str, head: &str) -> Tri<Vec<ChangedPath>>;  // 3-dot -M -z
-    pub fn merges_touching(&self, since: &Sha, globs: &[Pathspec]) -> Tri<u32>;    // --first-parent
-    pub fn last_touch(&self, p: &Pathspec) -> Option<(Sha, DateTime<Utc>)>;
+    /// `base` is explicit and REQUIRED: the range is `<since>..<base>`, and without a
+    /// named ref it would default to HEAD — in the primary worktree, whatever branch the
+    /// human happens to be standing on. Same for `last_touch`: the spec's last-edit anchor
+    /// must be read on a named ref. (Both corrected in round A from a signature that
+    /// omitted the ref while its own comment named it.)
+    pub fn merges_touching(&self, since: &Sha, base: &str, globs: &[Pathspec]) -> Tri<u32>; // --first-parent
+    pub fn last_touch(&self, rev: &str, p: &Pathspec) -> Option<(Sha, DateTime<Utc>)>;
     pub fn ahead_behind(&self, base: &str, head: &str) -> Option<(u32, u32)>;
     pub fn last_commit_at(&self, rev: &str) -> Option<DateTime<Utc>>;
     pub fn fetch(&self) -> Result<()>;
@@ -923,7 +928,19 @@ impl Git {
 `src/gh.rs` — **the one and only mock seam in the crate.**
 
 ```rust
-pub struct Gh { slug: Option<String>, fixtures: Option<PathBuf>, authed: OnceCell<bool> }
+/// All fields private, so nothing outside `gh.rs` can observe their shape. Three
+/// round-A corrections to the original `{ slug: Option<String>, fixtures, authed:
+/// OnceCell<bool> }`:
+///   * `OnceCell` is `!Sync` and breaks `Arc<Ctx>: Send + Sync` (§2.6) — `OnceLock`
+///     memoizes identically and is the `Sync` one.
+///   * `mode` is REQUIRED to honour `[git] gh = auto|always|never`, which the original
+///     field list omitted; `never` must win over every other path, fixture seam included.
+///   * `root` + a `OnceLock` slug deliver the deferral `detect`'s own doc comment
+///     promises. A plain `Option<String>` can only be filled eagerly in `detect`, which
+///     puts a subprocess in `Ctx::open` for every command — including the ~90% that
+///     never ask `gh` anything.
+pub struct Gh { root: PathBuf, slug: OnceLock<Option<String>>, mode: GhCfg,
+                fixtures: Option<PathBuf>, authed: OnceLock<bool> }
 #[derive(Debug, Clone, Serialize)] pub struct GhUnavailable(pub String);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrInfo { pub number: u64, pub state: PrState, pub merged_at: Option<DateTime<Utc>>,
@@ -941,10 +958,33 @@ impl Gh {
     pub fn pr_view(&self, n: u64) -> std::result::Result<PrInfo, GhUnavailable>;
     /// REQUIRED, not optional: a squash-merged ticket with `pr: null` would
     /// otherwise skip the only rung that can see a title-only squash.
+    /// `--state all` — the PR that landed a squash is MERGED, and therefore
+    /// invisible to `gh pr list`'s default `--state open`. Sorted merged-first /
+    /// newest-merge-first, so §7's literal `.find(|p| p.state == Merged)` picks the
+    /// right PR when a branch name has been reused.
     pub fn pr_for_head(&self, branch: &str)
         -> std::result::Result<Vec<PrInfo>, GhUnavailable>;
 }
+
+/// Free functions, added in round A. Neither changes a signature above.
+///
+/// The ONE place a list of PRs becomes a verdict, so "gh answered, and nothing it
+/// showed had landed" cannot be spelled two ways. `Some` only for a PR GitHub itself
+/// reports MERGED (most recent merge wins on a reused branch name); `None` is
+/// inconclusive and NEVER a negative — a closed PR's commits can still have been
+/// cherry-picked onto main.
+pub fn merged_pr(list: &[PrInfo]) -> Option<&PrInfo>;
+
+/// The fixture seam's file-naming convention as CODE rather than a comment a later
+/// slice has to guess: `pr-142`, `head-ks-t-9c41-x` (every character a branch may
+/// carry but a flat filename may not is folded to `-`). Feed either straight to
+/// `TestRepo::gh_fixture(name, json)`, which appends `.json`.
+pub fn fixture_name_pr(n: u64) -> String;
+pub fn fixture_name_head(branch: &str) -> String;
 ```
+
+**A missing fixture is inconclusive, never empty.** A test that forgets to record one
+gets `unknown`, never a false "not merged" — the difference the seam exists for.
 
 ### 2.12 `src/out.rs` — one rendering layer
 
@@ -1050,8 +1090,16 @@ impl<'c> Store<'c> {
 /// The allowlist is exactly TWO files and its own length is asserted, so it
 /// cannot grow silently: `lock.rs` (creates the very lockfile it then locks) and
 /// `cmd/init.rs` (scaffolds `.kanspec/` before a store can exist).
-/// `hooks.rs` / `setup.rs` write outside `.kanspec/` (`.git/hooks`, CLAUDE.md)
-/// and are covered by a second grep asserting they name no `.kanspec` path.
+///
+/// ROUND-A CORRECTION. This used to say `hooks.rs` / `setup.rs` "write outside
+/// `.kanspec/`" and are exempted by a second grep. They are NOT exempt — the grep
+/// skips only `store.rs` and the allowlist — so those two files may not contain a
+/// mutator at all. That turned out to be the better design and it stands: `hooks.rs`
+/// and `setup.rs` are PURE PLANNERS over a typed `hooks::Edit`, and the allowlisted
+/// `cmd::init::apply` is their single applier — the same planner/applier split
+/// `Store::transact` makes for the store. The second grep still runs, and now asserts
+/// something stronger than it was written for: those two planners may never name a
+/// path under `.kanspec/`, so the store's ground stays `store.rs`'s alone.
 pub(crate) fn write_atomic(p: &Path, bytes: &[u8], _t: &LockToken) -> Result<()>;
 pub(crate) fn append_line(p: &Path, line: &str, _t: &LockToken) -> Result<()>;
 pub(crate) fn move_dir(a: &Path, b: &Path, _t: &LockToken) -> Result<()>;
@@ -1689,7 +1737,11 @@ libc          = "0.2.189"                  # flock(2) only — ~40 lines, zero n
 notify        = "8.2.0"
 owo-colors    = { version = "4.4.0", features = ["supports-colors"] }
 pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
-rust-embed    = { version = "8.12.0", features = ["mime-guess"] }
+# `debug-embed` is NOT optional (added round A). Without it rust-embed reads `docs/`
+# and `assets/` off disk in a debug build, at the absolute path baked in at compile
+# time — so `kanspec instructions` lists no topics and 404s every real one, and `up`
+# would serve the SPA only on its own build machine. Dogfooding runs debug builds.
+rust-embed    = { version = "8.12.0", features = ["mime-guess", "debug-embed"] }
 serde         = { version = "1.0.229", features = ["derive"] }
 serde_json    = "1.0.151"
 serde_yaml_ng = "0.10.0"                   # READ-SIDE DESERIALIZER ONLY; never to_string
@@ -1783,6 +1835,13 @@ only rung that catches the title-only squash. **Git itself is never mocked**, an
 `trait GitBackend`, because the second implementation does not exist. `insta` filters normalizing
 SHAs, timestamps and generated ids are written with the **first** snapshot, not retrofitted.
 
+One more env var exists and is deliberately NOT in that list, because it is read by the installed
+shell hooks rather than by `Ctx::open` and it changes no answer kanspec computes: **`KANSPEC_BIN`**
+overrides the binary path a hook invokes (hooks default to the name the user ran `init` as, and
+no-op silently when it is not on `PATH`). It exists so `tests/setup_hooks.rs` can point a real git
+hook at `target/debug/kanspec`; nothing in the product reads it. Owner: S7, documented in
+`docs/config.md`.
+
 **How each slice tests in isolation.** Every slice's public surface exists as a signature after
 wave 0, so a slice compiles and unit-tests against `unimplemented!()` neighbours from hour one.
 Only *runtime* integration waits on a dependency, and the gate for each slice (§10) names exactly
@@ -1824,9 +1883,9 @@ a bare origin and the six merge shapes.
 
 | # | Slice | Owns (exclusive write) | Depends on (reads only) | Must NOT touch |
 |---|---|---|---|---|
-| **F** | **Foundation** | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `src/lib.rs`, `src/bin/*`, `cli.rs`, `ctx.rs`, `error.rs`, `out.rs`, `paths.rs`, `config.rs`, `ids.rs`, `keys.rs`, `logentry.rs`, `model.rs`, `transitions.rs`, `plan.rs`, `cmd/mod.rs`, `tests/common/**`, `tests/fixtures/**`, `tests/cli_well_formed.rs`, `tests/cli_smoke.rs` | — | any slice file after wave 0 |
+| **F** | **Foundation** | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `src/lib.rs`, `src/bin/*`, `cli.rs`, `ctx.rs`, `error.rs`, `out.rs`, `paths.rs`, `config.rs`, `ids.rs`, `keys.rs`, `logentry.rs`, `model.rs`, `transitions.rs`, `plan.rs`, `cmd/mod.rs`, `tests/common/**`, `tests/fixtures/**` *except* `tests/fixtures/gh/**` (S2's, see below), `tests/cli_well_formed.rs`, `tests/cli_smoke.rs` | — | any slice file after wave 0 |
 | **S1** | **Write path** | `fm.rs`, `lock.rs`, `store.rs`, `tests/{fm_bytes,lock,single_write_path}.rs` | F | everything else |
-| **S2** | **Git** | `git.rs`, `gh.rs`, `tests/worktree.rs` | F | everything else |
+| **S2** | **Git** | `git.rs`, `gh.rs`, `tests/worktree.rs`, `tests/fixtures/gh/**` | F | everything else |
 | **S3** | **Scan** | `scan.rs`, `cache.rs`, `cmd/scan.rs`, `cmd/repair.rs`, `tests/{scan_ladder,proof_is_sealed}.rs` | F, S1(store), S2(git,gh) | everything else |
 | **S4** | **Derive + doctor** | `derive.rs`, `doctor.rs`, `cmd/doctor.rs`, `cmd/status.rs`, `tests/{purity,transition_table,doctor_replay,cache_wipe}.rs` | F, S1, S3(cache types) | everything else |
 | **S5** | **Ticket verbs** | `triage.rs`, `cmd/ticket.rs`, `cmd/flow.rs`, `cmd/done.rs`, `tests/lifecycle.rs` | F, S1, S2, S3(`Landed`,`proof_for_done`), S4(derive) | everything else |
@@ -1912,7 +1971,7 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-2 | Crate list names `gray_matter` | **Removed.** It cannot serialize and mutates content. `src/fm.rs` (first-party) + `serde_yaml_ng` read-only. |
 | D-3 | Ladder rung 4 "patch-id — last resort for squashes" | **Backwards.** Relabelled *rebase/cherry-pick detection*; a `+` line is `Unknown`, never `NotMerged`. |
 | D-4 | Ladder order not fully specified | **Two guards added** before rung 1: object-exists, and `rev-list --count main..head != 0` (a fresh `start` branch is trivially an ancestor — a verified false MERGED). |
-| D-5 | "`prepare-commit-msg` (per-branch, set by `start`)" | **Git has no per-branch hooks.** One repo-wide hook dispatching on `git symbolic-ref --short HEAD`, skipping `$2 ∈ {merge, squash, commit}`. Installed by `init`, not by `start`. |
+| D-5 | "`prepare-commit-msg` (per-branch, set by `start`)" | **Git has no per-branch hooks.** One repo-wide hook dispatching on `branch.<name>.kanspec-ticket` (read through `hooks::BRANCH_TICKET_KEY` / `hooks::branch_ticket_key`, which `start` must use for the same spelling), skipping `$2 ∈ {merge, squash, commit}`. Installed by `init`, not by `start`. **Round-A correction: it is a PAIR of hooks, not one.** `prepare-commit-msg` runs *before* the editor, so on an interactive commit the message is still empty — and stamping it makes it non-empty, silently destroying git's "an empty message aborts the commit" (reproduced against real git: `GIT_EDITOR=true git commit` committed with the message `Kanspec: t-9c41`). So `prepare-commit-msg` stamps only a message that already has content (`-m`/`-F`/`-t`), and a companion **`commit-msg`** hook, which runs *after* the editor, stamps the rest. Neither stamps twice; both skip a merge, a squash, and anything below a `git commit -v` scissors line. `hooks::HOOKS` therefore has four entries: `post-merge`, `post-checkout`, `prepare-commit-msg`, `commit-msg`. |
 | D-6 | "resolves `git rev-parse --git-common-dir`" | Insufficient: it is *relative* in the primary worktree. `--path-format=absolute` + `git_dir == common_dir` **first** + `worktree list` fallback + a sanity check that **refuses** rather than guessing. |
 | D-7 | Hooks installed (implied `.git/hooks`) | **Resolve via `rev-parse --git-path hooks`**; `core.hooksPath` (husky/lefthook) makes `.git/hooks` inert. Install kanspec as the entrypoint, move any pre-existing hook to `<hook>.d/10-<name>`. Naive append is unsafe two ways (`exit 0` starvation; missing trailing newline). |
 | D-8 | `head:` "survives branch deletion" | **Narrower than claimed:** ~2 weeks post-reflog-expiry, then gc removes it, and it only rescues rung 1 — which only fires when the SHA is reachable from main anyway. Still recorded: it is `cherry`'s input, the CI-by-SHA key, and `--explain` provenance. |

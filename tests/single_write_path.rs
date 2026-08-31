@@ -22,9 +22,11 @@ const ALLOWLIST: &[&str] = &[
     "cmd/init.rs",
 ];
 
-/// Files that write OUTSIDE `.kanspec/` — git hooks and the agent snippet in CLAUDE.md.
-/// They are held to a different rule: they may touch the filesystem, but they may not name
-/// a path under `.kanspec/`.
+/// Files that PLAN edits outside `.kanspec/` — git hooks and the agent snippet in
+/// CLAUDE.md. They are held to a second rule on top of the first: they contain no mutator
+/// (the grep above covers them like everything else, and they pass it by planning a typed
+/// `hooks::Edit` list that the allowlisted `cmd::init::apply` executes), and on top of that
+/// they may never name a path under `.kanspec/` — that ground is `store.rs`'s alone.
 ///
 /// `project.rs` is deliberately NOT here: it *generates* `KANSPEC-*.md`, but it hands the
 /// bytes to `Op::WriteGenerated`, so it is not a writer at all.
@@ -142,7 +144,7 @@ fn the_files_that_write_outside_kanspec_never_name_a_path_inside_it() {
     }
     assert!(
         violations.is_empty(),
-        "these files write to the filesystem, so they must never name a path under \
+        "these files plan edits outside the store, so they must never name a path under \
          `.kanspec/` — that is `store.rs`'s ground:\n  {}",
         violations.join("\n  ")
     );

@@ -124,10 +124,11 @@ fn plan_scaffold(ctx: &Ctx) -> Scaffold {
         path: ctx.layout.cache_dir(),
     });
     s.append_line(&root, store.join(".gitignore"), CACHE_IGNORE);
-    // NOT `Layout::gitattributes()`: that derives the repo root from the features
-    // projection's parent, which stops being the repo root the moment `[paths] features`
-    // names a subdirectory. `Repo::primary_root` is the actual answer. (Reported to F.)
-    s.append_line(&root, root.join(".gitattributes"), GITATTRIBUTES_LINE);
+    // `Layout::gitattributes()` used to derive the repo root from the features
+    // projection's parent, which stopped being the repo root the moment `[paths] features`
+    // named a subdirectory. `Layout` now carries the root explicitly (round-A fix in
+    // paths.rs), so this goes back through the one type allowed to name a path.
+    s.append_line(&root, ctx.layout.gitattributes(), GITATTRIBUTES_LINE);
     s
 }
 
