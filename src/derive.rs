@@ -417,10 +417,20 @@ pub fn double_claims(s: &Snapshot) -> Vec<(TicketId, Vec<String>)> {
     out
 }
 
-/// Spec staleness, RECOMPUTED at read time from per-ticket cached `changed_paths` matched
-/// against the spec's `code:` globs since its last-edit anchor. **Never an accumulated
-/// counter**: a counter in a disposable cache silently resets to zero on `rm -rf cache/`
-/// and UNDER-fires the tripwire — the dangerous direction (D-10).
+/// Spec staleness, RECOMPUTED at read time from the git observations `scan` recorded:
+/// `SpecAnchor::merges_since` — every merge on main touching the spec's `code:` globs
+/// since its last-edit anchor — widened by the per-ticket cached `changed_paths`, which
+/// name examples. **Never an accumulated counter**: both numbers are fresh answers to git
+/// questions, so `rm -rf cache/` erases the answer (→ `NeverScanned`) rather than resetting
+/// a tally to a confident zero, which would UNDER-fire the tripwire — the dangerous
+/// direction (D-10).
+///
+/// The recorded count is the half that makes this fire on work kanspec never tracked: a
+/// teammate's PR, a hotfix pushed straight to main, a dependabot bump, everything that
+/// predates adoption. None of those has a ticket, so none appears in `GitState.tickets` —
+/// and counting only kanspec's own merged tickets left the wire silent on exactly the
+/// repos whose specs drift furthest. The two counts OVERLAP (a kanspec ticket's merge is
+/// one of the merges git counted), so they combine with `max`, never a sum.
 ///
 /// The two anchors are both durable in their own way. `last_edit_at` is a git fact
 /// recomputed by every `scan`; `stale_ack` lives in the spec's own frontmatter, so the
@@ -443,28 +453,39 @@ pub fn staleness(s: &Snapshot, spec: &Spec) -> Staleness {
         };
     }
 
-    let since = [
-        anchor.last_edit_at,
-        spec.fm.stale_ack.as_ref().map(|a| a.at),
-    ]
-    .into_iter()
-    .flatten()
-    .max();
+    let last_edit = anchor.last_edit_at;
+    let ack = spec.fm.stale_ack.as_ref().map(|a| a.at);
+    let since = [last_edit, ack].into_iter().flatten().max();
 
-    if let (Some(since), Some(set)) = (since, globs_of(spec)) {
+    if let Some(since) = since {
+        // `scan` measured `merges_since` from `last_edit_at` and from nowhere else, so it
+        // only answers the question being asked while the last edit IS the anchor. An
+        // attestation that postdates it SUPERSEDES the count rather than being subtracted
+        // from it — otherwise `--confirm` could not clear a spec until the ack commit
+        // itself reached main, and a decrement is the counter D-10 forbids.
+        let recorded = if spec.fm.code.is_empty() || ack > last_edit {
+            0
+        } else {
+            anchor.merges_since
+        };
+        // kanspec's own merged tickets — already inside `recorded`, and here to NAME the
+        // drift, and to answer at all when git could not (`merges_touching` declining
+        // records a 0, and a 0 must never read as "nothing happened").
         let mut examples: Vec<TicketId> = Vec::new();
-        for (id, fact) in &s.git.tickets {
-            if fact.status != MergeStatus::Merged {
-                continue;
-            }
-            if !fact.changed.iter().any(|p| set.is_match(p)) {
-                continue;
-            }
-            if landed_since(s, id, since) {
-                examples.push(id.clone());
+        if let Some(set) = globs_of(spec) {
+            for (id, fact) in &s.git.tickets {
+                if fact.status != MergeStatus::Merged {
+                    continue;
+                }
+                if !fact.changed.iter().any(|p| set.is_match(p)) {
+                    continue;
+                }
+                if landed_since(s, id, since) {
+                    examples.push(id.clone());
+                }
             }
         }
-        let merges = examples.len() as u32;
+        let merges = recorded.max(examples.len() as u32);
         if merges >= s.cfg.windows.stale_merges.max(1) {
             examples.truncate(5);
             return Staleness::Stale {
@@ -479,6 +500,11 @@ pub fn staleness(s: &Snapshot, spec: &Spec) -> Staleness {
         return Staleness::DeadGlobs {
             globs: dead.clone(),
         };
+    }
+    if since.is_none() {
+        // D-10 at its quietest end: an anchor with no point to count FROM has not been
+        // measured. "I have never looked" must never render as "I looked and it is fine".
+        return Staleness::NeverScanned;
     }
     Staleness::Ok
 }
@@ -1458,12 +1484,17 @@ mod tests {
     }
 
     fn anchor(at: Option<DateTime<Utc>>, dead: &[&str]) -> SpecAnchor {
+        anchor_counting(at, 0, dead)
+    }
+
+    /// An anchor carrying what `scan` asked git: the merges on main touching the spec's
+    /// globs since `at`. A RESULT, recomputed whole every scan — not a tally anything
+    /// increments (D-10).
+    fn anchor_counting(at: Option<DateTime<Utc>>, merges: u32, dead: &[&str]) -> SpecAnchor {
         SpecAnchor {
             last_edit_sha: Some("deadbee".into()),
             last_edit_at: at,
-            // Deliberately a LIE: nothing in `derive` may read it, because a counter in a
-            // disposable cache silently resets on wipe (D-10).
-            merges_since: 999,
+            merges_since: merges,
             dead_globs: dead.iter().map(|d| d.to_string()).collect(),
         }
     }
@@ -1539,6 +1570,147 @@ mod tests {
             matches!(staleness(&s, &spec), Staleness::Ok),
             "the git-tracked attestation is the new anchor (D-10)"
         );
+    }
+
+    /// THE headline case, and the one the ticket-only count could never see: every merge
+    /// that touched the spec's code went through somebody else's PR, a hotfix or a
+    /// dependabot bump. `GitState.tickets` is EMPTY, and the wire must still trip.
+    #[test]
+    fn merges_no_kanspec_ticket_ever_saw_still_trip_the_wire() {
+        let mut s = snap();
+        let spec = spec_with(&["src/auth/**"]);
+        s.git.specs.insert(
+            spec.name.clone(),
+            anchor_counting(Some(ago(24 * 30)), 4, &[]),
+        );
+        s.specs.insert(spec.name.clone(), spec.clone());
+        assert!(s.git.tickets.is_empty(), "nothing kanspec tracked");
+
+        match staleness(&s, &spec) {
+            Staleness::Stale {
+                merges, examples, ..
+            } => {
+                assert_eq!(merges, 4, "the count git gave `scan`");
+                assert!(
+                    examples.is_empty(),
+                    "there is no ticket to name — the drift is real anyway"
+                );
+            }
+            other => panic!("a spec drifting under untracked merges must go stale: {other:?}"),
+        }
+        // ...and it reaches `status` as a WATCHING line with its one-command fix.
+        let a = attention(&s)
+            .into_iter()
+            .find(|a| a.subject == "auth")
+            .expect("a stale spec line");
+        assert_eq!(
+            a.line,
+            "4 merges touched src/auth/** since spec last edited"
+        );
+        assert_eq!(a.fix, "kanspec features --stale");
+    }
+
+    #[test]
+    fn the_recorded_count_and_the_tickets_are_the_same_merges_so_they_never_sum() {
+        // Three merged kanspec tickets AND a recorded count of 4: the tickets are three of
+        // those four merges. Summing would say 7 and over-fire by naming merges that never
+        // happened; taking the larger keeps the answer git's.
+        let (mut s, spec) = stale_snapshot();
+        s.git.specs.insert(
+            spec.name.clone(),
+            anchor_counting(Some(ago(24 * 30)), 4, &[]),
+        );
+        match staleness(&s, &spec) {
+            Staleness::Stale {
+                merges, examples, ..
+            } => {
+                assert_eq!(merges, 4);
+                assert_eq!(examples.len(), 3, "the tickets still NAME what they can");
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+
+        // And the other way round: git could not answer (a decline records a 0), so the
+        // tickets carry the count on their own.
+        s.git.specs.insert(
+            spec.name.clone(),
+            anchor_counting(Some(ago(24 * 30)), 0, &[]),
+        );
+        assert!(matches!(
+            staleness(&s, &spec),
+            Staleness::Stale { merges: 3, .. }
+        ));
+    }
+
+    #[test]
+    fn an_attestation_supersedes_the_recorded_count_it_postdates() {
+        let mut s = snap();
+        let mut spec = spec_with(&["src/auth/**"]);
+        s.git.specs.insert(
+            spec.name.clone(),
+            anchor_counting(Some(ago(24 * 30)), 4, &[]),
+        );
+        s.specs.insert(spec.name.clone(), spec.clone());
+        assert!(matches!(staleness(&s, &spec), Staleness::Stale { .. }));
+
+        // `scan` measured those 4 from the spec's last edit, a month ago. The human looked
+        // an hour ago and signed for it, so the count no longer answers the question — and
+        // nobody decremented it: the cache still says 4.
+        spec.fm.stale_ack = Some(StaleAck {
+            sha: "a1b9c3d".into(),
+            at: ago(1),
+            by: "trevor".into(),
+            why: "refactor only".into(),
+        });
+        assert!(
+            matches!(staleness(&s, &spec), Staleness::Ok),
+            "the newer attestation is the anchor (D-10)"
+        );
+        assert_eq!(s.git.specs[&spec.name].merges_since, 4);
+
+        // An attestation OLDER than the spec's own last edit says nothing about merges
+        // counted from that edit, so the count still stands.
+        spec.fm.stale_ack.as_mut().unwrap().at = ago(24 * 60);
+        assert!(matches!(
+            staleness(&s, &spec),
+            Staleness::Stale { merges: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn an_anchor_with_nothing_to_count_from_is_never_a_green_tick() {
+        // The spec exists and was scanned, but `git log <main> -- <spec>` found nothing:
+        // it has never been committed. There is no point to count merges from, and D-10's
+        // rule is the same at the quiet end — "I have never looked" may not render as
+        // "I looked and it is fine".
+        let mut s = snap();
+        let spec = spec_with(&["src/auth/**"]);
+        s.git
+            .specs
+            .insert(spec.name.clone(), anchor_counting(None, 0, &[]));
+        s.specs.insert(spec.name.clone(), spec.clone());
+        assert!(matches!(staleness(&s, &spec), Staleness::NeverScanned));
+
+        // Glob rot still outranks it: a dead glob is something we DID observe.
+        s.git.specs.insert(
+            spec.name.clone(),
+            anchor_counting(None, 0, &["src/auth/**"]),
+        );
+        assert!(matches!(staleness(&s, &spec), Staleness::DeadGlobs { .. }));
+
+        // ...and an attestation is an anchor even with no last edit, so the spec is then
+        // genuinely `Ok` rather than unmeasured.
+        let mut acked = spec.clone();
+        acked.fm.stale_ack = Some(StaleAck {
+            sha: "a1b9c3d".into(),
+            at: ago(1),
+            by: "trevor".into(),
+            why: "brand new spec".into(),
+        });
+        s.git
+            .specs
+            .insert(spec.name.clone(), anchor_counting(None, 0, &[]));
+        assert!(matches!(staleness(&s, &acked), Staleness::Ok));
     }
 
     #[test]

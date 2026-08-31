@@ -303,6 +303,63 @@ fn every_answer_that_does_not_come_from_git_survives_the_wipe_unchanged() {
     assert_eq!(cycles_before, derive::dep_cycles(&after));
 }
 
+/// The same property for the half of staleness that has NO ticket behind it.
+///
+/// `SpecAnchor::merges_since` is what `scan` got back from
+/// `rev-list --count --first-parent <last edit>..<main> -- <globs>`: every merge that
+/// touched the spec's code, including the teammate PRs, hotfixes and dependabot bumps
+/// kanspec never tracked. It is a RESULT recomputed whole on every scan, so a wipe must
+/// erase it to *never scanned* — the moment it degraded to a confident **zero** it would
+/// be an accumulator, and the tripwire would go quiet on exactly the repos that need it.
+#[test]
+fn a_recorded_merge_count_with_no_ticket_behind_it_degrades_to_never_scanned() {
+    let repo = TestRepo::new();
+    fixture(&repo);
+    // Four merges against `src/auth/**` that no kanspec ticket accounts for: `tickets`
+    // holds exactly one auth fact (t-31aa), which is 1 < the window of 3.
+    let untracked = CACHE.replace(
+        r#""auth":     {"last_edit_sha":"aaa1111","last_edit_at":"2026-08-31T00:00:00Z",
+                 "merges_since":0"#,
+        r#""auth":     {"last_edit_sha":"aaa1111","last_edit_at":"2026-08-31T00:00:00Z",
+                 "merges_since":4"#,
+    );
+    assert!(
+        untracked.contains(r#""merges_since":4"#),
+        "the edit applied"
+    );
+    repo.write(".kanspec/cache/gitstate.json", &untracked);
+
+    let auth = SpecName::parse("auth").unwrap();
+    let s = snapshot(&repo);
+    assert!(
+        matches!(
+            derive::staleness(&s, &s.specs[&auth]),
+            Staleness::Stale { merges: 4, .. }
+        ),
+        "work kanspec never tracked still drifts the spec: {:?}",
+        derive::staleness(&s, &s.specs[&auth])
+    );
+
+    wipe_cache(&repo);
+    let s = snapshot(&repo);
+    assert!(
+        matches!(
+            derive::staleness(&s, &s.specs[&auth]),
+            Staleness::NeverScanned
+        ),
+        "a wipe must SUBTRACT the count, never resolve it to a clean zero (D-10)"
+    );
+
+    // Putting the same bytes back reproduces the same verdict: nothing was accumulated.
+    std::fs::create_dir_all(repo.root.join(".kanspec/cache")).unwrap();
+    repo.write(".kanspec/cache/gitstate.json", &untracked);
+    let s = snapshot(&repo);
+    assert!(matches!(
+        derive::staleness(&s, &s.specs[&auth]),
+        Staleness::Stale { merges: 4, .. }
+    ));
+}
+
 #[test]
 fn a_human_attestation_outlives_the_cache_because_it_lives_in_the_spec() {
     let repo = TestRepo::new();
