@@ -1,0 +1,66 @@
+[package]
+name        = "kanspec"
+version     = "0.1.0"
+edition     = "2021"                       # house style (~/dev/homerunner), NOT cargo's 2024 default
+rust-version = "1.85"
+description = "kanban + spec review over plain git-tracked files"
+license     = "MIT"
+default-run = "kanspec"
+
+[[bin]]
+name = "kanspec"
+path = "src/bin/kanspec.rs"
+[[bin]]
+name = "ks"                                # cargo-dist ships every [[bin]]; a symlink does not survive
+path = "src/bin/ks.rs"
+
+[lib]
+name = "kanspec"
+path = "src/lib.rs"
+
+[features]
+default = []
+# v0.2. Bundled rusqlite compiles SQLite from C on every clean build and is by far
+# the largest compile cost in the set for code v0.1 never calls. Moves into
+# `default` when ci.rs lands.
+ci-homerunner = ["dep:rusqlite"]
+
+[dependencies]
+anyhow        = "1.0.104"
+axum          = "0.8.9"                    # default features; SSE is NOT feature-gated
+chrono        = { version = "0.4.45", features = ["serde"] }
+clap          = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+comfy-table   = "8.0.0"
+globset       = "0.4.20"
+libc          = "0.2.189"                  # flock(2) only — ~40 lines, zero new supply chain
+notify        = "8.2.0"
+owo-colors    = { version = "4.4.0", features = ["supports-colors"] }
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+rust-embed    = { version = "8.12.0", features = ["mime-guess"] }
+serde         = { version = "1.0.229", features = ["derive"] }
+serde_json    = "1.0.151"
+serde_yaml_ng = "0.10.0"                   # READ-SIDE DESERIALIZER ONLY; never to_string
+thiserror     = "2.0.20"
+tokio         = { version = "1.53.1", features = [
+                  "rt-multi-thread", "macros", "signal", "time", "net", "fs", "sync"] }
+tokio-stream  = { version = "0.1", features = ["sync"] }   # wrappers::BroadcastStream
+toml          = "1.1.4"                    # NOTE: 1.x, not 0.8
+rusqlite      = { version = "0.40.2", features = ["bundled"], optional = true }
+
+# DELIBERATELY ABSENT:
+#   gray_matter — cannot serialize at all, and mutates the content it returns
+#   tower-http  — axum 0.8 alone covers SSE + a 12-line embedded-asset fallback;
+#                 verified 9 direct deps / 1.3 MB stripped for the whole server
+#   futures     — tokio-stream's merge + map_while replaces take_until
+#   a git library — shell out for exact parity with the user's git
+
+[dev-dependencies]
+insta    = { version = "1.48.0", features = ["json", "filters"] }
+tempfile = "3.27.0"
+
+[profile.release]
+lto    = true
+strip  = true
+opt-level = 3
+codegen-units = 1

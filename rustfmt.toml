@@ -1,0 +1,7 @@
+# kanspec house style. Deliberately close to rustfmt defaults so `cargo fmt` is never
+# a merge magnet across nine parallel slice agents — only the width is widened, because
+# the contract's signatures and doc comments are written to a 100-column budget.
+edition = "2021"
+max_width = 100
+use_small_heuristics = "Default"
+newline_style = "Unix"

@@ -1,0 +1,1979 @@
+# kanspec — implementation contract v1
+
+**Architecture: Skeleton-First, sealed at the seams.**
+Base = *Skeleton-First* (2 of 3 judges). Grafted: *One Gate*'s pure planner / `Plan` / in-lock
+snapshot / `closed_ids` / doctor registry; *Sealed Keel*'s closed key enums, `Sha`/`HeadSha`,
+`ScanToken`, `NoCodeWaiver`, `Fixes(Fix, Vec<Fix>)`, `Verb::Confirm`, private `KanspecDir`, rich
+`Unknown`. Every fatal flaw the judges named is closed below and marked ✅.
+
+> **Thesis.** kanspec is a file-munger with a git oracle bolted on. One crate, two bins, flat
+> `src/*.rs`, no workspace, no trait with one implementation, no async outside `up`. Three things
+> carry the whole design: **`Ctx`** is built once in `run()` before dispatch, so worktree
+> unification and actor/clock injection touch every command without any command knowing they
+> exist; **`Store::transact`** is the only code that writes a byte under `.kanspec/`, and it takes
+> the flock, reloads a fresh `Snapshot` *inside* the lock, runs a **pure planner**
+> `fn(&Snapshot, &Facts, &Args, &Minter) -> Result<Plan>`, validates, applies, and replays each
+> touched ticket's log before releasing; **`Render: Serialize`** makes `--json` the Serialize impl
+> so the two surfaces cannot drift. Compile-time guarantees are spent in exactly four places where
+> they buy a real safety property — `MergedProof`, `TicketKey`, `HumanActor`, `KanspecDir` — and
+> nowhere else.
+
+**Everything in §2 was compiled and tested before this document was written**
+(`/private/tmp/claude-501/.../scratchpad/arch-verify`, 6 tests green, clippy clean, incl.
+`Arc<Ctx>: Send + Sync`, flock, the seals, `plan_ship`/`plan_done`, the transition table, and
+`replay`). `E0742` was reproduced to prove why the seals are colocated (§2.7).
+
+---
+
+## 1. Module tree
+
+Flat `src/*.rs` (house style: `~/dev/homerunner`). Every file has **exactly one owner** (§10).
+Scope tag: **v0.1** = the weekend cut · **v0.2** = declared in wave 0 as `unimplemented!("v0.2")`
+with a `#[command(hide = true)]` clap arm, so v0.2 fills bodies and never edits a frozen file.
+
+```
+kanspec/
+├── Cargo.toml                 pinned deps, 2 [[bin]], profile.release lto+strip        F   v0.1
+├── build.rs                   println!("cargo:rerun-if-changed=assets") — MANDATORY    F   v0.1
+├── rust-toolchain.toml        pin stable; edition 2021                                 F   v0.1
+├── assets/                    embedded SPA: index.html, app.js, style.css (vanilla)    S8  v0.1
+├── docs/                      long-form workflow docs for `kanspec instructions`       S7  v0.1
+└── src/
+    ├── lib.rs                 run(invoked_as)->ExitCode; Ctx build; the whole dispatch  F  v0.1
+    ├── bin/kanspec.rs         3 lines -> kanspec::run("kanspec")                        F  v0.1
+    ├── bin/ks.rs              3 lines -> kanspec::run("ks")                             F  v0.1
+    ├── cli.rs                 clap derive tree ONLY: Cli, Command, every *Args. FROZEN  F  v0.1
+    ├── ctx.rs                 Ctx, Actor, HumanActor, OutMode. Send+Sync. FROZEN        F  v0.1
+    ├── error.rs               KsError (8 shapes), Fix/Fixes, ExitCode, GateDetail       F  v0.1
+    ├── out.rs                 trait Render: Serialize; emit(); Line/Table/Style prims   F  v0.1
+    ├── paths.rs               Repo::discover ladder; KanspecDir (private); Layout       F  v0.1
+    ├── config.rs              Config + every field #[serde(default)]; toml 1.1          F  v0.1
+    ├── ids.rs                 id_kind! per-kind newtypes, Minter, ItemRef, RuleRef      F  v0.1
+    ├── keys.rs                TicketKey/SpecKey/... closed enums + RESERVED_DERIVED     F  v0.1
+    ├── logentry.rs            the `## Log` line grammar: parse/format, one place        F  v0.1
+    ├── model.rs               entity structs + Snapshot. Types only, no IO. FROZEN      F  v0.1
+    ├── transitions.rs         Verb, next(), require(), replay(), LogViolation. FROZEN   F  v0.1
+    ├── plan.rs                Op, Plan, Plan::validate, EntityRef. FROZEN               F  v0.1
+    │
+    ├── fm.rs                  lossless split, key index, surgical set(), writable()     S1 v0.1
+    ├── lock.rs                flock(2) advisory lock -> LockToken (write capability)   S1 v0.1
+    ├── store.rs               load_snapshot(); Store::transact — THE ONLY WRITER        S1 v0.1
+    │
+    ├── git.rs                 `git -C <primary>` shell-out; Sha/HeadSha seal; Pathspec  S2 v0.1
+    ├── gh.rs                  gh JSON; KANSPEC_GH_FIXTURES replay seam (the ONE seam)   S2 v0.1
+    │
+    ├── scan.rs                the 4-rung ladder; MergedProof/NoCodeWaiver/ScanToken     S3 v0.1
+    ├── cache.rs               cache/gitstate.json DTOs; total, versioned load           S3 v0.1
+    │
+    ├── derive.rs              PURE fns over &Snapshot: the whole derived surface        S4 v0.1
+    ├── doctor.rs              CHECKS registry, Finding, --fix appliers                  S4 v0.1
+    │
+    ├── triage.rs              Triage: the typed done-gate argument (flags AND prompts)  S5 v0.1
+    │
+    ├── rulesdoc.rs            THE standing-rules generator + THE renderer               S6 v0.1
+    ├── project.rs             KANSPEC-FEATURES.md / KANSPEC-ARCHITECTURE.md writers     S6 v0.1
+    │
+    ├── hooks.rs               rev-parse --git-path hooks; the <hook>.d/ dispatcher      S7 v0.1
+    ├── setup.rs               claude|cursor|codex snippet + agent hooks (+ --remove)    S7 v0.1
+    ├── instructions.rs        embedded docs/ topic printer                              S7 v0.1
+    ├── ci.rs                  provider detect; homerunner rusqlite + SSE; gh fallback   S7 v0.2
+    │
+    ├── board.rs               BoardModel: one struct for `board` AND /api/board         S8 v0.1
+    ├── server.rs              axum 0.8: /api/*, /events SSE, embedded-asset fallback    S8 v0.1
+    │
+    └── cmd/
+        ├── mod.rs             `pub mod` lines ONLY. FROZEN                              F  v0.1
+        ├── init.rs            init [--refresh-hooks]                                    S7 v0.1
+        ├── setup.rs           setup claude|cursor|codex [--remove] / instructions /
+        │                      completions                                               S7 v0.1
+        ├── ticket.rs          new / show / ls / log / where                             S5 v0.1
+        ├── flow.rs            ready / start / ship / park / drop                        S5 v0.1
+        ├── done.rs            THE close-out gate (interactive + --json)                 S5 v0.1
+        ├── status.rs          YOU / AGENT / WATCHING                                    S4 v0.1
+        ├── doctor.rs          doctor [--fix]                                            S4 v0.1
+        ├── scan.rs            scan [--explain] [--confirm]                              S3 v0.1
+        ├── repair.rs          repair <id> --why (the recorded log reset)                S3 v0.1
+        ├── spec.rs            spec new|show|grep                                        S6 v0.1
+        ├── quirk.rs           quirk add|fix / quirks [--touch]                          S6 v0.1
+        ├── decision.rs        decide / accept / supersede / revoke / why                S6 v0.1
+        ├── rules.rs           rules [--path] [--audit] [--adopt]                        S6 v0.1
+        ├── prime.rs           prime                                                     S6 v0.1
+        ├── features.rs        features [--stale] [--confirm <spec>]                     S6 v0.1
+        ├── board.rs           board [--export]                                          S8 v0.1
+        ├── up.rs              up [--port] / open — the ONLY async entry point           S8 v0.1
+        ├── proposal.rs        propose/review/approve/close/abandon                      V2 v0.2
+        ├── comment.rs         comments / comment add|reply|resolve / promote / expire   V2 v0.2
+        └── landcheck.rs       the Stop hook — the ONLY minter of BlockToken (exit 2)    V2 v0.2
+
+tests/
+├── common/mod.rs              TestRepo harness (template-dir + fs::copy). FROZEN        F
+├── common/merges.rs           the six real merge shapes from recon. FROZEN              F
+├── fixtures/                  adversarial frontmatter corpus, recorded gh JSON, goldens F
+├── fm_bytes.rs                byte-stability, 100-edit idempotence, CRLF, adversarial   S1
+├── lock.rs                    20-process contention; kill -9 releases                   S1
+├── single_write_path.rs       GREP: no fs writes outside store.rs (+2 allowlist)        S1
+├── worktree.rs                every mutating verb from a linked wt hits primary         S2
+├── scan_ladder.rs             all 6 merge shapes -> exact MergeStatus, incl. 2 unknowns S3
+├── proof_is_sealed.rs         GREP: no Deserialize/Default/From impl for MergedProof    S3
+├── purity.rs                  GREP: derive.rs imports no std::fs / std::process         S4
+├── transition_table.rs        exhaustive (State x Verb); replay matrix; repair reset    S4
+├── doctor_replay.rs           hand-edit fails; legal trail passes; repair recovers      S4
+├── cache_wipe.rs              rm -rf cache/ changes nothing but freshness stamps        S4
+├── lifecycle.rs               new->start->ship->real squash merge->scan->done           S5
+├── invariants_rules.rs        prime stdout starts_with rules stdout, over N scopes      S6
+├── setup_hooks.rs             foreign-hook preservation; core.hooksPath; .d/ dispatch   S7
+├── board.rs                   BoardModel insta snapshots (filters written day one)      S8
+├── json_matrix.rs             every_command_supports_json, walked off the clap tree     S8
+├── cli_well_formed.rs         Cli::command().debug_assert()                             F
+└── cli_smoke.rs               shells the real binary: argv, exit codes, `ks` alias      F
+```
+
+---
+
+## 2. The shared contract — verbatim Rust
+
+> Everything in §2 is **frozen after wave 0**. A missing type or flag is a *request to F*, batched
+> between waves — never a direct edit. Compiled and tested as written.
+
+### 2.1 `src/error.rs` — 8 closed shapes, non-empty fix by TYPE
+
+```rust
+/// Non-empty BY TYPE: head + tail. `debug_assert` is deleted by `--release`;
+/// this is not. ✅ fixes Skeleton-First `Fixes(pub Vec<String>)` and One Gate `Fix::many`.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct Fix(String);
+impl Fix {
+    pub fn cmd(s: impl Into<String>) -> Fix { Fix(s.into()) }
+    pub fn as_str(&self) -> &str { &self.0 }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Fixes(Fix, Vec<Fix>);
+impl Fixes {
+    pub fn one(f: Fix) -> Fixes { Fixes(f, Vec::new()) }
+    pub fn new(head: Fix, rest: Vec<Fix>) -> Fixes { Fixes(head, rest) }
+    pub fn iter(&self) -> impl Iterator<Item = &Fix> {
+        std::iter::once(&self.0).chain(self.1.iter())
+    }
+}
+#[macro_export] macro_rules! fix   { ($($t:tt)*) => { $crate::error::Fix::cmd(format!($($t)*)) } }
+#[macro_export] macro_rules! fixes { ($h:expr $(, $r:expr)* $(,)?) => {
+    $crate::error::Fixes::new($h, vec![$($r),*]) }; }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnvCode { NotARepo, NotInitialized, LockHeld, AmbiguousWorktree, GitMissing }
+
+/// Structured payloads for the TWO errors whose output quality is the product.
+/// Agents constructing a new refusal use `GateDetail::Plain` and never edit this file.
+#[derive(Debug, Serialize)]
+#[serde(tag = "detail", rename_all = "snake_case")]
+pub enum GateDetail {
+    Plain,
+    NotLanded { trace: Vec<crate::git::RungTrace> },
+    Undispositioned { items: Vec<crate::ids::ItemRef> },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KsError {
+    #[error("{id} is {from}, not {}, — cannot {verb}", crate::transitions::verbs_str(*allowed))]
+    IllegalTransition { id: TicketId, from: State, verb: Verb,
+                        allowed: &'static [Verb], fix: Fixes },
+    #[error("{kind} {id} not found")]
+    NotFound   { kind: &'static str, id: String, fix: Fixes },
+    #[error("{message}")]
+    Gate       { code: &'static str, message: String, detail: GateDetail, fix: Fixes },
+    #[error("{message}")]
+    Environment{ code: EnvCode, message: String, fix: Fixes },
+    #[error("{message}")]
+    Git        { message: String, cmd: String, exit: i32, fix: Fixes },
+    #[error("{message}")]
+    Conflict   { message: String, fix: Fixes },   // duplicate claim, id collision
+    #[error("{message}")]
+    Invalid    { message: String, fix: Fixes },   // bad args, bad YAML, bad id
+    #[error("internal error: {source}")]
+    Internal   { #[source] source: anyhow::Error, fix: Fixes },
+}
+
+impl KsError {
+    pub fn gate(code: &'static str, message: impl Into<String>, fix: Fixes) -> KsError {
+        KsError::Gate { code, message: message.into(), detail: GateDetail::Plain, fix }
+    }
+    /// ✅ There is NO `#[from] std::io::Error`. A bare `?` on a file op cannot
+    /// produce a fix-less error; every call site converts deliberately.
+    pub fn internal(e: impl Into<anyhow::Error>) -> KsError {
+        KsError::Internal { source: e.into(), fix: fixes![fix!("kanspec doctor")] }
+    }
+    /// TOTAL over the enum — every variant, including Internal. Invariant 9.
+    pub fn fixes(&self) -> &Fixes { /* one match, 8 arms */ }
+    pub fn kind(&self) -> &'static str;             // stable JSON discriminator
+    pub fn detail(&self) -> Option<&GateDetail>;
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            KsError::Environment { .. } => code::ENVIRONMENT,   // 69
+            KsError::Internal { .. }    => code::INTERNAL,      // 70
+            _                           => code::VIOLATION,     // 1
+        }
+    }
+    pub fn render(&self, mode: &OutMode);           // human -> stderr; json -> stdout envelope
+    pub fn to_json(&self) -> serde_json::Value;     // {"ok":false,"error":{kind,message,detail,fix,exit}}
+}
+pub type Result<T> = std::result::Result<T, KsError>;
+
+pub mod code {
+    pub const OK: u8 = 0;
+    pub const VIOLATION: u8 = 1;    // gate refusal / invariant violation / doctor
+    pub const BLOCK: u8 = 2;        // landcheck Stop hook ONLY (see BlockToken)
+    pub const USAGE: u8 = 64;       // clap's native 2 is REMAPPED here
+    pub const ENVIRONMENT: u8 = 69; // no repo / no .kanspec/ / lock held / git missing
+    pub const INTERNAL: u8 = 70;
+}
+```
+
+**Error rendering** (`KsError::render`, human mode, stderr):
+
+```
+✗ t-9c41 is review, not doing — cannot ship
+  → kanspec show t-9c41
+```
+
+Exit-2 seal — declared **inside `cmd/landcheck.rs`** so `pub(in ...)` is legal (§2.7):
+
+```rust
+// src/cmd/landcheck.rs
+pub struct BlockToken(());              // private field: only this file mints one
+pub enum Status { Ok, Violation, Block(BlockToken) }
+impl Status { pub fn code(self) -> u8 { match self {
+    Status::Ok => 0, Status::Violation => 1, Status::Block(_) => 2 } } }
+```
+
+### 2.2 `src/ids.rs` — per-kind newtypes, minted under the lock
+
+```rust
+macro_rules! id_kind {
+    ($name:ident, $prefix:literal, $noun:literal) => {
+        #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+        impl $name {
+            pub const PREFIX: &'static str = $prefix;
+            pub const NOUN:   &'static str = $noun;
+            /// Accepts `t-9c41` and bare `9c41`; rejects a foreign prefix BY TYPE.
+            /// Accepts >= 4 hex so `id_width` can grow without breaking old ids.
+            pub fn parse(s: &str) -> Result<Self>;
+            pub fn as_str(&self) -> &str;
+        }
+        impl std::fmt::Display for $name { /* writes the prefixed form */ }
+        impl TryFrom<String> for $name { type Error = String; /* .. */ }
+        impl From<$name> for String     { /* .. */ }
+    };
+}
+id_kind!(TicketId,   "t-",  "ticket");
+id_kind!(ProposalId, "p-",  "proposal");
+id_kind!(DecisionId, "D-",  "decision");
+id_kind!(QuirkId,    "q-",  "quirk");
+id_kind!(CommentId,  "cm-", "comment");
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SpecName(String);
+impl SpecName { pub fn parse(s: &str) -> Result<SpecName>; pub fn as_str(&self) -> &str; }
+
+/// Visible-text anchors (invariant 5): `p-7de2#c3`, `auth#lockout`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ItemKind { Change, Prescription, Ticket }          // c / p / t
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ItemRef { pub proposal: ProposalId, pub kind: ItemKind, pub n: u16 }
+impl ItemRef { pub fn parse(s: &str) -> Result<ItemRef>; }  // "p-7de2#c3"
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RuleRef { pub spec: SpecName, pub rule: String }  // "auth#lockout"
+impl RuleRef { pub fn parse(s: &str) -> Result<RuleRef>; }
+
+/// Minting is check-and-retry against the FRESH in-lock snapshot's id set —
+/// which includes `closed_ids`. 16 bits is 65536, so birthday collisions bite
+/// near ~300 entities; collision-freedom is a property of EXCLUSION, not entropy.
+/// After 64 rejections the width steps to 5 hex, which is why `parse` accepts >= 4.
+pub struct Minter<'s> { taken: &'s HashSet<String>, seed: u64, width: usize }
+impl<'s> Minter<'s> {
+    /// Only `Store::transact` constructs one; `seed` comes from KANSPEC_ID_SEED in tests.
+    pub(crate) fn new(taken: &'s HashSet<String>, seed: u64, width: usize) -> Minter<'s>;
+    pub fn ticket(&self, title: &str)   -> Result<TicketId>;
+    pub fn proposal(&self, title: &str) -> Result<ProposalId>;
+    pub fn decision(&self, title: &str) -> Result<DecisionId>;
+    pub fn quirk(&self, title: &str)    -> Result<QuirkId>;
+    pub fn comment(&self, body: &str)   -> Result<CommentId>;
+}
+pub fn slug(title: &str) -> String;   // "Rate-limit login" -> "rate-limit-login", <= 40 chars
+```
+
+### 2.3 `src/keys.rs` — invariant 1 as an absent variant ✅
+
+```rust
+pub trait FmKey: Copy + PartialEq + 'static {
+    const ORDER: &'static [Self];            // canonical schema order, for INSERTION only
+    fn as_str(self) -> &'static str;
+}
+
+/// Every writable ticket frontmatter key. There is no `Merged`, no `InMain`,
+/// no `Landed`, no `Ready`, no `Ci`. Every write in the crate passes through
+/// `Key`, so "no command or UI action can set merge state" is a type fact, not a
+/// deny-list. ✅ fixes Skeleton-First's `set_fields(&[(&str, Yv)])` and One
+/// Gate's `Op::Transition.also: Vec<(&'static str, Yv)>`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketKey {
+    Id, Title, State, Spec, Proposal, Item, Deps, FollowupOf, DiscoveredIn,
+    Branch, Worktree, ClaimedBy, Pr, Head, SpecUnchanged, Created,
+}
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+pub enum SpecKey     { Feature, Code, StaleAck }
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+pub enum ProposalKey { Id, Title, Status, Specs, Approved, Ledger, Created }
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+pub enum DecisionKey { Id, Title, Status, Date, Source, Scope, Supersedes, SupersededBy }
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+pub enum QuirkKey    { Id, Title, Paths, Severity, Status, Source, FixedBy }
+
+impl FmKey for TicketKey {
+    const ORDER: &'static [TicketKey] = &[ /* exactly the DESIGN.md ticket order */ ];
+    fn as_str(self) -> &'static str { /* "followup_of", "discovered_in", "spec_unchanged", .. */ }
+}
+// ... identical impls for SpecKey / ProposalKey / DecisionKey / QuirkKey
+
+/// The single key type that crosses a module boundary.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+#[serde(untagged)]
+pub enum Key {
+    Ticket(TicketKey), Spec(SpecKey), Proposal(ProposalKey),
+    Decision(DecisionKey), Quirk(QuirkKey),
+}
+impl Key {
+    pub fn as_str(self) -> &'static str;
+    pub fn order(self) -> &'static [&'static str];   // fm::set's insertion-point hint
+}
+
+/// READ-side deny-list. A file that ARRIVES with `merged: true` — a hand-edit,
+/// an import, a bad merge — has no write path to blame, so `doctor` scans every
+/// entity's `#[serde(flatten)] extra` map against this. ✅ the hand-edit vector
+/// no type and no grep can cover.
+pub const RESERVED_DERIVED: &[&str] = &[
+    "merged", "merged_at", "in_main", "landed", "ready", "blocked",
+    "stalled", "settling", "stale", "dwell", "ci", "checked_at", "method",
+];
+```
+
+### 2.4 `src/transitions.rs` — THE legality oracle (one definition)
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State { Todo, Doing, Review, Done, Dropped }
+impl State {
+    pub const fn glyph(self) -> &'static str;   // ○ ◐ ◈ ● ✕
+    pub const fn as_str(self) -> &'static str;  // the frontmatter text, exactly
+    pub const fn terminal(self) -> bool { matches!(self, State::Done | State::Dropped) }
+}
+impl std::fmt::Display for State { /* as_str */ }
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Verb { New, Start, Ship, Done, Park, Drop, Confirm, Repair }
+impl Verb { pub const fn as_str(self) -> &'static str; }
+impl std::fmt::Display for Verb { /* as_str */ }
+
+pub const ALL_STATES: &[State] = &[State::Todo, State::Doing, State::Review,
+                                   State::Done, State::Dropped];
+pub const ALL_VERBS:  &[Verb]  = &[Verb::New, Verb::Start, Verb::Ship, Verb::Done,
+                                   Verb::Park, Verb::Drop, Verb::Confirm, Verb::Repair];
+
+/// A const table + exhaustive match, NOT typestate — an explicit pushback on
+/// DESIGN.md's build-plan prose. Ticket state arrives from a hand-editable FILE
+/// at runtime, so compile-time phases would be a lie requiring a fallible
+/// downcast at every boundary. `from == None` means "does not exist yet", so
+/// `New` lives in the same table and `replay` needs no genesis special case.
+///
+/// `Confirm` and `Repair` ARE in the table. ✅ fixes Skeleton-First (declared,
+/// absent from LEGAL -> every `scan --confirm` wedges a ticket) and One Gate
+/// (no `Confirm` variant at all while specifying a confirm Log line).
+pub const fn next(from: Option<State>, verb: Verb) -> Option<State> {
+    use State::*; use Verb as V;
+    match (from, verb) {
+        (None,          V::New)   => Some(Todo),
+        (Some(Todo),    V::Start) => Some(Doing),
+        (Some(Review),  V::Start) => Some(Doing),      // rework
+        (Some(Doing),   V::Ship)  => Some(Review),
+        (Some(Doing),   V::Park)  => Some(Todo),
+        (Some(Review),  V::Done)  => Some(Done),       // requires MergedProof
+        (Some(Doing),   V::Done)  => Some(Done),       // requires NoCodeWaiver
+        (Some(Todo), V::Drop) | (Some(Doing), V::Drop) | (Some(Review), V::Drop) => Some(Dropped),
+        (Some(s), V::Confirm) => Some(s),              // non-transition, recorded
+        (Some(s), V::Repair)  => Some(s),              // non-transition, recorded
+        _ => None,
+    }
+}
+pub fn allowed_from(from: Option<State>) -> Vec<Verb>;
+pub fn verbs_str(vs: &[Verb]) -> String;
+
+pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State>;   // else IllegalTransition
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "break", rename_all = "snake_case")]
+pub enum LogViolation {
+    Empty,
+    NoGenesis     { first: Verb },
+    IllegalStep   { index: usize, from: Option<State>, verb: Verb },
+    StateMismatch { index: usize, logged: State, legal: State },
+    OutOfOrder    { index: usize, at: DateTime<Utc> },
+    Divergence    { replayed: State, frontmatter: State },
+}
+
+/// THE MECHANICAL PROOF (invariant 10). Folds the ticket's own `## Log` through
+/// the SAME oracle the write path uses. Checks THREE things the losing entries
+/// each missed one of: legal sequence, each entry's RECORDED state against the
+/// legal successor (a doctored log LINE, not just a doctored frontmatter field),
+/// and timestamp monotonicity.
+pub fn replay(entries: &[LogEntry]) -> std::result::Result<State, LogViolation> {
+    let mut cur: Option<State> = None;
+    let mut last: Option<DateTime<Utc>> = None;
+    for (i, e) in entries.iter().enumerate() {
+        if let Some(prev) = last { if e.at < prev {
+            return Err(LogViolation::OutOfOrder { index: i, at: e.at }); } }
+        last = Some(e.at);
+        cur = match e.verb {
+            // Repair is the ONE verb whose logged state is authoritative rather
+            // than derived: the human-attested reset that makes an imported or
+            // already-broken repo RECOVERABLE instead of permanently unwritable.
+            Verb::Repair => Some(e.state),
+            v => {
+                let n = next(cur, v)
+                    .ok_or(LogViolation::IllegalStep { index: i, from: cur, verb: v })?;
+                if n != e.state {
+                    return Err(LogViolation::StateMismatch { index: i, logged: e.state, legal: n });
+                }
+                Some(n)
+            }
+        };
+    }
+    cur.ok_or(LogViolation::Empty)
+}
+
+/// Called per touched ticket by `Store::transact` on commit AND by `doctor`.
+pub fn prove(t: &Ticket) -> std::result::Result<(), LogViolation>;
+```
+
+### 2.5 `src/logentry.rs` — the `## Log` grammar, one place
+
+```
+- 2026-08-30T14:20Z  doing    claude/sess-a91      kanspec start (branch + worktree created)
+  └ %Y-%m-%dT%H:%MZ  state    actor (<=20, padded) verb + optional " (note)"
+```
+
+```rust
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LogEntry {
+    pub at: DateTime<Utc>,
+    /// The resulting state. STORED, not a format-time parameter — so
+    /// `parse(format(e)) == e` and `replay` can catch a line whose printed state
+    /// disagrees with its verb. ✅ fixes Sealed Keel's stateless LogEntry.
+    pub state: State,
+    pub actor: String,          // Actor::label()
+    pub verb: Verb,
+    pub note: Option<String>,
+}
+impl LogEntry {
+    pub fn format(&self) -> String;
+    /// `None` == not a log line, so prose under `## Log` survives untouched.
+    pub fn parse(line: &str) -> Option<LogEntry>;
+}
+/// Extracts every parseable entry under the `## Log` heading of a ticket body.
+pub fn parse_log(body: &str) -> Vec<LogEntry>;
+pub const LOG_HEADING: &str = "## Log";
+pub const STEPS_HEADING: &str = "## Steps";
+```
+
+### 2.6 `src/ctx.rs` — built ONCE, and provably `Send + Sync` ✅
+
+```rust
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Actor {
+    Human { name: String },
+    Agent { session: String, tool: String },
+}
+impl Actor {
+    /// KANSPEC_ACTOR + KANSPEC_ACTOR_KIND (tests) > CLAUDE_SESSION_ID/CURSOR_SESSION_ID/
+    /// CODEX_SESSION_ID (agent) > git config user.email > $USER (human).
+    pub fn detect() -> Actor;
+    pub fn label(&self) -> String;     // "trevor" | "claude/sess-a91"
+    pub fn is_agent(&self) -> bool;
+}
+
+/// Invariant 8, mechanically. Private field; the ONLY constructor refuses an
+/// `Actor::Agent`, and `plan_accept`/`plan_revoke` take `&HumanActor`. An agent
+/// session literally cannot call them. ✅ unenforced in all three inputs.
+pub struct HumanActor(Actor);
+impl HumanActor {
+    pub fn require(a: &Actor, verb: &'static str) -> Result<HumanActor>;
+    pub fn actor(&self) -> &Actor;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum OutMode { Human { color: bool }, Json }
+
+/// NOTE what is absent: no `Ui`, no `RefCell`, no `Rc`, no handle to stdout.
+/// Presentation lives in `out.rs`. That is what makes `Arc<Ctx>` crossable into
+/// `spawn_blocking`. ✅ fixes One Gate's `RefCell<Ui>` (verified E0277).
+pub struct Ctx {
+    pub repo:   Repo,
+    pub layout: Layout,
+    pub cfg:    Config,
+    pub git:    Git,
+    pub gh:     Gh,
+    pub actor:  Actor,
+    pub now:    DateTime<Utc>,   // KANSPEC_NOW-overridable => deterministic goldens
+    pub out:    OutMode,
+    pub invoked_as: &'static str,
+}
+impl Ctx {
+    pub fn open(cli: &Cli, cwd: &Path) -> Result<Ctx>;
+    pub fn snapshot(&self) -> Result<Snapshot> { crate::store::load_snapshot(self) }
+    pub fn invocation(&self) -> String;         // "kanspec ship --pr 142" for the Log note
+    pub fn style(&self) -> Style;
+}
+const _: fn() = || { fn need<T: Send + Sync + 'static>() {} need::<std::sync::Arc<Ctx>>(); };
+```
+
+### 2.7 `src/paths.rs` — worktree unification, structurally unavoidable
+
+```rust
+pub struct Repo {                 // ALL FIELDS PRIVATE ✅ (both losers exposed primary_root)
+    primary_root: PathBuf, git_dir: PathBuf, common_dir: PathBuf,
+    here: PathBuf, linked: bool,
+}
+impl Repo {
+    /// ONE `git rev-parse --path-format=absolute --git-common-dir --git-dir --show-toplevel`
+    /// (via std::process::Command — `Git` needs a root, so discovery cannot use it).
+    ///   1. exit 128                -> Environment{NotARepo}
+    ///   2. git_dir == common_dir   -> primary_root = show_toplevel   [survives --separate-git-dir]
+    ///   3. else                    -> first `worktree <path>` stanza of
+    ///                                 `git worktree list --porcelain -z`
+    ///   4. sanity: primary_root's gitdir must resolve to common_dir, else
+    ///      Environment{AmbiguousWorktree} — a typed refusal, never a guess.
+    pub fn discover(cwd: &Path, repo_flag: Option<&Path>) -> Result<Repo>;
+    pub fn primary_root(&self) -> &Path;
+    pub fn here(&self) -> &Path;          // where the user stands — for `where`, hooks, branch
+    pub fn common_dir(&self) -> &Path;
+    pub fn git_dir(&self) -> &Path;
+    pub fn linked(&self) -> bool;
+}
+
+/// Private field, no `From<PathBuf>`, no public constructor. `Layout` is the
+/// only thing that can name a kanspec file, and `Repo::discover` is the only
+/// source of one. "Every command resolves git-common-dir" is therefore not a
+/// rule anyone can forget — there is no other way to name a file. ✅
+pub struct KanspecDir(PathBuf);
+impl KanspecDir {
+    pub(crate) fn resolve(repo: &Repo) -> KanspecDir;   // <primary_root>/.kanspec
+    pub fn display(&self) -> std::path::Display<'_>;
+    pub fn exists(&self) -> bool;
+    fn join(&self, s: impl AsRef<Path>) -> PathBuf;     // PRIVATE
+}
+
+pub struct Layout { ks: KanspecDir, features_md: PathBuf, architecture_md: PathBuf }
+impl Layout {
+    /// Non-circular: `KanspecDir::resolve` needs only `Repo`; `Config::load`
+    /// needs only `KanspecDir`; `Layout::open` needs both. ✅ fixes
+    /// Skeleton-First's `Layout::open(repo, &cfg)` circularity.
+    pub(crate) fn open(repo: &Repo, cfg: &Config) -> Layout;
+    pub fn ks(&self) -> &KanspecDir;
+    pub fn config_toml(&self)      -> PathBuf;   // .kanspec/config.toml
+    pub fn tickets_dir(&self)      -> PathBuf;
+    pub fn ticket(&self, id: &TicketId) -> PathBuf;
+    pub fn specs_dir(&self)        -> PathBuf;
+    pub fn spec(&self, n: &SpecName) -> PathBuf;
+    pub fn decisions_dir(&self)    -> PathBuf;
+    pub fn decision(&self, id: &DecisionId) -> PathBuf;
+    pub fn quirks_dir(&self)       -> PathBuf;
+    pub fn quirk(&self, id: &QuirkId) -> PathBuf;
+    pub fn proposals_dir(&self)    -> PathBuf;
+    pub fn proposals_closed_dir(&self) -> PathBuf;
+    pub fn proposal_dir(&self, id: &ProposalId, slug: &str) -> PathBuf;
+    pub fn proposal_md(&self, dir: &Path) -> PathBuf;
+    pub fn comments_jsonl(&self, dir: &Path) -> PathBuf;
+    pub fn cache_dir(&self)        -> PathBuf;
+    pub fn lock(&self)             -> PathBuf;   // cache/lock
+    pub fn gitstate(&self)         -> PathBuf;   // cache/gitstate.json
+    pub fn features_md(&self)      -> &Path;     // honours [paths]
+    pub fn architecture_md(&self)  -> &Path;
+    pub fn path_for(&self, e: &EntityRef) -> PathBuf;   // the Op applier's dispatch
+}
+```
+
+**Why every seal is colocated with its minting module.** `pub(in path)` requires `path` to be an
+*ancestor*. Reproduced in-environment:
+
+```
+error[E0742]: visibilities can only be restricted to ancestor modules
+```
+
+for `pub(in crate::git) fn mint()` on an item declared in `crate::model`. In this flat layout each
+sealed type lives **in the file that mints it** (`Sha`/`HeadSha` in `git.rs`; `MergedProof`,
+`NoCodeWaiver`, `ScanToken`, `Detection` in `scan.rs`; `LockToken` in `lock.rs`; `BlockToken` in
+`cmd/landcheck.rs`), sealed by a plain private field. This compiles; ✅ Sealed Keel's five
+`pub(in ...)` seals do not.
+
+### 2.8 `src/config.rs`
+
+```rust
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Config {
+    pub main: String,                 // "origin/main"; resolved via symbolic-ref if unset
+    pub id_width: usize,              // 4
+    pub sync: SyncMode,               // Batch (default) | Commit | Branch(v0.4)
+    pub port: u16,                    // 5757
+    pub branch_prefix: String,        // "ks/"
+    pub worktree_dir: PathBuf,        // "../kanspec-wt"
+    pub lock_timeout_secs: u64,       // 5
+    pub paths: Paths,
+    pub windows: Windows,
+    pub git: GitCfg,
+    pub ci: CiCfg,
+    pub hooks: HooksCfg,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)] #[serde(default, deny_unknown_fields)]
+pub struct Paths { pub features: PathBuf, pub architecture: PathBuf }      // KANSPEC-*.md
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)] #[serde(default, deny_unknown_fields)]
+pub struct Windows {
+    pub stall_secs: u64,              // 7200  (doing, no commit/update)
+    pub review_dwell_secs: u64,       // 604800
+    pub in_main_dwell_secs: u64,      // 86400
+    pub settling_dwell_secs: u64,     // 259200
+    pub discovered_dwell_secs: u64,   // 604800
+    pub stale_merges: u32,            // 3     (spec staleness tripwire)
+    pub fetch_max_age_secs: u64,      // 300
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SyncMode { Batch, Commit, Branch }
+#[derive(Clone, Debug, Deserialize, Serialize)] #[serde(default, deny_unknown_fields)]
+pub struct GitCfg  { pub fetch: bool, pub gh: GhMode }
+#[derive(Clone, Debug, Deserialize, Serialize)] #[serde(default, deny_unknown_fields)]
+pub struct CiCfg   { pub provider: CiProvider, pub homerunner: HomerunnerCfg }
+#[derive(Clone, Debug, Deserialize, Serialize)] #[serde(default, deny_unknown_fields)]
+pub struct HooksCfg{ pub landcheck: bool }        // v0.2, DEFAULT FALSE (§11 D-14)
+
+impl Config {
+    /// A MISSING file is `Config::default()`, not an error — `.kanspec/` without
+    /// a config.toml is legal. A malformed one is `Invalid` with the toml span.
+    pub fn load(ks: &KanspecDir) -> Result<Config>;
+    pub fn render_default() -> String;             // what `init` writes, with comments
+}
+```
+
+### 2.9 `src/model.rs` — types only, zero IO
+
+```rust
+#[derive(Debug, Clone, Deserialize)]
+pub struct TicketFm {
+    pub id: TicketId, pub title: String, pub state: State,
+    pub spec: Option<SpecName>, pub proposal: Option<ProposalId>, pub item: Option<String>,
+    #[serde(default)] pub deps: Vec<TicketId>,
+    pub followup_of: Option<TicketId>, pub discovered_in: Option<TicketId>,
+    pub branch: Option<String>, pub worktree: Option<PathBuf>,
+    pub claimed_by: Option<String>, pub pr: Option<u64>,
+    /// A plain String: read from git by `ship`/`done`, never typed by an agent —
+    /// enforced upstream, because the only value that can be WRITTEN here comes
+    /// from `HeadSha` (§2.11), which only `git.rs` can mint.
+    pub head: Option<String>,
+    pub spec_unchanged: Option<String>,
+    pub created: DateTime<Utc>,
+    /// Load-bearing: a key written by a NEWER kanspec is never dropped by an
+    /// older one, and `doctor::check_reserved_keys` scans exactly this map.
+    #[serde(flatten)] pub extra: BTreeMap<String, serde_yaml_ng::Value>,
+}
+// NOTE what is absent, forever: merged, in_main, ready, stalled, ci, checked_at.
+
+#[derive(Debug, Clone)]
+pub struct Ticket {
+    pub fm: TicketFm,
+    pub path: PathBuf,
+    pub body: String,                 // everything after the closing fence, verbatim = TRUTH
+    pub steps: Vec<Step>,             // parsed `- [ ]` view of the body
+    pub log: Vec<LogEntry>,           // parsed `## Log` view of the body
+    pub mtime: SystemTime,
+}
+#[derive(Debug, Clone, Serialize)] pub struct Step { pub index: usize, pub done: bool, pub text: String }
+
+#[derive(Debug, Clone, Deserialize)] pub struct SpecFm {
+    pub feature: String, #[serde(default)] pub code: Vec<String>,
+    pub stale_ack: Option<StaleAck>, #[serde(flatten)] pub extra: BTreeMap<String, serde_yaml_ng::Value> }
+#[derive(Debug, Clone, Serialize, Deserialize)] pub struct StaleAck {
+    pub sha: String, pub at: DateTime<Utc>, pub by: String, pub why: String }
+#[derive(Debug, Clone)] pub struct Spec {
+    pub name: SpecName, pub fm: SpecFm, pub path: PathBuf, pub body: String, pub rules: Vec<Rule> }
+#[derive(Debug, Clone, Serialize)] pub struct Rule {
+    pub anchor: String,                       // "auth.lockout" -> RuleRef "auth#lockout"
+    pub text: String, pub provenance: Vec<ProposalId>, pub line: usize }
+
+#[derive(Debug, Clone, Deserialize)] pub struct DecisionFm { /* DESIGN.md decision frontmatter */ }
+#[derive(Debug, Clone)] pub struct Decision { pub fm: DecisionFm, pub path: PathBuf,
+    pub body: String, pub scope: Vec<String> }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")] pub enum DecisionStatus { Proposed, Accepted, Superseded, Revoked }
+
+#[derive(Debug, Clone, Deserialize)] pub struct QuirkFm { /* DESIGN.md quirk frontmatter */ }
+#[derive(Debug, Clone)] pub struct Quirk { pub fm: QuirkFm, pub path: PathBuf, pub body: String }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")] pub enum Severity { Landmine, Gotcha, Debt }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")] pub enum QuirkStatus { Active, Fixed, Stale }
+
+// v0.2 types, declared in wave 0 so V2 never edits this file:
+#[derive(Debug, Clone, Deserialize)] pub struct ProposalFm { /* .. */ }
+#[derive(Debug, Clone)] pub struct Proposal { pub fm: ProposalFm, pub dir: PathBuf,
+    pub body: String, pub items: Vec<Item> }
+#[derive(Debug, Clone, Serialize)] pub struct Item { pub id: ItemRef, pub text: String,
+    pub prescription: Option<Prescription> }
+#[derive(Debug, Clone, Serialize)] pub enum Prescription {
+    TempUntil(TicketId), Promote(PromoteAs), Untyped }
+#[derive(Debug, Clone, Copy, Serialize)] pub enum PromoteAs { Decision, Spec, Quirk }
+#[derive(Debug, Clone, Serialize, Deserialize)] pub struct CommentOp { /* DESIGN.md jsonl row */ }
+
+/// Everything on disk, loaded once, plus the disposable cache. Derived state is
+/// computed FROM this and never stored IN it — the whole design in one struct.
+pub struct Snapshot {
+    pub tickets:   BTreeMap<TicketId, Ticket>,
+    /// OPEN proposals ONLY. Closed proposal BODIES are never read from disk, so
+    /// there is physically no value through which closed prose can reach
+    /// `rulesdoc::build` or `prime`. Invariant 4 is a property of the
+    /// generator's INPUT TYPE. ✅ (Sealed Keel and Skeleton-First both load them.)
+    pub proposals: BTreeMap<ProposalId, Proposal>,
+    /// Ids of closed proposals — for collision-free minting and NOTHING else.
+    /// Non-obvious: omitting closed BODIES reopens an id collision against
+    /// `proposals/closed/` unless the ids are tracked separately. ✅
+    pub closed_ids: HashSet<String>,
+    pub specs:     BTreeMap<SpecName, Spec>,
+    pub decisions: BTreeMap<DecisionId, Decision>,
+    pub quirks:    BTreeMap<QuirkId, Quirk>,
+    pub comments:  BTreeMap<ProposalId, Vec<CommentOp>>,   // id+op deduped on read
+    pub git:       GitState,          // the gitignored cache — the SOLE home of derived git facts
+    pub cfg:       Config,
+    pub now:       DateTime<Utc>,
+    /// Bumped on every successful `transact`. The server memoizes on it; the SSE
+    /// payload carries it. Present from day one so the memoization escape hatch
+    /// is a one-file change later, not a re-architecture.
+    pub rev:       u64,
+}
+impl Snapshot {
+    pub fn ticket(&self, id: &TicketId) -> Result<&Ticket>;      // else NotFound + fix
+    pub fn spec(&self, n: &SpecName)    -> Result<&Spec>;
+    pub fn decision(&self, id: &DecisionId) -> Result<&Decision>;
+    pub fn quirk(&self, id: &QuirkId)   -> Result<&Quirk>;
+    pub fn taken_ids(&self) -> HashSet<String>;                  // incl. closed_ids
+}
+```
+
+### 2.10 `src/plan.rs` — the typed edit vocabulary
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum EntityRef {
+    Ticket(TicketId), Proposal(ProposalId), Spec(SpecName),
+    Decision(DecisionId), Quirk(QuirkId),
+}
+
+pub enum Op {
+    /// The ONLY op that can touch `state:`. It computes the destination itself
+    /// via `next(current, verb)` — the caller does NOT pass a destination
+    /// ✅ (Skeleton-First's `transition(.., to: State, ..)` let a caller pass a
+    /// state the table never produces) — and emits the frontmatter delta AND the
+    /// `## Log` line in ONE staged write to ONE file, so the omission of the log
+    /// append is unavailable rather than merely rejected.
+    Transition { id: TicketId, verb: Verb, actor: Actor, at: DateTime<Utc>,
+                 detail: String, also: Vec<(TicketKey, Yv)> },
+    /// Non-state fields on any entity. `Key` is closed, so a derived key cannot
+    /// be NAMED here, let alone written.
+    SetFields  { entity: EntityRef, sets: Vec<(Key, Yv)> },
+    CreateEntity { entity: EntityRef, contents: String },   // errors if the file exists
+    AppendSection{ entity: EntityRef, heading: &'static str, line: String },
+    MarkSteps  { id: TicketId, checks: Vec<(usize, bool)> },  // `done` triage: actually-done
+    AppendJsonl{ path: PathBuf, line: String },              // comments.jsonl (v0.2)
+    MoveDir    { from: PathBuf, to: PathBuf },               // close: -> proposals/closed/
+    WriteGenerated { path: PathBuf, contents: String },      // KANSPEC-*.md ONLY
+    /// cache/gitstate.json. `ScanToken` is minted solely by `scan::scan_all`, so
+    /// "written by scan and nothing else" is a type fact — and the write happens
+    /// INSIDE the lock. ✅ (One Gate allowlisted cache.rs for unlocked writes.)
+    WriteGitState { token: ScanToken, state: GitState },
+}
+
+#[derive(Default)]
+pub struct Plan { pub ops: Vec<Op>, pub minted: Vec<EntityRef>, pub note: Option<String> }
+impl Plan {
+    pub fn of(ops: Vec<Op>) -> Plan;
+    pub fn empty() -> Plan;
+    pub fn push(&mut self, op: Op) -> &mut Plan;
+    /// Belt-and-braces (the key enums already make it unreachable), plus id
+    /// uniqueness and one-transition-per-ticket-per-plan.
+    pub fn validate(&self, snap: &Snapshot) -> Result<()>;
+    pub fn touched(&self, layout: &Layout) -> Vec<PathBuf>;
+}
+```
+
+### 2.11 `src/git.rs` — shell-out, tri-state, sealed SHAs
+
+```rust
+/// Private field; the ONLY constructor is `Sha::mint`, private to THIS file, and
+/// every call site parses real git stdout. `head:` is therefore provably read
+/// from git and can never be agent-typed — DESIGN.md's second gear, enforced.
+/// `Serialize` yes; `Deserialize` NEVER, so a cache entry cannot mint one. ✅
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct Sha(String);
+impl Sha {
+    fn mint(s: &str) -> Option<Sha>;        // PRIVATE — >= 7 lowercase hex
+    pub fn short(&self) -> &str;            // 7 chars
+    pub fn as_str(&self) -> &str;
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct HeadSha(Sha);
+impl HeadSha { pub fn sha(&self) -> &Sha; }
+
+/// Always emits `:(glob,top)`. `Git` will not accept a bare &str where a
+/// Pathspec is expected, so recon finding 6 (pathspecs are cwd-relative; `glob`
+/// makes `**` cross separators exactly like globset) cannot be forgotten. ✅
+#[derive(Clone, Debug, PartialEq, Eq)] pub struct Pathspec(String);
+impl Pathspec { pub fn glob(g: &str) -> Pathspec; pub fn as_str(&self) -> &str; }
+
+/// "Unknown" is a VALUE, not an error path: every consumer must destructure it,
+/// so no code path can quietly fold a git failure into "not merged" (invariant 2).
+#[derive(Clone, Debug)] pub enum Tri<T> { Yes(T), No, Unknown(Unknown) }
+
+/// One variant per decline reason, exhaustively matched, each carrying the
+/// fields its badge text needs. ✅ (One Gate: `Unknown{code, detail}` strings.)
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum Unknown {
+    NoHead,
+    ZeroCommitBranch,
+    HeadNotInObjectStore   { sha: String },
+    GitFailed              { cmd: String, code: i32, stderr: String },
+    GhUnavailable          { why: String },
+    SquashSuspectedNoGh    { plus_lines: usize },
+    GhMergedButNotAncestor { merge_sha: String },
+    FetchStale             { age_secs: u64 },
+    ConflictingSignals     { rungs: Vec<RungTrace> },
+}
+impl Unknown { pub fn badge(&self) -> String; }   // "unknown (squash suspected, no gh)"
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RungTrace { pub method: Method, pub cmd: String, pub exit: i32,
+                       pub saw: String, pub verdict: &'static str }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Method { Ancestry, GhPr, Trailer, PatchId, HumanConfirm, None }
+
+pub struct Git { root: PathBuf }        // ALWAYS `git -C <primary_root>`
+pub struct GitOut { pub code: i32, pub out: String, pub err: String }
+#[derive(Clone, Debug, Serialize)] pub struct ChangedPath { pub status: char, pub path: String,
+                                                            pub renamed_from: Option<String> }
+#[derive(Clone, Debug)] pub struct CherryLine { pub upstream: bool, pub sha: String }
+#[derive(Clone, Debug, Serialize)] pub struct WorktreeRow { pub path: PathBuf,
+    pub branch: Option<String>, pub head: Option<String>, pub bare: bool,
+    pub detached: bool, pub locked: Option<String>, pub prunable: Option<String> }
+
+impl Git {
+    pub(crate) fn bind(root: &Path) -> Git;
+    /// ALWAYS scrubs GIT_DIR / GIT_WORK_TREE / GIT_INDEX_FILE from the child env:
+    /// git sets GIT_DIR when running hooks, and env beats `-C`. `Err` only when
+    /// git is not runnable at all; a non-zero exit is a normal `GitOut`.
+    pub fn run(&self, args: &[&str]) -> Result<GitOut>;
+    pub fn run_ps(&self, args: &[&str], ps: &[Pathspec]) -> Result<GitOut>;
+
+    pub fn head_sha(&self, rev: &str)  -> Result<HeadSha>;
+    pub fn current_branch(&self)       -> Option<String>;   // symbolic-ref; None = detached
+    pub fn object_exists(&self, s: &Sha) -> bool;           // rev-parse --verify --quiet ^{commit}
+    pub fn resolve_main(&self, cfg: &str) -> Result<String>;
+    pub fn is_ancestor(&self, s: &Sha, base: &str) -> Tri<()>;      // 0=Yes 1=No 128=Unknown
+    pub fn commits_ahead(&self, base: &str, head: &Sha) -> Tri<u32>; // the zero-commit guard
+    pub fn grep_trailer(&self, base: &str, id: &TicketId) -> Tri<Vec<Sha>>;
+    pub fn cherry(&self, base: &str, head: &Sha) -> Tri<Vec<CherryLine>>;
+    pub fn changed_paths(&self, base: &str, head: &str) -> Tri<Vec<ChangedPath>>;  // 3-dot -M -z
+    pub fn merges_touching(&self, since: &Sha, globs: &[Pathspec]) -> Tri<u32>;    // --first-parent
+    pub fn last_touch(&self, p: &Pathspec) -> Option<(Sha, DateTime<Utc>)>;
+    pub fn ahead_behind(&self, base: &str, head: &str) -> Option<(u32, u32)>;
+    pub fn last_commit_at(&self, rev: &str) -> Option<DateTime<Utc>>;
+    pub fn fetch(&self) -> Result<()>;
+    pub fn fetch_age(&self) -> Option<Duration>;            // mtime(common_dir/FETCH_HEAD)
+    pub fn worktrees(&self) -> Result<Vec<WorktreeRow>>;    // -z; FIRST stanza is primary
+    pub fn worktree_add(&self, path: &Path, branch: &str, base: &str) -> Result<()>;
+    pub fn worktree_remove(&self, path: &Path, force: bool) -> Result<()>;
+    pub fn branch_delete(&self, branch: &str, force: bool) -> Result<()>;
+    pub fn dirty_kanspec(&self) -> Result<u32>;             // status --porcelain=v2 -z
+    pub fn is_ignored(&self, p: &Path) -> bool;             // check-ignore
+    pub fn is_tracked(&self, p: &Path)  -> bool;            // ls-files --error-unmatch
+    pub fn hooks_dir(&self) -> Result<PathBuf>;             // --git-path hooks (core.hooksPath!)
+    pub fn commit_kanspec(&self, msg: &str) -> Result<()>;  // sync = "commit"
+}
+```
+
+`src/gh.rs` — **the one and only mock seam in the crate.**
+
+```rust
+pub struct Gh { slug: Option<String>, fixtures: Option<PathBuf>, authed: OnceCell<bool> }
+#[derive(Debug, Clone, Serialize)] pub struct GhUnavailable(pub String);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrInfo { pub number: u64, pub state: PrState, pub merged_at: Option<DateTime<Utc>>,
+                    pub merge_commit: Option<String>, pub head_ref_oid: String, pub url: String }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")] pub enum PrState { Open, Closed, Merged }
+
+impl Gh {
+    /// `$KANSPEC_GH_FIXTURES` points at recorded `gh` JSON. You cannot create a
+    /// real GitHub PR in a test, and rung 2 is the only rung that catches a
+    /// title-only squash — the case that defeats all four. Git itself is NEVER
+    /// mocked. ✅ (neither Sealed Keel nor One Gate can test rung 2.)
+    pub(crate) fn detect(git: &Git, cfg: &GhCfg) -> Gh;
+    pub fn available(&self) -> bool;                            // `gh auth status`, cached
+    pub fn pr_view(&self, n: u64) -> std::result::Result<PrInfo, GhUnavailable>;
+    /// REQUIRED, not optional: a squash-merged ticket with `pr: null` would
+    /// otherwise skip the only rung that can see a title-only squash.
+    pub fn pr_for_head(&self, branch: &str)
+        -> std::result::Result<Vec<PrInfo>, GhUnavailable>;
+}
+```
+
+### 2.12 `src/out.rs` — one rendering layer
+
+```rust
+pub struct Style { pub color: bool, pub width: usize, pub quiet: bool }
+
+/// The second and LAST trait in the crate (~25 impls day one). `--json` IS the
+/// Serialize impl; there is zero hand-written JSON. Monomorphic: no dyn, no
+/// `serde_json::Value` per render, no coherence-trapping blanket impl, and — the
+/// decisive property for a parallel build — each command's payload struct and
+/// its `impl Render` live in THAT COMMAND'S OWN FILE, so `out.rs` never grows a
+/// variant or a match arm. ✅ (One Gate's `Report` mega-enum in a single-owner
+/// file; Sealed Keel's `impl<T: Serialize + Paint> View for T`.)
+pub trait Render: serde::Serialize {
+    fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()>;
+}
+/// The single emit point. Handlers NEVER print.
+pub fn emit<R: Render>(r: &R, mode: &OutMode) -> Result<()>;
+
+/// The shared human primitive: most output is a list of these.
+pub struct Line { pub glyph: char, pub id: Option<String>, pub text: String,
+                  pub dim: Option<String>, pub fix: Option<String>, pub url: Option<String> }
+impl Line { pub fn write(&self, w: &mut dyn Write, st: &Style) -> std::io::Result<()>; }
+
+pub struct Table;                                  // comfy-table preset wrapper
+impl Table {
+    pub fn new(headers: &[&str], st: &Style) -> comfy_table::Table;
+    pub fn kanspec_preset(t: &mut comfy_table::Table, st: &Style);
+}
+pub fn rel_time(then: DateTime<Utc>, now: DateTime<Utc>) -> String;   // "14m ago", "3h", "2d"
+pub fn paint(s: &str, c: Color, st: &Style) -> String;
+pub enum Color { Red, Green, Yellow, Blue, Cyan, Dim, Bold }
+/// Set ONCE in `run()` from `--color`, never from the env dance: recon proved
+/// CLICOLOR_FORCE beats NO_COLOR in owo-colors' supports-color.
+pub fn apply_color_policy(choice: ColorChoice) -> bool;
+```
+
+### 2.13 `src/lock.rs` + `src/store.rs` — THE ONE WRITE PATH
+
+```rust
+// ── lock.rs ──────────────────────────────────────────────────────────────────
+/// flock(2) via libc. The kernel releases it when the process dies, so there is
+/// NO stale-lock reaper to get subtly wrong (pid reuse, clock skew) and `kill -9`
+/// mid-transaction cannot wedge the repo. ✅ (Sealed Keel and One Gate both
+/// hand-roll "pid dead AND older than 60s".)
+///
+/// The private field is the WRITE CAPABILITY: every byte-writing primitive in
+/// `store` takes `&LockToken`, and `acquire` is the only constructor, so "the
+/// lock is held" is a borrow-checker fact at the call site.
+pub struct LockToken { file: std::fs::File, path: PathBuf }
+#[derive(Serialize, Deserialize)]
+pub struct LockOwner { pub pid: u32, pub host: String, pub cmd: String, pub at: DateTime<Utc> }
+impl LockToken {
+    /// LOCK_EX|LOCK_NB, 25ms poll to `timeout` (cfg.lock_timeout_secs, default 5s).
+    /// The holder note is written AFTER acquiring, so a reader may legitimately
+    /// see it empty -> render "held by an unknown process", never a wrong pid.
+    pub fn acquire(layout: &Layout, owner: LockOwner, timeout: Duration) -> Result<LockToken>;
+}
+impl Drop for LockToken { /* truncate note, LOCK_UN */ }
+
+// ── store.rs ─────────────────────────────────────────────────────────────────
+/// Glob-and-parse. ~55ms at 2000 tickets (measured). Loads OPEN proposals only;
+/// walks `proposals/closed/` for IDS ONLY, never bodies.
+pub fn load_snapshot(ctx: &Ctx) -> Result<Snapshot>;
+
+pub struct Committed { pub snapshot: Snapshot, pub touched: Vec<PathBuf>,
+                       pub minted: Vec<EntityRef>, pub rev: u64 }
+
+pub struct Store<'c> { ctx: &'c Ctx }
+impl<'c> Store<'c> {
+    pub fn open(ctx: &'c Ctx) -> Store<'c>;
+
+    /// THE single write path. CLI handlers and axum POST handlers call it
+    /// byte-identically, because both go through the same `cmd::*` function.
+    ///
+    ///  1. `LockToken::acquire` (typed, diagnosable contention error)
+    ///  2. load a FRESH Snapshot *inside* the lock — never trust one taken
+    ///     before we had exclusivity ✅
+    ///  3. build a `Minter` over `snap.taken_ids()` (incl. `closed_ids`)
+    ///  4. run the PURE planner; all validation lives there
+    ///  5. `Plan::validate`
+    ///  6. `fm::writable()` on every frontmatter the plan touches, BEFORE any
+    ///     byte moves — turns "silently appended a duplicate key" into a typed
+    ///     refusal; `SetOutcome::ReplacedMultiline` is a HARD error
+    ///  7. apply: stage per file, then tmp + `fs::rename` + fsync the dir. A
+    ///     ticket's frontmatter delta and its `## Log` line are ONE write to ONE
+    ///     file; cross-file plans order the authoritative file LAST
+    ///  8. `transitions::prove()` on every touched ticket — the write path proves
+    ///     its own legality, so a hand-edit is caught by the very NEXT VERB
+    ///     instead of by CI weeks later ✅ (best enforcement timing in the field)
+    ///  9. `sync = "commit"` -> `git add -A .kanspec && git commit -m "kanspec: <verb> <id>"`
+    /// 10. drop the lock; return the post-write snapshot with `rev + 1`
+    ///
+    /// gh/network calls MUST happen BEFORE `transact` (see `Facts`, §2.16): a
+    /// wedged subprocess inside the lock stalls the browser and every CLI verb.
+    pub fn transact<F>(&self, verb: Verb, cmdline: &str, planner: F) -> Result<Committed>
+    where F: FnOnce(&Snapshot, &Minter) -> Result<Plan>;
+}
+
+/// The ONLY fs-mutating functions in the crate. `tests/single_write_path.rs`
+/// greps every other source file for `fs::write|fs::rename|File::create|
+/// OpenOptions|fs::remove|fs::create_dir` and fails on any hit outside this file.
+/// The allowlist is exactly TWO files and its own length is asserted, so it
+/// cannot grow silently: `lock.rs` (creates the very lockfile it then locks) and
+/// `cmd/init.rs` (scaffolds `.kanspec/` before a store can exist).
+/// `hooks.rs` / `setup.rs` write outside `.kanspec/` (`.git/hooks`, CLAUDE.md)
+/// and are covered by a second grep asserting they name no `.kanspec` path.
+pub(crate) fn write_atomic(p: &Path, bytes: &[u8], _t: &LockToken) -> Result<()>;
+pub(crate) fn append_line(p: &Path, line: &str, _t: &LockToken) -> Result<()>;
+pub(crate) fn move_dir(a: &Path, b: &Path, _t: &LockToken) -> Result<()>;
+pub(crate) fn create_new(p: &Path, bytes: &[u8], _t: &LockToken) -> Result<()>;
+```
+
+### 2.14 `src/fm.rs` — the surgical frontmatter writer
+
+Body is the recon module **verbatim** (365 lines, compiled and tested; port from
+`.../scratchpad/fmtest/src/fm.rs`). `gray_matter` is **deleted from DESIGN.md's crate list**
+(cannot serialize at all, and mutates the content it hands back — no byte-identical write path can
+exist on top of it). `yaml-edit` is rejected (silently truncates on read, welds lines on write).
+`serde_yaml_ng::to_string` is never called: a no-op round trip reformats 11 of 22 lines.
+
+```rust
+#[derive(Debug)] pub enum FmError { NoFrontmatter, Unterminated }
+/// `open + fm + close + body` reconstructs the input byte-exactly.
+#[derive(Debug, Clone)] pub struct MdDoc { pub open: String, pub fm: String,
+                                           pub close: String, pub body: String }
+impl MdDoc { pub fn render(&self) -> String; }
+pub fn split(src: &str) -> std::result::Result<MdDoc, FmError>;
+
+#[derive(Debug, Clone)] pub struct KeySpan { pub key: String, pub line: usize,
+    pub block_end: usize, pub val: (usize, usize), pub multiline: bool }
+pub fn index(fm: &str) -> Vec<KeySpan>;                    // CRLF- and quote-aware
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Yv { Null, Bool(bool), Int(i64), Str(String), List(Vec<Yv>) }
+impl Yv {
+    pub fn s(v: impl Into<String>) -> Yv;
+    pub fn opt_s(v: Option<impl Into<String>>) -> Yv;      // None -> Yv::Null
+    pub fn list(v: impl IntoIterator<Item = String>) -> Yv;
+}
+pub fn emit(v: &Yv, flow: bool) -> String;
+
+#[derive(Debug, PartialEq)]
+pub enum SetOutcome { Unchanged, Replaced, ReplacedMultiline, Inserted }
+/// Replaces ONLY the value's byte range. Inline comments, key order, quoting
+/// style, block scalars, unknown future keys and CRLF all survive. `ship`
+/// produces a 3-line real git diff; 100 round-tripping edits reproduce the file
+/// byte-identically.
+pub fn set(doc: &mut MdDoc, key: &str, val: &Yv, order: &[&str]) -> SetOutcome;
+pub fn append_to_section(doc: &mut MdDoc, heading: &str, line: &str);
+pub fn mark_step(doc: &mut MdDoc, index: usize, done: bool) -> bool;
+/// SAFETY GUARD — `Store::transact` calls this before ANY byte moves, and
+/// `doctor::check_frontmatter_writable` calls it on every file. It compares the
+/// line indexer's top-level keys against serde_yaml_ng's; a mismatch (quoted
+/// key, explicit `?` key, key with spaces) becomes a typed refusal instead of a
+/// silently appended duplicate key.
+pub fn writable(fm_text: &str) -> std::result::Result<(), String>;
+```
+
+`ReplacedMultiline` is a **hard `KsError::Invalid`** in `store.rs`, never a silent collapse. No
+v0.1 or v0.2 field holds a block scalar or nested map; if the schema ever grows one, this is where
+it fails loudly.
+
+### 2.15 `src/scan.rs` — the sealed proof and the ladder
+
+```rust
+/// Private fields; NO Default, NO Deserialize, NO From<MergeFact>. The only
+/// constructors live in THIS file and each ran a real ladder. `plan_done`'s
+/// signature therefore makes invariant 1 a COMPILE-TIME guarantee: a `done`
+/// that never consulted git does not build. Same-module privacy — no
+/// `pub(in ...)`, so it compiles (§2.7). ✅
+#[derive(Clone, Debug, Serialize)]
+pub struct MergedProof { ticket: TicketId, sha: Sha, method: Method,
+                         pr: Option<u64>, checked_at: DateTime<Utc> }
+impl MergedProof {
+    pub fn ticket(&self) -> &TicketId;  pub fn sha(&self) -> &Sha;
+    pub fn method(&self) -> Method;     pub fn pr(&self) -> Option<u64>;
+    pub fn checked_at(&self) -> DateTime<Utc>;
+    pub fn badge(&self) -> String;      // "IN MAIN (gh-pr #142 · checked 11s ago)"
+}
+
+/// The chore/docs escape — a DIFFERENT type, so the landed path cannot accept
+/// it, and `record` needs `&mut Plan` so the waiver is DURABLE before it is
+/// usable. `plan_done` additionally refuses it from `review`, so `--no-code`
+/// provably cannot bypass the gate on an already-shipped ticket. ✅
+#[derive(Clone, Debug, Serialize)]
+pub struct NoCodeWaiver { why: String, by: String, at: DateTime<Utc> }
+impl NoCodeWaiver {
+    pub fn record(plan: &mut Plan, id: &TicketId, why: &str, by: &Actor, at: DateTime<Utc>)
+        -> Result<NoCodeWaiver>;         // refuses an empty `why`
+    pub fn why(&self) -> &str;
+}
+#[derive(Clone, Debug, Serialize)] pub enum Landed { Proof(MergedProof), NoCode(NoCodeWaiver) }
+
+/// Minted ONLY by `scan_all`; required by `Op::WriteGitState`. ✅
+pub struct ScanToken(());
+
+/// Three-state per rung. Ancestry-NEGATIVE is Inconclusive, not NotMerged: a
+/// squash-merged branch is genuinely not an ancestor of main. Only rungs that
+/// can PROVE absence may say No. Sharpest statement of invariant 2 in the field.
+pub enum Rung { Merged(Evidence), NotMerged(Evidence), Inconclusive(Unknown) }
+#[derive(Clone, Debug, Serialize)]
+pub struct Evidence { pub method: Method, pub saw: String, pub sha: Option<Sha>, pub pr: Option<u64> }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum Verdict { Landed { sha: Sha, method: Method, pr: Option<u64> },
+                   NotLanded, Unknown(Unknown) }
+
+/// A completed ladder run. Carries its own `rungs`, so `scan --explain` is a
+/// property of the value `detect` already produced — there is no SECOND ladder
+/// run that could disagree with the first. ✅ (Skeleton-First had a separate
+/// `explain()` that re-runs.)
+#[derive(Clone, Debug, Serialize)]
+pub struct Detection { verdict: Verdict, checked_at: DateTime<Utc>,
+                       fetch_age_secs: Option<u64>, rungs: Vec<RungTrace> }
+impl Detection {
+    fn seal(v: Verdict, at: DateTime<Utc>, age: Option<u64>, r: Vec<RungTrace>) -> Detection;
+    pub fn verdict(&self) -> &Verdict;
+    pub fn checked_at(&self) -> DateTime<Utc>;
+    pub fn explain(&self) -> &[RungTrace];
+    /// Down-converts the sealed, in-process value to the plain cache DTO. The
+    /// cache is badge-grade; the gate is proof-grade. There is deliberately no
+    /// inverse. ✅ (Sealed Keel's `GitState: Deserialize` holding a
+    /// Serialize-only `Detection` does not compile — verified E0277 — and the
+    /// obvious repair silently converts the cache into a forgery channel.)
+    pub fn to_fact(&self, changed: Vec<String>) -> MergeFact;
+}
+
+/// THE LADDER, in the recon-corrected order. Every rung returns `Rung`; exit 128
+/// anywhere is Unknown, never No.
+///
+///  0.  guard  rev-parse --verify --quiet '<head>^{commit}'
+///                                          -> Unknown::HeadNotInObjectStore
+///  0b. guard  rev-list --count <main>..<head> == 0
+///                                          -> Unknown::ZeroCommitBranch
+///             (a fresh `start` branch is trivially an ancestor of main —
+///              a VERIFIED false MERGED for work that never happened)
+///  1.  ANCESTRY  merge-base --is-ancestor <head> <main>   0=Merged 1=next 128=Unknown
+///  2.  GH        pr view <n> | pr list --head <branch>; MERGED -> RE-VERIFY with
+///                is-ancestor(mergeCommit.oid); mismatch -> Unknown::GhMergedButNotAncestor;
+///                any gh failure -> Unknown::GhUnavailable, NEVER NotMerged
+///  3.  TRAILER   log <main> -E --grep 'Kanspec: t-9c41([^0-9a-f]|$)' --format=%H
+///                UNANCHORED (git indents squash-body trailers 4 spaces) and
+///                boundary-terminated (ids are 4 hex; `t-9c4` would match `t-9c41`).
+///                Blind to reverts -> weighted BELOW ancestry.
+///  4.  PATCH-ID  cherry <main> <head> — RELABELLED "rebase/cherry-pick detection".
+///                DESIGN.md rung 4 is backwards: recon measured a real 2-commit
+///                squash as `+2`, i.e. NOT merged — the exact case the rung was
+///                added for. Merged iff output non-empty AND every line is `-`.
+///                Any `+` -> Unknown::SquashSuspectedNoGh.
+///  5.  otherwise Unknown, with every RungTrace attached.
+pub fn ladder(git: &Git, gh: &Gh, t: &Ticket, main: &str,
+              fetch_age: Option<Duration>, now: DateTime<Utc>) -> Detection;
+
+/// The `done` gate. RE-RUNS the ladder rather than trusting the cache — "a 60s-old
+/// merged is not a gate". ✅ (One Gate reads `MergeVerdict` straight out of
+/// gitstate.json.)
+pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof>;
+
+/// Runs the ladder across every non-terminal ticket + spec anchors + branch facts.
+/// The ONLY producer of `ScanToken`. Runs OUTSIDE the lock (gh/network); the
+/// caller then opens a short `transact` to persist via `Op::WriteGitState`.
+pub fn scan_all(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<(GitState, ScanToken)>;
+pub struct ScanOpts { pub fetch: bool, pub only: Option<TicketId>, pub quiet: bool }
+
+/// The recorded human override. Appends an attributed `Verb::Confirm` line to the
+/// TICKET'S `## Log`, not a cache entry: a human attestation is an ASSERTED ACT
+/// WITH AN ACTOR, so it must survive `rm -rf cache/` and be visibly signed. ✅
+pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<Plan>;
+pub struct ConfirmFacts { pub sha: Option<Sha>, pub actor: Actor,
+                          pub at: DateTime<Utc>, pub why: String, pub invocation: String }
+/// Reads a recorded confirmation back out of the log — the ONLY non-ladder route
+/// to a `MergedProof`.
+pub fn confirmed_proof(t: &Ticket) -> Option<MergedProof>;
+```
+
+### 2.16 The planner shape — pure, with `Facts`
+
+```rust
+/// Everything a planner needs from the outside world, gathered BEFORE `transact`.
+/// The planner is GENUINELY pure: no `Ctx`, no git, no gh, no clock, no fs.
+/// ✅ One Gate's `Planner<A> = fn(&Snapshot, &A, &Ctx, &Minter)` handed every
+/// planner Git/Gh/Ui/clock and its own worked example shelled out to git inside
+/// the lock, falsifying the purity claim for exactly `ship` and `done`.
+pub struct Facts { pub actor: Actor, pub at: DateTime<Utc>, pub invocation: String }
+pub struct StartFacts { pub base: Facts, pub branch: String,
+                        pub worktree: Option<PathBuf>, pub head: HeadSha }
+pub struct ShipFacts  { pub base: Facts, pub head: HeadSha }
+pub struct DoneFacts  { pub base: Facts, pub landed: Landed, pub touched: Vec<ChangedPath> }
+
+/// The uniform planner shape. Every mutating verb is one of these, and each is a
+/// table-driven unit test against a hand-built `Snapshot` with ZERO IO.
+/// (Signatures below are exhaustive for v0.1; V2 adds its own in its own files.)
+pub fn plan_new   (s:&Snapshot, f:&Facts,      a:&NewArgs,   m:&Minter) -> Result<Plan>;
+pub fn plan_start (s:&Snapshot, f:&StartFacts, a:&StartArgs, m:&Minter) -> Result<Plan>;
+pub fn plan_ship  (s:&Snapshot, f:&ShipFacts,  a:&ShipArgs,  m:&Minter) -> Result<Plan>;
+pub fn plan_done  (s:&Snapshot, f:&DoneFacts,  t:&Triage,    a:&DoneArgs, m:&Minter) -> Result<Plan>;
+pub fn plan_park  (s:&Snapshot, f:&Facts,      a:&ParkArgs,  m:&Minter) -> Result<Plan>;
+pub fn plan_drop  (s:&Snapshot, f:&Facts,      a:&DropArgs,  m:&Minter) -> Result<Plan>;
+pub fn plan_repair(s:&Snapshot, f:&Facts,      a:&RepairArgs,m:&Minter) -> Result<Plan>;
+```
+
+Worked example — **`ship`, both call sites, byte-identical:**
+
+```rust
+// src/cmd/flow.rs
+pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
+    let snap = ctx.snapshot()?;                       // read-only peek, outside the lock
+    let t = snap.ticket(&TicketId::parse(&a.id)?)?;
+    // Every subprocess happens HERE, before the lock is taken.
+    let head = ctx.git.head_sha(t.fm.branch.as_deref().unwrap_or("HEAD"))?;
+    let f = ShipFacts { base: Facts { actor: ctx.actor.clone(), at: ctx.now,
+                                      invocation: ctx.invocation() }, head };
+    let done = Store::open(ctx).transact(Verb::Ship, &ctx.invocation(),
+                                         |s, m| plan_ship(s, &f, a, m))?;
+    Ok(ShipReport::from(&done, a))
+}
+
+// src/server.rs — the SAME function. There is no server-side write code at all.
+async fn post_verb(State(st): State<AppState>, Json(a): Json<ShipArgs>)
+    -> std::result::Result<Json<ShipReport>, ApiError> {
+    let ctx = st.ctx.clone();                                     // Arc<Ctx>: Send + Sync ✅
+    Ok(Json(tokio::task::spawn_blocking(move || cmd::flow::ship(&ctx, &a)).await??))
+}
+```
+
+### 2.17 `src/triage.rs` — one typed value, two front doors
+
+```rust
+/// The interactive prompts and the `--json` flags BOTH construct this, and only
+/// this reaches `plan_done`. The agent path and the human path therefore cannot
+/// diverge in what they record.
+pub struct Triage { pub steps: Vec<StepDisposition>, pub quirks: Vec<NewQuirk>,
+                    pub decisions: Vec<NewDecision>, pub spec: SpecCheck }
+pub enum StepDisposition { Spawn { index: usize, title: String },
+                           Drop  { index: usize, why: String },
+                           ActuallyDone { index: usize } }
+pub enum SpecCheck { EditedOnBranch { specs: Vec<SpecName> },
+                     Unchanged { why: String }, NotApplicable }
+pub struct NewQuirk    { pub title: String, pub paths: Vec<String>, pub severity: Severity }
+pub struct NewDecision { pub title: String, pub scope: Vec<String> }
+
+impl Triage {
+    /// Non-interactive REFUSES with a typed error naming BOTH flags when neither
+    /// `--spawn` nor `--no-followups` is present — clap cannot express "required
+    /// iff --json" (`required_if_eq` works on values, and global+required is the
+    /// debug-only panic the recon found), and the handler yields a better message.
+    pub fn from_args(t: &Ticket, a: &DoneArgs, touched: &[ChangedPath], s: &Snapshot)
+        -> Result<Triage>;
+    pub fn prompt(t: &Ticket, a: &DoneArgs, touched: &[ChangedPath], s: &Snapshot)
+        -> Result<Triage>;
+}
+```
+
+---
+
+## 3. Error strategy
+
+**Shape, not situation.** Eight closed shapes (§2.1). A new refusal is
+`KsError::gate("undispositioned", msg, fixes![..])` **in the raising agent's own file** —
+`error.rs` never grows, which removes the single worst merge magnet from a 9-agent build. `code:
+&'static str` remains a stable JSON discriminator, so agent-facing error kinds stay as precise as
+a per-situation enum. The two errors whose output quality *is* the product keep structured
+payloads via `GateDetail` (`NotLanded { trace }`, `Undispositioned { items }`) — pre-formatting a
+ladder trace into a `message` string would throw away the `--explain`-grade output that is this
+tool's selling point.
+
+**Invariant 9 is a type constraint.** `Fixes(Fix, Vec<Fix>)` is non-empty by construction, so you
+cannot build an error without naming the next command, and unlike a `debug_assert` it survives
+`cargo build --release`. `KsError::fixes()` is **total** — including `Internal`, which gets
+`kanspec doctor`. There is **no `#[from] std::io::Error`**: in a file-munger that conversion would
+make every bare `?` emit a fix-less error, i.e. invariant 9 opt-out-by-default.
+
+**A typed error renders its exact next command:**
+
+```
+✗ t-9c41 is not on origin/main — cannot close it
+    ancestry   merge-base --is-ancestor a1b9c3d origin/main   exit 1   not an ancestor
+    gh-pr      (gh unavailable: HTTP 401 Bad credentials)     exit 1   inconclusive
+    trailer    log origin/main --grep 'Kanspec: t-9c41…'      exit 0   0 hits
+    patch-id   cherry origin/main a1b9c3d                     exit 0   +2  squash suspected
+  unknown (squash suspected, no gh)
+  → kanspec scan --explain t-9c41
+  → kanspec scan --confirm t-9c41 --why "..."
+```
+
+```json
+{"ok":false,"error":{"kind":"gate","code":"merge_unknown",
+ "message":"cannot verify t-9c41 landed",
+ "detail":{"detail":"not_landed","trace":[{"method":"ancestry","exit":1,...}]},
+ "fix":["kanspec scan --explain t-9c41","kanspec scan --confirm t-9c41 --why \"...\""],
+ "exit":1}}
+```
+
+**Exit codes.** `0` ok · `1` gate refusal / invariant violation / `doctor` findings · `2`
+**landcheck Stop-hook block ONLY** · `64` usage · `69` environment · `70` internal.
+
+`main` uses `try_get_matches()` + `from_arg_matches_mut` and returns `ExitCode`; it **never** calls
+`Cli::parse()` (which internally `process::exit(2)`s on any typo'd flag) and never
+`process::exit`. Clap's native 2 is remapped to 64. `2` is reachable from exactly one module,
+sealed by `BlockToken`'s private field, so the Stop-hook contract is auditable by grep.
+`dispatch` returns `Result<u8, KsError>` so a **successful** run can still exit non-zero (`doctor`
+→ 1, `landcheck` → 2) without going through the error renderer.
+
+```rust
+// src/lib.rs — frozen after wave 0
+pub fn run(invoked_as: &'static str) -> std::process::ExitCode {
+    let cmd = Cli::command().name(invoked_as).bin_name(invoked_as);
+    let cli = match cmd.try_get_matches().and_then(|mut m| Cli::from_arg_matches_mut(&mut m)) {
+        Ok(c)  => c,
+        Err(e) => { let _ = e.print(); return ExitCode::from(match e.kind() {
+            ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => code::OK,
+            // bare `kanspec` / bare `kanspec comment` land here; USAGE, not OK, so an
+            // agent that runs an incomplete command does not think it succeeded (§11 D-16)
+            _ => code::USAGE }); }
+    };
+    let color = out::apply_color_policy(cli.color);
+    let mode  = if cli.json { OutMode::Json } else { OutMode::Human { color } };
+    let ctx = match Ctx::open(&cli, &cwd()) {
+        Ok(c) => c, Err(e) => { e.render(&mode); return ExitCode::from(e.exit_code()) } };
+    match dispatch(&ctx, &cli) {
+        Ok(c)  => ExitCode::from(c),
+        Err(e) => { e.render(&ctx.out); ExitCode::from(e.exit_code()) }
+    }
+}
+```
+
+---
+
+## 4. The Store / single-write-path, locking, surgical writes
+
+Covered as code in §2.13–2.14. The load-bearing points:
+
+| Concern | Mechanism | Why not the alternative |
+|---|---|---|
+| One write path | `store::{write_atomic,append_line,move_dir,create_new}` are `pub(crate)` and each takes `&LockToken`; `Store::transact` is the only public mutator | Module privacy gets 90%; Rust cannot forbid `std::fs` crate-wide, so the last 10% is `tests/single_write_path.rs` — named after the invariant, not pretended away |
+| Lock | **flock(2)** held for the transaction's whole life; released by the kernel on process death | No stale reaper to get wrong (pid reuse, clock skew); `kill -9` cannot wedge the repo |
+| Lock diagnostics | `LockOwner` JSON written **after** acquiring; empty note renders "held by an unknown process" | flock alone gives a blocked syscall and nothing to print, but invariant 9 demands a fix line |
+| Staleness of reads | Snapshot loaded **inside** the lock | A snapshot taken before exclusivity is a TOCTOU |
+| Atomicity | tmp + `fs::rename` + dir fsync, per file; state delta and Log line are ONE write to ONE file; cross-file plans order the authoritative file **last** | Multi-file plans are genuinely not atomic — see §11 R-1; `doctor` names the half-applied state |
+| Frontmatter | hand-rolled surgical writer; `serde_yaml_ng` read-only | `gray_matter` cannot serialize and mutates content; `yaml-edit` truncates on read; full re-serialize changes 11/22 lines |
+| Pre-write guard | `fm::writable()` on every touched file, inside the lock, before any byte moves | Converts the indexer's one real hazard (non-plain keys → duplicate key appended) into a typed refusal |
+| Post-write proof | `transitions::prove()` on every touched ticket | A hand-edited `state:` fails at the **next verb**, not at the next CI run |
+| Derived cache | `Op::WriteGitState { token: ScanToken, .. }` — inside the lock, capability-gated | An unlocked `cache.rs` writer lets the server's 60s poll and a post-merge hook interleave on the sole home of every derived fact |
+| gh / network | **must** run before `transact` | A wedged `gh` inside the lock stalls the browser and every concurrent CLI verb for the lock timeout |
+
+**ID minting.** Inside `transact`, under the lock, against the fresh snapshot's `taken_ids()`
+(which includes `closed_ids`), retrying on collision, widening 4→5 hex after 64 rejections.
+Collision-freedom is a property of **exclusion**, not hash entropy — 16 bits is 65536, so birthday
+collisions bite near ~300 entities. It works across parallel agents and worktrees precisely
+because worktree unification means they all contend on ONE lock over ONE primary `.kanspec/`. The
+`t-`/`p-`/`D-`/`q-` prefixes are load-bearing twice: type safety, and stopping a bare 4-hex id like
+`0x1f` from being reinterpreted as a YAML number.
+
+---
+
+## 5. `rules ≡ prime` — one generator, one renderer (invariant 3)
+
+```rust
+// src/rulesdoc.rs
+pub struct Scope { pub paths: Vec<String>, set: GlobSet }   // empty = unscoped
+impl Scope {
+    pub fn none() -> Scope;
+    pub fn of(paths: &[String]) -> Result<Scope>;
+    pub fn from_branch(touched: &[ChangedPath]) -> Result<Scope>;
+    pub fn matches(&self, p: &str) -> bool;
+}
+
+#[derive(Serialize)] pub struct RulesDoc {
+    pub decisions:  Vec<StandingDecision>,   // ACCEPTED only; full text iff scope matches
+    pub quirks:     Vec<StandingQuirk>,      // ACTIVE only, path-matched
+    pub spec_rules: Vec<StandingRule>,       // with {p-xxxx} provenance tokens
+    pub counts:     Counts,
+}
+/// THE generator. `rules`, `rules --path`, and `prime` all call exactly this.
+/// PURE: `&Snapshot` cannot contain a closed proposal body, so invariant 4 is
+/// enforced by what the input TYPE can hold.
+pub fn build(s: &Snapshot, scope: &Scope) -> RulesDoc;
+
+/// THE renderer — the ONLY way a RulesDoc becomes bytes. `kanspec rules` writes
+/// exactly this and stops. `kanspec prime` writes exactly this, then "\n", then
+/// the live slice. Byte-identity is a property of the CALL GRAPH: there is
+/// physically no second formatter to drift from.
+pub fn render_text(d: &RulesDoc) -> String;
+
+pub fn audit(s: &Snapshot, d: &RulesDoc) -> Vec<AuditWarning>;   // rules --audit / --adopt
+```
+
+`cmd/prime.rs` produces the payload in **exactly one place**:
+
+```rust
+pub fn payload(ctx: &Ctx, s: &Snapshot, dv: &Derived, scope: &Scope) -> String {
+    let standing = rulesdoc::render_text(&rulesdoc::build(s, scope));
+    format!("{standing}\n{}", live_slice(ctx, s, dv))
+}
+```
+
+**The test** (`tests/invariants_rules.rs`) combines both winning ideas: assert on the **real
+binary's stdout** (catching a handler that adds a header or a trailing newline between the
+generator and the terminal), **parameterized over scopes** (unscoped plus several `--path` values,
+which is what makes the identity meaningful under path-scoped injection), plus
+`prime --json .standing == rules --json .data`.
+
+```rust
+for scope in [vec![], vec!["src/auth/x.ts"], vec!["src/billing/**"], vec!["nonexistent/**"]] {
+    let r = repo.ks(["rules"].iter().chain(path_flags(&scope))).stdout;
+    let p = repo.ks(["prime"].iter().chain(path_flags(&scope))).stdout;
+    assert!(p.starts_with(&r), "invariant 3 broke for scope {scope:?}");
+}
+```
+
+---
+
+## 6. Derived-state projection — `src/derive.rs`, pure
+
+No `use std::fs`, no `use std::process`, no `Utc::now()` — `now` is a `Snapshot` field.
+`tests/purity.rs` greps for all three and fails the build on a hit. This is what makes the part of
+the product most likely to be wrong, and hardest to reproduce, testable as table-driven unit tests
+over struct literals in microseconds. Every derived fact in the product is one of these:
+
+```rust
+// ── the dependency graph ─────────────────────────────────────────────────────
+/// A dep is satisfied when it is TERMINAL (done or dropped) or IN-MAIN. Dropped
+/// counts as satisfied: blocking forever on a dropped dep is worse, and
+/// `doctor::check_orphan_deps` warns on a dep pointing at a dropped ticket.
+pub fn dep_satisfied(s: &Snapshot, dep: &TicketId) -> bool;
+pub fn is_ready(s: &Snapshot, t: &Ticket) -> bool;                 // todo && all deps satisfied
+pub fn ready_queue(s: &Snapshot) -> Vec<&Ticket>;
+pub fn blocked_by(s: &Snapshot, t: &Ticket) -> Vec<&TicketId>;
+pub fn dep_cycles(s: &Snapshot) -> Vec<Vec<TicketId>>;
+
+// ── the git overlay (reads ONLY s.git — the gitignored cache) ────────────────
+pub fn merge_fact(s: &Snapshot, t: &Ticket) -> Option<&MergeFact>;
+pub fn in_main(s: &Snapshot, t: &Ticket) -> Option<&MergeFact>;    // doing|review && Merged
+pub fn badge(s: &Snapshot, t: &Ticket) -> Badge;
+#[derive(Serialize)] pub enum Badge { Unpushed, Pushed, PrOpen { n: u64 },
+    InMain { method: Method, sha: String, checked_at: DateTime<Utc> },
+    Unknown { why: String, checked_at: Option<DateTime<Utc>> }, NeverScanned }
+
+// ── the tripwires ────────────────────────────────────────────────────────────
+pub fn stalled(s: &Snapshot, t: &Ticket)  -> Option<Duration>;     // doing, idle > stall_secs
+pub fn dwell(s: &Snapshot, t: &Ticket)    -> Option<Tripwire>;
+#[derive(Serialize)] pub enum Tripwire { ReviewDwell(Duration), InMainNotClosed(Duration),
+                                         SettlingDwell(Duration), DiscoveredUntriaged(Duration) }
+pub fn settling(s: &Snapshot, p: &Proposal) -> bool;               // every linked ticket terminal
+pub fn unresolved(s: &Snapshot, p: &ProposalId) -> usize;          // v0.2
+pub fn double_claims(s: &Snapshot) -> Vec<(TicketId, Vec<String>)>;
+
+/// Spec staleness, RECOMPUTED at read time from per-ticket cached `changed_paths`
+/// matched against the spec's `code:` globs since its last-edit anchor. NEVER an
+/// accumulated counter: a counter in a disposable cache silently resets to zero
+/// on `rm -rf cache/` and UNDER-fires the tripwire — the dangerous direction. ✅
+pub fn staleness(s: &Snapshot, spec: &Spec) -> Staleness;
+#[derive(Serialize)] pub enum Staleness {
+    Ok,
+    Stale { merges: u32, since: DateTime<Utc>, examples: Vec<TicketId> },
+    DeadGlobs { globs: Vec<String> },
+    NeverScanned,
+}
+
+// ── the board / status aggregates ────────────────────────────────────────────
+pub fn column(s: &Snapshot, t: &Ticket) -> Column;
+#[derive(Serialize)] pub enum Column { Backlog, Ready, Doing, Review, InMain, Done, Dropped }
+/// THE status list: every attention line, grouped, each already carrying its fix.
+pub fn attention(s: &Snapshot) -> Vec<Attention>;
+#[derive(Serialize)] pub struct Attention { pub owner: Owner, pub glyph: char,
+    pub subject: String, pub line: String, pub fix: String, pub url: Option<String> }
+#[derive(Serialize)] pub enum Owner { You, Agent, Watching }
+
+/// The one aggregate `status`, `board`, `up` and `prime` all read, so the
+/// terminal, the browser and the agent cannot disagree — there is exactly one
+/// implementation of "stalled".
+pub fn compute(s: &Snapshot) -> Derived;
+#[derive(Serialize)] pub struct Derived {
+    pub ready: Vec<TicketId>, pub blocked: BTreeMap<TicketId, Vec<TicketId>>,
+    pub in_main: BTreeMap<TicketId, Badge>, pub stalled: BTreeMap<TicketId, Duration>,
+    pub settling: Vec<ProposalId>, pub dwell: BTreeMap<TicketId, Tripwire>,
+    pub stale: BTreeMap<SpecName, Staleness>, pub attention: Vec<Attention>,
+}
+```
+
+`derive` receives git facts through exactly one channel — `Snapshot.git`, the gitignored cache —
+so "derived facts are never stored" reduces to "the projection's only git input is a disposable
+file that cannot travel through git".
+
+---
+
+## 7. The git wrapper and the merge-detection ladder, as code
+
+Wrapper API: §2.11. Universal invocation rules, each verified by recon: always `git -C
+<primary_root>`; always scrub `GIT_DIR`/`GIT_WORK_TREE`/`GIT_INDEX_FILE` from the child env
+(git sets `GIT_DIR` for hooks, and env beats `-C`); always `--path-format=absolute`; every
+pathspec through `Pathspec` (`:(glob,top)`); never trust exit code alone for `log`/`cherry` (both
+exit 0 on no matches); **exit 128 is always `Unknown`, never `No`**.
+
+```rust
+// src/scan.rs
+pub fn ladder(git: &Git, gh: &Gh, t: &Ticket, main: &str,
+              fetch_age: Option<Duration>, now: DateTime<Utc>) -> Detection {
+    let mut tr: Vec<RungTrace> = Vec::new();
+    let age = fetch_age.map(|d| d.as_secs());
+    macro_rules! done { ($v:expr) => { return Detection::seal($v, now, age, tr) } }
+
+    // ── guard 0: is there anything to ask about? ──────────────────────────────
+    let Some(head) = head_of(git, t) else { done!(Verdict::Unknown(Unknown::NoHead)) };
+    if !git.object_exists(&head) {
+        tr.push(trace(Method::None, "rev-parse --verify --quiet", 1, "absent", "unknown"));
+        done!(Verdict::Unknown(Unknown::HeadNotInObjectStore { sha: head.as_str().into() }))
+    }
+    // ── guard 0b: a fresh `start` branch is trivially an ancestor of main ─────
+    match git.commits_ahead(main, &head) {
+        Tri::Yes(0) => { tr.push(trace(Method::None, "rev-list --count", 0, "0", "not-merged"));
+                         done!(Verdict::Unknown(Unknown::ZeroCommitBranch)) }
+        Tri::Unknown(u) => done!(Verdict::Unknown(u)),
+        _ => {}
+    }
+
+    // ── rung 1: ANCESTRY — exact for true merges and fast-forwards ────────────
+    match git.is_ancestor(&head, main) {
+        Tri::Yes(()) => { tr.push(trace(Method::Ancestry, "merge-base --is-ancestor", 0,
+                                        "ancestor", "merged"));
+                          done!(Verdict::Landed { sha: head, method: Method::Ancestry, pr: t.fm.pr }) }
+        Tri::Unknown(u) => done!(Verdict::Unknown(u)),
+        Tri::No => tr.push(trace(Method::Ancestry, "merge-base --is-ancestor", 1,
+                                 "not an ancestor", "inconclusive")),
+        // NOTE: ancestry-NEGATIVE is inconclusive, not NotMerged — a squash-merged
+        // branch is genuinely not an ancestor. Only rungs that can PROVE absence say No.
+    }
+
+    // ── rung 2: GH — the ONLY rung that sees a title-only squash ──────────────
+    if gh.available() {
+        let prs = t.fm.pr.map(|n| gh.pr_view(n).map(|p| vec![p]))
+                    .unwrap_or_else(|| t.fm.branch.as_deref()
+                        .map(|b| gh.pr_for_head(b))
+                        .unwrap_or(Ok(vec![])));
+        match prs {
+            Err(GhUnavailable(why)) => tr.push(trace(Method::GhPr, "gh pr", 1, &why, "inconclusive")),
+            Ok(list) => if let Some(pr) = list.iter().find(|p| p.state == PrState::Merged) {
+                if let Some(oid) = pr.merge_commit.as_deref().and_then(sha_of) {
+                    // Re-verify gh's CLAIM as a local git FACT, and get a real SHA.
+                    match git.is_ancestor(&oid, main) {
+                        Tri::Yes(()) => { tr.push(trace(Method::GhPr, "gh + is-ancestor(mergeCommit)",
+                                                        0, "MERGED", "merged"));
+                            done!(Verdict::Landed { sha: oid, method: Method::GhPr,
+                                                    pr: Some(pr.number) }) }
+                        // stale fetch or a different base branch — NOT a confident answer
+                        _ => done!(Verdict::Unknown(Unknown::GhMergedButNotAncestor {
+                                 merge_sha: oid.as_str().into() })),
+                    }
+                }
+            },
+        }
+    } else {
+        tr.push(trace(Method::GhPr, "gh auth status", 1, "unavailable", "inconclusive"));
+    }
+
+    // ── rung 3: TRAILER — unanchored + boundary-terminated ────────────────────
+    match git.grep_trailer(main, &t.fm.id) {
+        Tri::Yes(shas) if !shas.is_empty() => {
+            tr.push(trace(Method::Trailer, "log --grep", 0, &format!("{} hit(s)", shas.len()),
+                          "merged"));
+            // Blind to reverts, so it is weighted BELOW ancestry — the badge says so.
+            done!(Verdict::Landed { sha: shas[0].clone(), method: Method::Trailer, pr: t.fm.pr })
+        }
+        Tri::Unknown(u) => done!(Verdict::Unknown(u)),
+        _ => tr.push(trace(Method::Trailer, "log --grep", 0, "0 hits", "inconclusive")),
+    }
+
+    // ── rung 4: PATCH-ID — rebase/cherry-pick + SINGLE-commit squash only ─────
+    // DESIGN.md rung 4 is backwards: recon measured a real 2-commit squash as
+    // `+2`, i.e. NOT merged — the exact case the rung was supposed to cover.
+    match git.cherry(main, &head) {
+        Tri::Yes(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
+            tr.push(trace(Method::PatchId, "cherry", 0, "all -", "merged"));
+            done!(Verdict::Landed { sha: head, method: Method::PatchId, pr: t.fm.pr })
+        }
+        Tri::Yes(lines) => {
+            let plus = lines.iter().filter(|l| !l.upstream).count();
+            tr.push(trace(Method::PatchId, "cherry", 0, &format!("+{plus}"), "inconclusive"));
+            // A `+` line CANNOT distinguish an unmerged branch from a multi-commit
+            // squash, so it is Unknown — never NotMerged.
+            done!(Verdict::Unknown(Unknown::SquashSuspectedNoGh { plus_lines: plus }))
+        }
+        Tri::Unknown(u) => done!(Verdict::Unknown(u)),
+        Tri::No => {}
+    }
+
+    // Every rung declined. Stale fetch is the most actionable reason to name.
+    if let Some(a) = age { if a > FETCH_MAX { done!(Verdict::Unknown(Unknown::FetchStale { age_secs: a })) } }
+    done!(Verdict::NotLanded)
+}
+```
+
+**The honest hole, verified by recon:** a multi-commit squash with a GitHub title-only merge
+message and no `gh` defeats **all four rungs**. It renders `unknown (squash suspected, no gh)`
+with the trace, and `kanspec scan --confirm <id> --why "..."` is the recorded human override —
+which appends a `Verb::Confirm` line to the **ticket's `## Log`**, not to the cache, so the
+attestation survives a cache wipe and is visibly signed.
+
+---
+
+## 8. `Cargo.toml` — in full
+
+```toml
+[package]
+name        = "kanspec"
+version     = "0.1.0"
+edition     = "2021"                       # house style (~/dev/homerunner), NOT cargo's 2024 default
+rust-version = "1.85"
+description = "kanban + spec review over plain git-tracked files"
+license     = "MIT"
+default-run = "kanspec"
+
+[[bin]]
+name = "kanspec"
+path = "src/bin/kanspec.rs"
+[[bin]]
+name = "ks"                                # cargo-dist ships every [[bin]]; a symlink does not survive
+path = "src/bin/ks.rs"
+
+[lib]
+name = "kanspec"
+path = "src/lib.rs"
+
+[features]
+default = []
+# v0.2. Bundled rusqlite compiles SQLite from C on every clean build and is by far
+# the largest compile cost in the set for code v0.1 never calls. Moves into
+# `default` when ci.rs lands.
+ci-homerunner = ["dep:rusqlite"]
+
+[dependencies]
+anyhow        = "1.0.104"
+axum          = "0.8.9"                    # default features; SSE is NOT feature-gated
+chrono        = { version = "0.4.45", features = ["serde"] }
+clap          = { version = "4.6.6", features = ["derive"] }
+clap_complete = "4.6.9"
+comfy-table   = "8.0.0"
+globset       = "0.4.20"
+libc          = "0.2.189"                  # flock(2) only — ~40 lines, zero new supply chain
+notify        = "8.2.0"
+owo-colors    = { version = "4.4.0", features = ["supports-colors"] }
+pulldown-cmark = { version = "0.13.4", default-features = false, features = ["html"] }
+rust-embed    = { version = "8.12.0", features = ["mime-guess"] }
+serde         = { version = "1.0.229", features = ["derive"] }
+serde_json    = "1.0.151"
+serde_yaml_ng = "0.10.0"                   # READ-SIDE DESERIALIZER ONLY; never to_string
+thiserror     = "2.0.20"
+tokio         = { version = "1.53.1", features = [
+                  "rt-multi-thread", "macros", "signal", "time", "net", "fs", "sync"] }
+tokio-stream  = { version = "0.1", features = ["sync"] }   # wrappers::BroadcastStream
+toml          = "1.1.4"                    # NOTE: 1.x, not 0.8
+rusqlite      = { version = "0.40.2", features = ["bundled"], optional = true }
+
+# DELIBERATELY ABSENT:
+#   gray_matter — cannot serialize at all, and mutates the content it returns
+#   tower-http  — axum 0.8 alone covers SSE + a 12-line embedded-asset fallback;
+#                 verified 9 direct deps / 1.3 MB stripped for the whole server
+#   futures     — tokio-stream's merge + map_while replaces take_until
+#   a git library — shell out for exact parity with the user's git
+
+[dev-dependencies]
+insta    = { version = "1.48.0", features = ["json", "filters"] }
+tempfile = "3.27.0"
+
+[profile.release]
+lto    = true
+strip  = true
+opt-level = 3
+codegen-units = 1
+```
+
+```rust
+// build.rs — MANDATORY. rust-embed's include_bytes! tracks existing FILES but not
+// the DIRECTORY, so a newly added asset is silently absent from a release binary
+// (verified: build finished in 0.08s and the marker string was not in the binary).
+fn main() { println!("cargo:rerun-if-changed=assets"); }
+```
+
+---
+
+## 9. Test strategy
+
+**Unit tests live inline** (`#[cfg(test)] mod tests`) **in the file under test**, owned by that
+file's owner. No unit test ever lives in a shared file. **Integration tests are named after the
+invariant they prove** so a failure reads as "invariant 3 broke", which is the review conversation
+you want.
+
+**The fast half (~1s, no git, no fs, no clock).** `derive.rs` against `Snapshot` literals;
+`transitions::{next, replay}` over the exhaustive (State × Verb) matrix; `fm.rs` byte-stability +
+100-edit idempotence against the adversarial corpus; every planner (`plan_ship`, `plan_done`, …)
+asserting exact `Op`s against a hand-built `Snapshot` and a `Facts` literal — this is what the pure
+planner buys, and it is the single best testing seam in the design; rung *parsers* against
+recorded git stdout strings.
+
+**The real half.** `tests/common/mod.rs::TestRepo` builds a real temp git repo with a real bare
+`origin`, real commits, real worktrees, and the six real merge shapes.
+
+```rust
+// tests/common/mod.rs — FROZEN, foundation-owned
+pub struct TestRepo { pub root: PathBuf, pub origin: PathBuf, _tmp: tempfile::TempDir }
+pub struct Run { pub code: i32, pub stdout: String, pub stderr: String }
+
+impl TestRepo {
+    /// Builds the repo ONCE into a process-wide template dir, then `fs::copy`s it
+    /// per test (~4ms vs ~30ms for `git init` per test). With 9 agents each running
+    /// the suite on every save, this is the difference between a fast inner loop
+    /// and a suite nobody runs.
+    pub fn new() -> TestRepo;
+    pub fn with_merges() -> TestRepo;           // + common::merges::all()
+    pub fn worktree(&self, name: &str) -> PathBuf;
+
+    /// In-process for speed; `cli_smoke.rs` shells the real binary for the argv /
+    /// exit-code / `ks`-alias wiring the in-process path skips.
+    pub fn ks<I, S>(&self, args: I) -> Run where I: IntoIterator<Item = S>, S: AsRef<str>;
+    pub fn ks_in<I, S>(&self, cwd: &Path, args: I) -> Run;
+    pub fn json<T: serde::de::DeserializeOwned>(&self, args: &[&str]) -> T;
+
+    pub fn write(&self, rel: &str, body: &str);
+    pub fn read(&self, rel: &str) -> String;
+    pub fn commit(&self, msg: &str) -> String;
+    pub fn push(&self, branch: &str);
+    pub fn gh_fixture(&self, name: &str, json: &str);   // -> $KANSPEC_GH_FIXTURES
+}
+
+// tests/common/merges.rs — the six shapes, each a REAL merge into a REAL origin
+pub enum Shape { TrueMerge, SquashGitNative, SquashGhTitleOnly, Rebase, SquashOneCommit, Never }
+pub fn all(repo: &TestRepo) -> Vec<(Shape, TicketId, ExpectedStatus)>;
+```
+
+**Determinism comes from exactly three env overrides, read in `Ctx::open`:** `KANSPEC_NOW`,
+`KANSPEC_ACTOR` (+ `KANSPEC_ACTOR_KIND`), `KANSPEC_ID_SEED`. **The one and only mock seam in the
+crate is `KANSPEC_GH_FIXTURES`** — you cannot create a real GitHub PR in a test, and rung 2 is the
+only rung that catches the title-only squash. **Git itself is never mocked**, and there is no
+`trait GitBackend`, because the second implementation does not exist. `insta` filters normalizing
+SHAs, timestamps and generated ids are written with the **first** snapshot, not retrofitted.
+
+**How each slice tests in isolation.** Every slice's public surface exists as a signature after
+wave 0, so a slice compiles and unit-tests against `unimplemented!()` neighbours from hour one.
+Only *runtime* integration waits on a dependency, and the gate for each slice (§10) names exactly
+which test proves it.
+
+**Invariant tests own their own file so they cannot be quietly weakened:**
+
+| File | Proves |
+|---|---|
+| `single_write_path.rs` | source grep: no `fs::write\|fs::rename\|File::create\|OpenOptions\|fs::remove\|fs::create_dir` outside `store.rs` + the 3-file allowlist |
+| `purity.rs` | source grep: `derive.rs` imports no `std::fs`, no `std::process`, calls no `Utc::now()` |
+| `proof_is_sealed.rs` | source grep: no `impl (Deserialize\|Default\|From<.*>) for MergedProof` — it *will* be tempting the first time someone wants a fast `status` |
+| `cache_wipe.rs` | `rm -rf .kanspec/cache` changes no rendered state except freshness stamps. The correct **behavioural** proof of invariant 1 — it holds regardless of how a derived fact got there, which no type and no grep can do |
+| `invariants_rules.rs` | `prime` stdout `starts_with` `rules` stdout, on the real binary, across N scopes |
+| `transition_table.rs` | exhaustive (State × Verb) agreement; `replay` matrix incl. the repair reset |
+| `doctor_replay.rs` | a hand-edited `state:` fails; a legal trail passes; `repair` recovers |
+| `worktree.rs` | every mutating verb run from a linked worktree lands in the primary `.kanspec/` |
+| `scan_ladder.rs` | all six merge shapes → exact `MergeStatus` **and** `Method`, incl. the two that must be `unknown` |
+| `lock.rs` | 20-process contention; `kill -9` mid-transaction releases |
+| `fm_bytes.rs` | byte-stability, 100-edit idempotence, CRLF, adversarial corpus |
+| `json_matrix.rs` | `every_command_supports_json`, walked mechanically off the finished clap tree |
+| `setup_hooks.rs` | foreign hook preserved through install/uninstall; `core.hooksPath` respected; `.d/` dispatch order |
+| `cli_well_formed.rs` | `Cli::command().debug_assert()` — **not optional**: `global + required` is a debug-only assert compiled out of release |
+
+---
+
+## 10. File ownership map
+
+**Wave 0 (Foundation, ONE agent, serialized, ~3h) delivers a COMPILING SKELETON**, not a document:
+every file in §1, every `pub` signature, every doc comment, every `impl Render for X` stub, bodies
+`unimplemented!("S4")`. Plus `Cargo.toml`, `build.rs`, the complete clap tree from DESIGN.md's CLI
+reference, the complete `dispatch` match wiring every verb (v0.1 **and** v0.2) to a real `cmd::*`
+signature, and `tests/common/`.
+
+**Exit gate:** `cargo check --all-targets` clean · `cargo clippy --all-targets` clean ·
+`cli_well_formed.rs` passes · `kanspec --help` and `ks --help` print the real CLI reference ·
+every verb exits 1 with `not implemented (owner: S4)` · `TestRepo` actually builds a temp repo with
+a bare origin and the six merge shapes.
+
+| # | Slice | Owns (exclusive write) | Depends on (reads only) | Must NOT touch |
+|---|---|---|---|---|
+| **F** | **Foundation** | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `src/lib.rs`, `src/bin/*`, `cli.rs`, `ctx.rs`, `error.rs`, `out.rs`, `paths.rs`, `config.rs`, `ids.rs`, `keys.rs`, `logentry.rs`, `model.rs`, `transitions.rs`, `plan.rs`, `cmd/mod.rs`, `tests/common/**`, `tests/fixtures/**`, `tests/cli_well_formed.rs`, `tests/cli_smoke.rs` | — | any slice file after wave 0 |
+| **S1** | **Write path** | `fm.rs`, `lock.rs`, `store.rs`, `tests/{fm_bytes,lock,single_write_path}.rs` | F | everything else |
+| **S2** | **Git** | `git.rs`, `gh.rs`, `tests/worktree.rs` | F | everything else |
+| **S3** | **Scan** | `scan.rs`, `cache.rs`, `cmd/scan.rs`, `cmd/repair.rs`, `tests/{scan_ladder,proof_is_sealed}.rs` | F, S1(store), S2(git,gh) | everything else |
+| **S4** | **Derive + doctor** | `derive.rs`, `doctor.rs`, `cmd/doctor.rs`, `cmd/status.rs`, `tests/{purity,transition_table,doctor_replay,cache_wipe}.rs` | F, S1, S3(cache types) | everything else |
+| **S5** | **Ticket verbs** | `triage.rs`, `cmd/ticket.rs`, `cmd/flow.rs`, `cmd/done.rs`, `tests/lifecycle.rs` | F, S1, S2, S3(`Landed`,`proof_for_done`), S4(derive) | everything else |
+| **S6** | **Knowledge + rules** | `rulesdoc.rs`, `project.rs`, `cmd/{spec,quirk,decision,rules,prime,features}.rs`, `tests/invariants_rules.rs` | F, S1, S4 | everything else |
+| **S7** | **Setup / hooks / docs** | `hooks.rs`, `setup.rs`, `instructions.rs`, `ci.rs`, `cmd/{init,setup}.rs`, `docs/**`, `tests/setup_hooks.rs` | F, S1, S2 | everything else |
+| **S8** | **Board + server** | `board.rs`, `server.rs`, `cmd/{board,up}.rs`, `assets/**`, `tests/{board,json_matrix}.rs` | F, S1, S4, and every `cmd::*` fn | everything else |
+| **V2** | **Proposals + review** (v0.2) | `cmd/{proposal,comment,landcheck}.rs` | F, S1, S3, S6 | everything else |
+
+**No file appears twice.** Every file in §1 has exactly one owner. There is **no split ownership
+within a file** — the wave-0 commit *hands each file over* whole, signatures included; whoever
+fills the body owns the signature too. ✅ (Sealed Keel's `// ── keel ──` marker comment put two
+owners in one file, the exact hazard its plan claimed to eliminate.)
+
+**The five rules that make this actually disjoint** — each removes a *named* merge magnet:
+
+1. **No agent adds a `mod` line.** `lib.rs` and `cmd/mod.rs` declare every module in wave 0,
+   including every v0.2 module.
+2. **No agent adds an error variant.** The 8 shapes are closed; new refusals are
+   `KsError::gate(code, msg, fixes![..])` in the agent's own file.
+3. **No agent adds an output variant.** Each command's payload struct **and** its `impl Render`
+   live in that command's own file; `out.rs` never grows.
+4. **No agent adds a CLI arg.** The full clap tree ships in wave 0 straight off DESIGN.md's CLI
+   reference table (already declarative and complete; the recon proved every shape parses,
+   including the `--spawn`/`--no-followups` group and `allow_hyphen_values` on every free-text
+   reason). v0.2 subcommands ship `#[command(hide = true)]`.
+5. **No agent edits `Cargo.toml`.** Every crate the v0.1 *and* v0.2 cut needs is pinned in §8.
+
+A missing type or flag is a **request to F**, batched between waves. Budget one contract-change
+round per wave; fewer than five should be needed across the build.
+
+### Integration order — 6 rounds
+
+| Round | Lands | Gate ("done" looks like) |
+|---|---|---|
+| **0** | **F alone.** Nobody else has started. | `cargo check --all-targets` + clippy green; `cli_well_formed` passes; `TestRepo` builds the six merge shapes |
+| **1** | **S1 + S2 in parallel** (no shared file, no shared type they both define) | `fm_bytes.rs` (byte-identity + 100-edit idempotence on the adversarial fixture) · `single_write_path.rs` · `lock.rs` (20-process contention, `kill -9`) · `worktree.rs` (every verb from a linked worktree hits primary) |
+| **2** | **S3 (ancestry rung + `cache.rs` first, then rungs 2–4)** and **S4 in parallel** | `scan_ladder.rs` all six shapes with exact `Method`, **two landing on `unknown`** · `proof_is_sealed.rs` · `transition_table.rs` (all 40 pairs) · `doctor_replay.rs` · `purity.rs` |
+| | *Ancestry moves this early on purpose: the `done` gate's primary path must be real from birth, or three milestones of dogfooding tune the UX against `scan --confirm` and wear the human override smooth.* | |
+| **3** | **S5** — the walking skeleton | `lifecycle.rs`: `new → ready → start --worktree → ship --pr → (REAL squash merge) → scan → done`, run **from inside a linked worktree**, asserting every write landed in the primary `.kanspec/` and the `## Log` replays clean. **Dogfooding starts here.** |
+| **4** | **S6 + S7 in parallel** | `invariants_rules.rs` byte-identity across N scopes on the real binary · `cache_wipe.rs` · `setup_hooks.rs` (`setup claude --remove` restores a pre-existing husky-style hook exactly; `core.hooksPath` honoured) |
+| **5** | **S8** — last, because it consumes every view and every `cmd::*` fn and adds no new semantics | `json_matrix.rs` · `board.rs` insta snapshots · manual: `up` with two SSE tabs open, **Ctrl-C exits in under a second**; a CLI `start` in another terminal refreshes the board; a POST and the equivalent CLI verb produce byte-identical files |
+| **6** | Release cut | `cargo-dist`; `init --refresh-hooks` against the dogfood repo; **one manual run against a real GitHub squash-merged PR** before the ladder is trusted |
+
+**Rebase discipline:** each slice rebases on the integration branch at the start of every round.
+Because ownership is disjoint and `Cargo.toml` is complete up front, rebases are conflict-free by
+construction.
+
+**If fewer agents are available**, the honest collapse — chosen so adjacent slices merge without
+changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 4), giving F + 5.
+
+### Non-negotiables every slice must honour
+
+- Handlers are `fn(ctx: &Ctx, a: &XArgs) -> Result<XReport>`; `XReport: Render`; handlers **never**
+  print and never call `process::exit`.
+- Mutations go through `Store::transact` and a pure planner. **Every subprocess, network call and
+  clock read happens before `transact`**, packaged into a `Facts` value.
+- Every `KsError` you construct names its fix. `Fixes` makes this impossible to skip.
+- Every new frontmatter key is a **request to F** for a `keys.rs` variant, never a `&str`.
+- axum 0.8 routes use `{id}`, not `:id` — `:id` **panics** at `Router::route()`.
+
+---
+
+## 11. Decisions resolved
+
+### Judge disagreements (one line each)
+
+| # | Split | Resolution |
+|---|---|---|
+| J-1 | Winner: 2 judges Skeleton-First, 1 One Gate | **Skeleton-First**, because it is the only entry whose headline safety type compiles (E0742/E0277 reproduced against the others) and the only one where adding a command grows no shared file. |
+| J-2 | Typestate (`At<'t,P>`/`Change<'t,P>`) vs const table | **Const table.** `P` is never dispatched on, `Vec<Change<'t,?>>` is unrepresentable exactly when v0.2's `close` needs to batch N transitions, and Sealed Keel concedes the *seal*, not the typestate, earns its keep. |
+| J-3 | `Report` mega-enum vs per-command `impl Render` | **Per-command**, in the command's own file — the churniest surface in the crate must not be single-owner. |
+| J-4 | Planner purity | **Pure with `Facts`.** The idea is grafted; `&Ctx` in a planner is not — it would repeat One Gate's own contradiction of shelling out to git inside the lock. |
+| J-5 | Lock: flock vs O_EXCL pidfile | **flock**, with One Gate's `LockOwner` JSON body written *after* acquiring for the diagnosable message. |
+| J-6 | Error granularity | **Closed 8 shapes** (Skeleton-First, so `error.rs` never grows) **with** structured `GateDetail` payloads for the two errors whose output is the product (Sealed Keel). |
+| J-7 | Exit codes: 0/1/2/64 vs full sysexits | **0/1/2/64/69/70.** "Agents branch on zero/nonzero/2" is right for agents, but a wrapper script must distinguish "no `.kanspec/` here" from "gate refused". |
+| J-8 | Cache vs proof | **Split.** `MergeFact` is a plain `Deserialize` badge DTO; `MergedProof` is sealed and minted fresh at the gate. This is the exact boundary Sealed Keel got wrong. |
+
+### DESIGN.md ambiguities resolved
+
+| # | Ambiguity | Decision |
+|---|---|---|
+| D-1 | Build plan says "illegal transitions unrepresentable at compile time" | **Rejected as written.** Ticket state arrives from a hand-editable file at runtime; typestate would require a fallible downcast at every boundary. `require(from, verb)?` gives the same typed refusal. The compile-time budget is spent on `MergedProof`, `TicketKey`, `HumanActor`, `KanspecDir`. |
+| D-2 | Crate list names `gray_matter` | **Removed.** It cannot serialize and mutates content. `src/fm.rs` (first-party) + `serde_yaml_ng` read-only. |
+| D-3 | Ladder rung 4 "patch-id — last resort for squashes" | **Backwards.** Relabelled *rebase/cherry-pick detection*; a `+` line is `Unknown`, never `NotMerged`. |
+| D-4 | Ladder order not fully specified | **Two guards added** before rung 1: object-exists, and `rev-list --count main..head != 0` (a fresh `start` branch is trivially an ancestor — a verified false MERGED). |
+| D-5 | "`prepare-commit-msg` (per-branch, set by `start`)" | **Git has no per-branch hooks.** One repo-wide hook dispatching on `git symbolic-ref --short HEAD`, skipping `$2 ∈ {merge, squash, commit}`. Installed by `init`, not by `start`. |
+| D-6 | "resolves `git rev-parse --git-common-dir`" | Insufficient: it is *relative* in the primary worktree. `--path-format=absolute` + `git_dir == common_dir` **first** + `worktree list` fallback + a sanity check that **refuses** rather than guessing. |
+| D-7 | Hooks installed (implied `.git/hooks`) | **Resolve via `rev-parse --git-path hooks`**; `core.hooksPath` (husky/lefthook) makes `.git/hooks` inert. Install kanspec as the entrypoint, move any pre-existing hook to `<hook>.d/10-<name>`. Naive append is unsafe two ways (`exit 0` starvation; missing trailing newline). |
+| D-8 | `head:` "survives branch deletion" | **Narrower than claimed:** ~2 weeks post-reflog-expiry, then gc removes it, and it only rescues rung 1 — which only fires when the SHA is reachable from main anyway. Still recorded: it is `cherry`'s input, the CI-by-SHA key, and `--explain` provenance. |
+| D-9 | Spec `code:` globs feed the tripwire | Pathspecs are **cwd-relative** → `Pathspec` newtype always emits `:(glob,top)`. Merge counting uses `--first-parent` (2 commits vs 1 merge in the recon repo), or the tripwire over-fires by the size of each PR. |
+| D-10 | Staleness "counter resets" on confirm | **Never an accumulated counter** — recomputed at read time; a counter in a disposable cache silently resets on wipe and *under*-fires. The human's "no behavior change" is an asserted act → `stale_ack: {sha, at, by, why}` in the **spec frontmatter** (git-tracked, survives `rm -rf cache/`). |
+| D-11 | `scan --confirm` storage unspecified | **The ticket's `## Log`**, as an attributed `Verb::Confirm` line — not a cache entry. A human attestation must survive a cache wipe and be visibly signed. |
+| D-12 | No verb exists for repairing a broken log | **Added `Verb::Repair`** (`kanspec repair <id> --why`), the one verb whose logged state is authoritative in `replay`. Without it, replay-on-commit turns any imported or already-broken repo into a permanently unwritable one. |
+| D-13 | Open question 1 — auto-commit board state | **`sync = "batch"` default**; `status` reminds when N tracker changes are pending. `sync = "commit"` is one config line. |
+| D-14 | Open question 3 — landcheck strictness | **Opt-in** (`[hooks] landcheck = false`), installed but config-gated, v0.2. |
+| D-15 | Open questions 2 & 4 | **Ancestry-first** (recon: exact, cheap, and gh is rung 2 — the only rung catching a title-only squash). **No PR importer** in v0.1 or v0.2. |
+| D-16 | Bare `kanspec` / bare `kanspec comment` exit code | **64**, not 0 — an agent that runs an incomplete command must not think it succeeded. |
+| D-17 | `ready` when a dep is in-main but not `done` | **Satisfied** by terminal *or* in-main. **Dropped counts as satisfied** (blocking forever is worse); `doctor::check_orphan_deps` warns on a dep pointing at a dropped ticket. |
+| D-18 | Invariant 8 ("agents never self-accept") had no mechanism | **`HumanActor`**: private field, constructor refuses `Actor::Agent`. `plan_accept`/`plan_revoke` take `&HumanActor`, so an agent session cannot call them. |
+| D-19 | `comments.jsonl` "id-dedupe on read" — dedupe key unspecified | **`(id, op, at)`**: one `cm-` id legitimately carries `comment` + `reply` + `resolve` rows. |
+| D-20 | `KANSPEC-*.md` regeneration timing | On `scan`, and on any `transact` that touched a spec or a decision (`Op::WriteGenerated`, inside the same lock). |
+| D-21 | Branch / worktree naming | `ks/<id>-<slug>` (`branch_prefix` configurable), worktree `<worktree_dir>/<id>`. `worktree add --no-track` — without it a later `git push` from the ticket branch targets **main**. |
+| D-22 | Server snapshot freshness | `up` holds `Arc<Ctx>` and a `rev`-stamped memoized snapshot that `transact` **publishes synchronously** on write; the watcher only invalidates. A POST's own refetch can never see the pre-write snapshot. |
+| D-23 | SSE payload granularity | `{rev, n}` **only**; the SPA refetches `/api/board`. macOS FSEvents coalesces create+remove+modify for one delete, so any event-kind-derived delta is a bug farm. |
+| D-24 | `rusqlite` in v0.1 | Behind a **non-default** `ci-homerunner` feature until `ci.rs` lands. Bundled SQLite is the largest clean-build cost in the set for code v0.1 never calls. |
+
+### Known limits carried forward, stated out loud
+
+**R-1 · Multi-file plans are not atomic.** Per-file tmp+rename is; a plan touching a ticket *and* a
+proposal *and* `comments.jsonl` can be interrupted between renames. Mitigated by preferring
+single-file plans (a transition's frontmatter delta and its Log line are one write to one file),
+ordering the authoritative file last, and a `doctor` check for half-applied plans. A real gap, not
+a solved problem — DESIGN.md's own framing: gates on plain files are provable, not preventable.
+
+**R-2 · The seals stop at the file boundary.** `sed -i 's/state: review/state: done/'` still works.
+The answer is detection, not prevention: `replay` proves the state was never legally reached, at
+the **next verb** and in CI. Module docs must say plainly that the seals bind the tool and the Log
+binds the human.
+
+**R-3 · Three invariants rest on grep tests** (one write path, derive purity, sealed proof) because
+Rust cannot express "no `std::fs` in this crate". A `use std::fs as f;` alias walks past them. They
+raise the cost of a violation from zero to "you had to work around a test named after the
+invariant" — a deterrent, not a guarantee.
+
+**R-4 · `unknown` will fire more than the user wants.** A multi-commit squash with a title-only
+merge message and no `gh` defeats all four rungs; the fix (`gh auth login`) is outside kanspec's
+control.
+
+**R-5 · `serde_yaml_ng`'s last release is 2024-05-26.** Right choice today (positioned type errors,
+2× faster, libyaml-stable, 5.6M recent downloads); exposure is one `from_str` call site;
+`serde_yaml_bw` 2.5.7 is a one-import migration at the cost of line/column in type errors and 2×
+parse time.
+
+**R-6 · `Snapshot::load` is linear and unmemoized outside the server.** 55ms at 2000 entities is
+fine; `transact` reloads it inside the lock on every write. The `rev` field exists from day one so
+the escape hatch (mtime-keyed partial reload, or the sanctioned gitignored SQLite cache) is a
+one-file change rather than a re-architecture. Nobody should build it before profiling says so.
+
+**R-7 · 4 hex is 65,536 ids, and the local exclusion guarantee evaporates across machines.**
+Birthday risk near a few hundred ids created off-network. `doctor` detects duplicates after a
+merge and `id_width` can grow, but the recovery — two entities that both think they are `t-9c41`,
+already referenced by `deps:` elsewhere — is unpleasant and has no automated fix.
+
+**R-8 · Cross-machine claims remain eventually consistent.** The lock is per-machine because the
+workspace is per-machine. `scan`/`status` flag double-claims after sync; true atomicity needs a
+shared service, deliberately out of scope.
+
+**R-9 · `fm::set` on a multi-line value is a hard error**, correct today (no verb writes a block
+scalar or nested map) but one schema field from making a verb unimplementable — and there is no
+mature format-preserving YAML editor in Rust to fall back on.
