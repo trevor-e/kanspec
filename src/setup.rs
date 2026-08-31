@@ -3,21 +3,28 @@
 //!
 //! Permanent context cost is ~10 lines; the long-form docs live behind
 //! `kanspec instructions` and version with the binary, so they never rot in CLAUDE.md.
+//! (The snippet's text itself lives in `instructions.rs` — see the note there.)
 //!
-//! Owner: **S7**. Writes only outside `.kanspec/` (CLAUDE.md, agent settings), never
-//! inside it.
-
-// Wave-0 skeleton. The bodies below are `todo!("S7: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by S7 when the bodies land.
-#![allow(unused_variables, dead_code)]
+//! Owner: **S7**. Writes only outside the store (CLAUDE.md, agent settings), never inside
+//! it, and — like `hooks.rs` — it *plans* those writes and hands them to
+//! `cmd::init::apply`, which is the one function in this slice that moves a byte.
+//!
+//! **What "symmetrically" has to mean.** A settings file is the user's, not ours. Install
+//! merges into whatever is there and leaves every foreign hook alone; `--remove` takes out
+//! exactly the entries kanspec would install and nothing else, restores any git hook
+//! kanspec displaced, and leaves a settings file that held only our hooks gone rather than
+//! empty.
 
 use std::path::PathBuf;
 
 use serde::Serialize;
+use serde_json::{json, Map, Value};
 
 use crate::cli::Agent;
 use crate::ctx::Ctx;
-use crate::error::Result;
+use crate::error::{KsError, Result};
+use crate::hooks::Edit;
+use crate::{fix, fixes};
 
 /// The exact snippet DESIGN.md specifies. Delimited so `--remove` can excise precisely
 /// what was added, leaving the rest of a hand-maintained CLAUDE.md untouched.
@@ -45,6 +52,9 @@ pub const AGENT_HOOKS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The tool names whose writes can step on a landmine. Anything that edits a file.
+const EDIT_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit";
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SetupReport {
     pub agent: &'static str,
@@ -58,22 +68,32 @@ pub struct SetupChange {
     pub changed: bool,
 }
 
-/// The markdown snippet installed into the agent's always-on context file.
-pub fn snippet(invoked_as: &str) -> String {
-    todo!("S7: the DESIGN.md `## kanspec` snippet, wrapped in SNIPPET_BEGIN/END")
+/// Where an agent keeps its always-on context, and its hook registry if it has one.
+///
+/// Only Claude Code has a hook registry kanspec knows how to write. Cursor and Codex get
+/// the context snippet and the git hooks; `settings` is `None` for them rather than a path
+/// nothing ever writes, so the report cannot claim a file it never touched.
+pub struct AgentFiles {
+    pub context: PathBuf,
+    pub settings: Option<PathBuf>,
 }
 
-pub fn install(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
-    todo!("S7: write the snippet into the agent's context file idempotently, register AGENT_HOOKS, install the git hooks")
-}
-
-pub fn remove(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
-    todo!("S7: excise the SNIPPET_BEGIN..SNIPPET_END block and the registered hooks, restoring anything displaced")
-}
-
-/// Where each agent keeps its always-on context and its hook registry.
-pub fn agent_files(ctx: &Ctx, agent: Agent) -> (PathBuf, PathBuf) {
-    todo!("S7: claude -> CLAUDE.md + .claude/settings.json; cursor -> .cursorrules; codex -> AGENTS.md")
+pub fn agent_files(ctx: &Ctx, agent: Agent) -> AgentFiles {
+    let root = ctx.repo.primary_root().to_path_buf();
+    match agent {
+        Agent::Claude => AgentFiles {
+            context: root.join("CLAUDE.md"),
+            settings: Some(root.join(".claude").join("settings.json")),
+        },
+        Agent::Cursor => AgentFiles {
+            context: root.join(".cursorrules"),
+            settings: None,
+        },
+        Agent::Codex => AgentFiles {
+            context: root.join("AGENTS.md"),
+            settings: None,
+        },
+    }
 }
 
 pub fn agent_name(agent: Agent) -> &'static str {
@@ -81,5 +101,484 @@ pub fn agent_name(agent: Agent) -> &'static str {
         Agent::Claude => "claude",
         Agent::Cursor => "cursor",
         Agent::Codex => "codex",
+    }
+}
+
+/// The markdown snippet installed into the agent's always-on context file.
+pub fn snippet(invoked_as: &str) -> String {
+    format!(
+        "{SNIPPET_BEGIN}\n{}{SNIPPET_END}\n",
+        crate::instructions::agent_snippet(invoked_as)
+    )
+}
+
+pub fn install(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
+    let files = agent_files(ctx, agent);
+    let mut edits = Vec::new();
+    let mut changes = Vec::new();
+
+    let before = read(&files.context);
+    let after = insert_snippet(&before, &snippet(ctx.invoked_as));
+    changes.push(plan_text(&mut edits, files.context, "agent context", before, after));
+
+    if let Some(path) = files.settings {
+        let before = read(&path);
+        let entries = hook_entries(ctx.invoked_as, ctx.cfg.hooks.landcheck);
+        let after = merge_settings(before.as_deref(), &entries)?;
+        changes.push(plan_text(
+            &mut edits,
+            path,
+            "agent hooks",
+            before,
+            Some(after),
+        ));
+    }
+
+    crate::cmd::init::apply(&edits)?;
+    // The git hooks are part of "setup installs everything": merge badges and the
+    // squash-surviving trailer are what make the agent contract's "never state whether
+    // something is merged" answerable at all.
+    for h in crate::hooks::install(ctx, false)? {
+        changes.push(SetupChange {
+            path: h.path,
+            what: "git hook",
+            changed: h.action.changed(),
+        });
+    }
+    Ok(report(ctx, agent, changes))
+}
+
+pub fn remove(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
+    let files = agent_files(ctx, agent);
+    let mut edits = Vec::new();
+    let mut changes = Vec::new();
+
+    let before = read(&files.context);
+    let after = before.as_deref().map(excise_snippet);
+    changes.push(plan_text(&mut edits, files.context, "agent context", before, after));
+
+    if let Some(path) = files.settings {
+        let before = read(&path);
+        let after = before
+            .as_deref()
+            .map(strip_settings)
+            .transpose()?
+            .flatten();
+        let gone = after.is_none();
+        let parent = path.parent().map(std::path::Path::to_path_buf);
+        changes.push(plan_text(&mut edits, path, "agent hooks", before, after));
+        // A settings directory that held nothing but our file goes with it. `PruneDir`
+        // refuses a populated directory, so a user's own `.claude/` is safe.
+        if let (true, Some(p)) = (gone, parent) {
+            edits.push(Edit::PruneDir { path: p });
+        }
+    }
+
+    crate::cmd::init::apply(&edits)?;
+    for h in crate::hooks::remove(ctx)? {
+        changes.push(SetupChange {
+            path: h.path,
+            what: "git hook",
+            changed: h.action.changed(),
+        });
+    }
+    Ok(report(ctx, agent, changes))
+}
+
+/// Report repo-relative paths: every other surface in the product does, and an absolute
+/// tempdir path is unreadable in a terminal and unstable in a snapshot.
+fn report(ctx: &Ctx, agent: Agent, mut files: Vec<SetupChange>) -> SetupReport {
+    let root = ctx.repo.primary_root();
+    for c in &mut files {
+        c.path = crate::hooks::relative_to(root, &c.path);
+    }
+    SetupReport {
+        agent: agent_name(agent),
+        files,
+    }
+}
+
+/// Turn a before/after pair into an [`Edit`] — or into nothing at all when they agree,
+/// which is what makes running `setup` twice a no-op. `after == None` means the file
+/// should not exist: that is how a settings file kanspec created goes away again.
+fn plan_text(
+    edits: &mut Vec<Edit>,
+    path: PathBuf,
+    what: &'static str,
+    before: Option<String>,
+    after: Option<String>,
+) -> SetupChange {
+    let changed = before != after;
+    if changed {
+        edits.push(match after {
+            Some(contents) => Edit::Write {
+                path: path.clone(),
+                contents,
+                exec: false,
+            },
+            None => Edit::Remove { path: path.clone() },
+        });
+    }
+    SetupChange {
+        path,
+        what,
+        changed,
+    }
+}
+
+fn read(p: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(p).ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The context snippet — a delimited block, so removal is byte-exact
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Insert or refresh the delimited block. An existing block is replaced in place, so the
+/// snippet can be upgraded without moving it and without touching a line around it.
+fn insert_snippet(existing: &Option<String>, block: &str) -> Option<String> {
+    let Some(text) = existing.as_deref() else {
+        return Some(block.to_string());
+    };
+    if let Some((start, end)) = block_span(text) {
+        return Some(format!("{}{block}{}", &text[..start], &text[end..]));
+    }
+    // One blank line between the user's last line and ours, and no more — so removal has
+    // exactly one separator to take back out.
+    let sep = if text.is_empty() || text.ends_with("\n\n") {
+        ""
+    } else if text.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    Some(format!("{text}{sep}{block}"))
+}
+
+/// The exact inverse of [`insert_snippet`] for a block that sits at the end of the file:
+/// the blank line that separated it goes too, so a CLAUDE.md that ended with a newline
+/// comes back byte-identical.
+fn excise_snippet(text: &str) -> String {
+    let Some((start, end)) = block_span(text) else {
+        return text.to_string();
+    };
+    let mut before = text[..start].to_string();
+    let after = &text[end..];
+    if after.is_empty() && before.ends_with("\n\n") {
+        before.pop();
+    }
+    format!("{before}{after}")
+}
+
+/// Byte range of the whole delimited block, including the newline that ends it.
+fn block_span(text: &str) -> Option<(usize, usize)> {
+    let start = text.find(SNIPPET_BEGIN)?;
+    let end_at = text[start..].find(SNIPPET_END)? + start + SNIPPET_END.len();
+    let end = match text[end_at..].find('\n') {
+        Some(nl) => end_at + nl + 1,
+        None => end_at,
+    };
+    Some((start, end))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The hook registry — merged, never overwritten
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// One row per hook kanspec installs: `(event, matcher, command)`.
+///
+/// The Stop hook is the one that can *block* a session, so it is installed only when
+/// `[hooks] landcheck = true` (D-14). Off by default is not timidity: a Stop hook that
+/// refuses to let a session end is the single most disruptive thing this tool can do, and
+/// it should be a thing you turned on.
+pub fn hook_entries(invoked_as: &str, landcheck: bool) -> Vec<(&'static str, String, String)> {
+    let ks = invoked_as;
+    let mut v = vec![
+        ("SessionStart", String::new(), format!("{ks} prime")),
+        ("PreCompact", String::new(), format!("{ks} prime")),
+        (
+            "PostToolUse",
+            EDIT_TOOLS.to_string(),
+            // The hook payload arrives as JSON on stdin, so the edited path has to be
+            // read out of it. No jq, no warning — never a failed tool call.
+            format!(
+                "f=$(jq -r '.tool_input.file_path // empty' 2>/dev/null); \
+                 [ -n \"$f\" ] && {ks} quirks --touch \"$f\"; exit 0"
+            ),
+        ),
+    ];
+    if landcheck {
+        v.push(("Stop", String::new(), format!("{ks} landcheck")));
+    }
+    v
+}
+
+/// The events kanspec is allowed to prune on `--remove`. Anything outside this set is the
+/// user's, even when it is empty.
+fn is_our_event(event: &str) -> bool {
+    AGENT_HOOKS.iter().any(|(e, _, _)| *e == event)
+}
+
+/// Is this a hook entry kanspec owns? Matched on the command, because a settings file has
+/// nowhere to hang a marker that the agent would not have to understand.
+fn is_kanspec_command(cmd: &str) -> bool {
+    ["prime", "quirks --touch", "landcheck"]
+        .iter()
+        .any(|verb| ["kanspec", "ks"].iter().any(|bin| word(cmd, bin, verb)))
+}
+
+/// `bin verb` at a word boundary, so `works prime` and `/opt/ks-tools prime` do not count.
+fn word(cmd: &str, bin: &str, verb: &str) -> bool {
+    let needle = format!("{bin} {verb}");
+    cmd.match_indices(&needle).any(|(i, _)| {
+        cmd[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && !"-_./".contains(c))
+    })
+}
+
+/// Merge our entries into whatever settings the user already has.
+///
+/// Everything foreign is preserved: other events, other matchers inside our events, other
+/// commands inside our matcher group, and every key outside `hooks`. The only thing that
+/// is ever rewritten is an entry that is already ours.
+pub fn merge_settings(existing: Option<&str>, entries: &[(&str, String, String)]) -> Result<String> {
+    let mut root = parse(existing)?;
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| bad("`hooks` is not an object"))?;
+
+    for (event, matcher, command) in entries {
+        let list = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| bad(&format!("`hooks.{event}` is not an array")))?;
+
+        let group = match list.iter().position(|g| matcher_of(g) == matcher.as_str()) {
+            Some(i) => &mut list[i],
+            None => {
+                let mut g = Map::new();
+                if !matcher.is_empty() {
+                    g.insert("matcher".into(), json!(matcher));
+                }
+                g.insert("hooks".into(), json!([]));
+                list.push(Value::Object(g));
+                list.last_mut().expect("just pushed")
+            }
+        };
+        let inner = group
+            .as_object_mut()
+            .and_then(|g| g.entry("hooks").or_insert_with(|| json!([])).as_array_mut())
+            .ok_or_else(|| bad(&format!("`hooks.{event}[].hooks` is not an array")))?;
+
+        match inner.iter().position(|h| is_kanspec_command(command_of(h))) {
+            Some(i) => inner[i] = json!({ "type": "command", "command": command }),
+            None => inner.push(json!({ "type": "command", "command": command })),
+        }
+    }
+    render(&root)
+}
+
+/// Take out exactly what [`merge_settings`] put in. `None` means the file held nothing but
+/// kanspec's hooks and should go away rather than linger as `{}`.
+pub fn strip_settings(existing: &str) -> Result<Option<String>> {
+    let mut root = parse(Some(existing))?;
+    if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
+        for (event, list) in hooks.iter_mut() {
+            if !is_our_event(event) {
+                continue;
+            }
+            let Some(groups) = list.as_array_mut() else {
+                continue;
+            };
+            groups.retain_mut(|g| {
+                let Some(inner) = g.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    return true;
+                };
+                let had = inner.len();
+                inner.retain(|h| !is_kanspec_command(command_of(h)));
+                // A group we emptied is a group we created. One the user left empty is
+                // theirs, and stays.
+                !(inner.is_empty() && had > 0)
+            });
+        }
+        hooks.retain(|k, v| !(is_our_event(k) && v.as_array().is_some_and(|a| a.is_empty())));
+    }
+    if root
+        .get("hooks")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        root.remove("hooks");
+    }
+    if root.is_empty() {
+        return Ok(None);
+    }
+    render(&root).map(Some)
+}
+
+fn matcher_of(group: &Value) -> &str {
+    group.get("matcher").and_then(Value::as_str).unwrap_or("")
+}
+
+fn command_of(hook: &Value) -> &str {
+    hook.get("command").and_then(Value::as_str).unwrap_or("")
+}
+
+fn parse(existing: Option<&str>) -> Result<Map<String, Value>> {
+    match existing.map(str::trim).filter(|t| !t.is_empty()) {
+        None => Ok(Map::new()),
+        Some(t) => match serde_json::from_str::<Value>(t) {
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) => Err(bad("the settings file is not a JSON object")),
+            Err(e) => Err(bad(&format!("the settings file is not valid JSON: {e}"))),
+        },
+    }
+}
+
+fn render(root: &Map<String, Value>) -> Result<String> {
+    let mut s = serde_json::to_string_pretty(root).map_err(KsError::internal)?;
+    s.push('\n');
+    Ok(s)
+}
+
+fn bad(what: &str) -> KsError {
+    KsError::invalid(
+        format!("cannot merge agent hooks: {what}"),
+        fixes![
+            fix!("fix the settings file by hand, then re-run setup"),
+            fix!("kanspec doctor"),
+        ],
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<(&'static str, String, String)> {
+        vec![
+            ("SessionStart", String::new(), "kanspec prime".into()),
+            ("PostToolUse", EDIT_TOOLS.into(), "kanspec quirks --touch x".into()),
+        ]
+    }
+
+    #[test]
+    fn the_snippet_block_round_trips_byte_for_byte() {
+        let original = "# My project\n\nSome notes about the repo.\n";
+        let with = insert_snippet(&Some(original.to_string()), &snippet("kanspec")).unwrap();
+        assert!(with.starts_with(original), "the user's text stays on top");
+        assert!(with.contains(SNIPPET_BEGIN) && with.contains(SNIPPET_END));
+        assert_eq!(excise_snippet(&with), original, "removal is not byte-exact");
+    }
+
+    #[test]
+    fn installing_twice_replaces_the_block_in_place() {
+        let text = insert_snippet(&None, &snippet("kanspec")).unwrap();
+        let again = insert_snippet(&Some(text.clone()), &snippet("kanspec")).unwrap();
+        assert_eq!(text, again);
+        // An upgraded snippet replaces the old one where it stands rather than appending.
+        let upgraded = insert_snippet(
+            &Some(format!("intro\n\n{text}trailer\n")),
+            "<!-- kanspec:begin -->\nNEW\n<!-- kanspec:end -->\n",
+        )
+        .unwrap();
+        assert_eq!(upgraded, "intro\n\n<!-- kanspec:begin -->\nNEW\n<!-- kanspec:end -->\ntrailer\n");
+    }
+
+    #[test]
+    fn merging_preserves_every_foreign_hook() {
+        let foreign = r#"{
+          "permissions": {"allow": ["Bash(git:*)"]},
+          "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
+            "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "guard.sh"}]}]
+          }
+        }"#;
+        let merged = merge_settings(Some(foreign), &entries()).unwrap();
+        let v: Value = serde_json::from_str(&merged).unwrap();
+
+        assert_eq!(v["permissions"]["allow"][0], json!("Bash(git:*)"));
+        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], json!("guard.sh"));
+        let ss = &v["hooks"]["SessionStart"][0]["hooks"];
+        assert_eq!(ss[0]["command"], json!("echo mine"), "the foreign hook stays");
+        assert_eq!(ss[1]["command"], json!("kanspec prime"), "ours joins it");
+        assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], json!(EDIT_TOOLS));
+
+        // …and removal puts it back exactly as it was.
+        let stripped = strip_settings(&merged).unwrap().unwrap();
+        let back: Value = serde_json::from_str(&stripped).unwrap();
+        let want: Value = serde_json::from_str(foreign).unwrap();
+        assert_eq!(back, want);
+    }
+
+    #[test]
+    fn a_settings_file_that_held_only_our_hooks_goes_away_again() {
+        let merged = merge_settings(None, &entries()).unwrap();
+        assert!(merged.ends_with('\n'));
+        assert_eq!(strip_settings(&merged).unwrap(), None);
+    }
+
+    #[test]
+    fn merging_twice_changes_nothing() {
+        let once = merge_settings(None, &entries()).unwrap();
+        let twice = merge_settings(Some(&once), &entries()).unwrap();
+        assert_eq!(once, twice);
+        // An upgraded command replaces ours in place instead of stacking up.
+        let upgraded = merge_settings(
+            Some(&once),
+            &[("SessionStart", String::new(), "ks prime --json".into())],
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&upgraded).unwrap();
+        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], json!("ks prime --json"));
+    }
+
+    #[test]
+    fn the_stop_hook_is_installed_only_when_the_config_turns_it_on() {
+        let off = hook_entries("kanspec", false);
+        assert!(
+            !off.iter().any(|(e, _, _)| *e == "Stop"),
+            "landcheck defaults to off (D-14): a Stop hook that blocks is opt-in"
+        );
+        let on = hook_entries("kanspec", true);
+        let stop = on.iter().find(|(e, _, _)| *e == "Stop").expect("Stop");
+        assert_eq!(stop.2, "kanspec landcheck");
+        assert_eq!(on.len(), off.len() + 1, "nothing else changed");
+    }
+
+    #[test]
+    fn every_hook_design_md_documents_is_actually_installed() {
+        let on = hook_entries("kanspec", true);
+        for (event, _, why) in AGENT_HOOKS {
+            let e = on
+                .iter()
+                .find(|(ev, _, _)| ev == event)
+                .unwrap_or_else(|| panic!("{event} is documented ({why}) but never installed"));
+            assert!(is_kanspec_command(&e.2), "{event}: {}", e.2);
+        }
+        assert_eq!(on.len(), AGENT_HOOKS.len(), "an undocumented hook appeared");
+    }
+
+    #[test]
+    fn only_our_commands_look_like_ours() {
+        assert!(is_kanspec_command("kanspec prime"));
+        assert!(is_kanspec_command("ks landcheck"));
+        assert!(is_kanspec_command("f=$(jq -r x); ks quirks --touch \"$f\""));
+        assert!(!is_kanspec_command("echo mine"));
+        assert!(!is_kanspec_command("works prime"), "word boundaries matter");
+        assert!(!is_kanspec_command("kanspec status"));
+    }
+
+    #[test]
+    fn a_broken_settings_file_is_a_typed_refusal_not_a_clobber() {
+        let e = merge_settings(Some("{not json"), &entries()).unwrap_err();
+        assert_eq!(e.kind(), "invalid");
+        assert!(e.fixes().iter().next().is_some());
     }
 }
