@@ -80,6 +80,12 @@ pub static CHECKS: &[Check] = &[
         fix: None, // there is nothing to rewrite — the remedy is evidence, or a truer state
     },
     Check {
+        id: "unproven_close",
+        about: "no ticket is `done` on the word of its own ## Log alone",
+        run: check_unproven_close,
+        fix: None, // same: evidence, a recorded waiver, or a truer state — never a rewrite
+    },
+    Check {
         id: "reserved_keys",
         about: "no entity's frontmatter carries a derived key (merged, in_main, ci, …)",
         run: check_reserved_keys,
@@ -297,6 +303,66 @@ fn check_attested_state(s: &Snapshot) -> Vec<Finding> {
             subject: id.to_string(),
             message,
             fix,
+            fixable: false,
+        });
+    }
+    out
+}
+
+/// The hole `log_trail` and `attested_state` between them still left open, and the reason
+/// DESIGN.md's invariant 10 no longer says `doctor` *proves* every state was reached
+/// legally.
+///
+/// `log_trail` replays the trail and `attested_state` catches the one verb whose state is
+/// authoritative. Neither sees the two-edit forgery: `sed` the frontmatter to `done`, then
+/// append ONE well-formed `done` line. The trail replays *perfectly* to the state the file
+/// claims, no `repair` verb appears — and until this check the repo answered
+/// `13 checks passed`, exit 0, with a provably unmerged ticket closed inside it.
+///
+/// What a fabricated line cannot write is corroboration. Every close the gate grants
+/// records the commit it was granted against, or the durable `--no-code` waiver; a
+/// `scan --confirm` records a commit too; an attestation is badged everywhere. A `done`
+/// carrying none of those, on a ticket that names a branch, a head or a PR, was not
+/// written by this tool's gate — and that is a claim, not a proof, so it is an Error and
+/// `cmd::status` promotes it to a YOU line.
+///
+/// **Three deliberate silences, so this never cries wolf:**
+/// - `dropped` — a drop is an act, not a merge; `--why` is the whole of its evidence.
+/// - a trail that does not replay — that is `check_log_trail`'s finding, and the forgery
+///   this exists for replays perfectly, so the two never speak about the same ticket.
+/// - a ticket naming no branch, head or PR — nothing for git to place, so there is no
+///   corroboration to demand. That is the honest edge of the detection, and the narrowed
+///   invariant 10 names it rather than papering over it.
+fn check_unproven_close(s: &Snapshot) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for t in s.tickets.values() {
+        if t.fm.state != transitions::State::Done {
+            continue;
+        }
+        if transitions::prove(t).is_err() {
+            continue;
+        }
+        if derive::close_evidence(s, t).is_some() {
+            continue;
+        }
+        let id = &t.fm.id;
+        out.push(Finding {
+            check: "unproven_close",
+            severity: Severity::Error,
+            subject: id.to_string(),
+            message: format!(
+                "is `done` with nothing outside its own ## Log behind the close: no commit \
+                 recorded by the gate, no `--no-code` waiver, no attestation, and no ladder run \
+                 that ever saw it in main. A ## Log is plain text, so a `done` line proves a \
+                 `done` line was written — only git can corroborate that the work landed. If it \
+                 did land, `kanspec scan --confirm {id} --why \"...\"` records the commit; if \
+                 there was never any code, the close needed `--no-code --why`; if it never \
+                 landed, put `state:` back to the state the log reached"
+            ),
+            // Ask GIT first. A TARGETED scan re-runs the ladder even on a terminal ticket,
+            // so this is the diagnostic AND — when the work really did land — the repair,
+            // while laundering nothing when it did not.
+            fix: format!("kanspec scan --explain {id}"),
             fixable: false,
         });
     }
@@ -1042,6 +1108,162 @@ mod tests {
         assert!(found(run_all(&s), "attested_state").is_empty());
     }
 
+    /// A ticket the gate really closed: `start` recorded the branch, `ship` the head, and
+    /// `plan_done` the commit it was granted against. The corroboration is git-tracked, so
+    /// it does not depend on the disposable cache being there.
+    fn closed_by_the_gate(id: &str) -> Ticket {
+        let mut t = legal(id);
+        t.fm.state = State::Done;
+        t.fm.branch = Some(format!("ks/{id}"));
+        t.fm.head = Some("3f2a19c7d4b6e8a0c1f5920b7e6d4a3c8b1f0e29".into());
+        t.log.push(LogEntry {
+            at: now() - chrono::Duration::minutes(5),
+            state: State::Done,
+            actor: "trevor".into(),
+            verb: Verb::Done,
+            note: Some("in main a1b9c3d via gh-pr #142".into()),
+        });
+        t
+    }
+
+    /// THE two-edit forgery: `state: done` in the frontmatter plus ONE fabricated `done`
+    /// line. It replays perfectly and carries no `repair`, so every other check is silent.
+    fn forged_close(id: &str) -> Ticket {
+        let mut t = closed_by_the_gate(id);
+        t.log.last_mut().unwrap().note = None;
+        t
+    }
+
+    #[test]
+    fn a_close_nothing_outside_the_log_stands_behind_is_an_error() {
+        let mut s = snap();
+        put(&mut s, forged_close("t-0001"));
+
+        let all = run_all(&s);
+        assert!(
+            found(all.clone(), "log_trail").is_empty(),
+            "the forged trail replays clean — which is exactly why it needed its own check"
+        );
+        assert!(
+            found(all.clone(), "attested_state").is_empty(),
+            "no `repair` verb, so the attestation check never sees it"
+        );
+        let f = found(all, "unproven_close");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Error, "this one fails CI");
+        assert!(
+            f[0].message.contains("nothing outside its own ## Log"),
+            "{}",
+            f[0].message
+        );
+        assert_eq!(f[0].fix, "kanspec scan --explain t-0001");
+        assert!(!f[0].fixable);
+    }
+
+    /// Every legitimate close, one per row, and every one of them silent. A check that
+    /// fires on the daily loop is a check nobody leaves switched on.
+    #[test]
+    fn every_corroborated_close_is_silent() {
+        // 1. the gate's own record of the commit it granted the close against
+        let mut s = snap();
+        put(&mut s, closed_by_the_gate("t-0001"));
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // 2. `scan --confirm` — the recorded human override (D-11)
+        let mut s = snap();
+        let mut t = forged_close("t-0002");
+        t.log.insert(
+            3,
+            LogEntry {
+                at: now() - chrono::Duration::minutes(6),
+                state: State::Review,
+                actor: "trevor".into(),
+                verb: Verb::Confirm,
+                note: Some("in main 3f2a19c7 — squash merged by hand, verified".into()),
+            },
+        );
+        put(&mut s, t);
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // 3. the durable `--no-code` waiver — prose under `## Log`, signed and dated
+        let mut s = snap();
+        let mut t = forged_close("t-0003");
+        t.body = "Body.\n\n## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n"
+            .to_string();
+        put(&mut s, t);
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // 4. a ladder run that actually put it in main — the cache, computed from git
+        let mut s = snap();
+        put(&mut s, forged_close("t-0004"));
+        s.git.tickets.insert(
+            tid("t-0004"),
+            crate::cache::MergeFact {
+                status: crate::cache::MergeStatus::Merged,
+                sha: Some("a1b9c3d".into()),
+                method: crate::git::Method::Ancestry,
+                pr: None,
+                why: None,
+                checked_at: now() - chrono::Duration::hours(1),
+                changed: vec![],
+            },
+        );
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // 5. a human attestation — `attested_state` owns that one, and says so alone
+        let mut s = snap();
+        let mut t = forged_close("t-0005");
+        t.log.push(entry(1, Verb::Repair, State::Done));
+        put(&mut s, t);
+        let all = run_all(&s);
+        assert_eq!(found(all.clone(), "attested_state").len(), 1);
+        assert!(
+            found(all, "unproven_close").is_empty(),
+            "one finding per break, in one voice"
+        );
+    }
+
+    /// The three deliberate silences. Each one is a case where firing would be noise, not
+    /// detection — and the third is the honest edge of what corroboration can see.
+    #[test]
+    fn the_check_stands_down_where_it_has_nothing_to_corroborate_against() {
+        // a drop is an act, not a merge
+        let mut s = snap();
+        let mut dropped = forged_close("t-0001");
+        dropped.fm.state = State::Dropped;
+        dropped.log.last_mut().unwrap().state = State::Dropped;
+        dropped.log.last_mut().unwrap().verb = Verb::Drop;
+        put(&mut s, dropped);
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // a broken trail belongs to `log_trail`, and only to it
+        let mut s = snap();
+        let mut t = legal("t-0002");
+        t.fm.state = State::Done;
+        t.fm.branch = Some("ks/t-0002".into());
+        put(&mut s, t);
+        let all = run_all(&s);
+        assert_eq!(found(all.clone(), "log_trail").len(), 1);
+        assert!(found(all, "unproven_close").is_empty());
+
+        // no branch, no head, no PR: nothing for git to place
+        let mut s = snap();
+        let mut t = forged_close("t-0003");
+        t.fm.branch = None;
+        t.fm.head = None;
+        t.fm.pr = None;
+        put(&mut s, t);
+        assert!(found(run_all(&s), "unproven_close").is_empty());
+        // …and a bare `pr:` is enough to bring it back, because rung 2 answers from one
+        let mut s = snap();
+        let mut t = forged_close("t-0004");
+        t.fm.branch = None;
+        t.fm.head = None;
+        t.fm.pr = Some(142);
+        put(&mut s, t);
+        assert_eq!(found(run_all(&s), "unproven_close").len(), 1);
+    }
+
     #[test]
     fn a_doctored_log_line_is_caught_even_when_the_frontmatter_agrees() {
         let mut s = snap();
@@ -1320,7 +1542,7 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate check id");
-        assert_eq!(n, 13);
+        assert_eq!(n, 14);
         // every check runs against an empty snapshot without panicking
         let s = snap();
         for c in CHECKS {

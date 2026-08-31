@@ -195,21 +195,125 @@ pub fn attested(t: &Ticket) -> Option<&LogEntry> {
         .filter(|e| e.state == t.fm.state)
 }
 
-/// Whether the ticket's own `## Log` carries the close the gate writes — the evidence a
-/// `done` needs, read out of the record that travels through git rather than out of the
-/// disposable cache (J-8: a cached `merged` is a badge, never a gate).
+/// Whether the ticket's own `## Log` carries a close-shaped line, read out of the record
+/// that travels through git rather than out of the disposable cache (J-8: a cached
+/// `merged` is a badge, never a gate).
 ///
-/// Two lines count, and both were written by a gate that already demanded proof:
+/// Two verbs count, and the gate that writes each already demanded proof:
 /// - a `done` entry — `plan_done` writes one only against a sealed `MergedProof` or a
 ///   recorded `--no-code` waiver, and neither can be minted without git or a signed reason;
 /// - a `confirm` entry — `scan --confirm`, the recorded human override (D-11), which
 ///   `plan_confirm` refuses without both a commit SHA and a reason.
 ///
-/// A `## Log` with neither says this ticket never landed.
+/// **This answers a weaker question than it looks like.** The `## Log` is plain text in a
+/// file anyone can edit, so a `done` line proves that a `done` line was written — not that
+/// a gate ever wrote it. The verb is the right input for the question `cmd::repair` asks
+/// (is there already a close here, so that re-attesting one asserts nothing new?), and the
+/// wrong input for "was this close granted?". [`close_evidence`] is that second question.
 pub fn logged_close(t: &Ticket) -> bool {
     t.log
         .iter()
         .any(|e| matches!(e.verb, Verb::Done | Verb::Confirm))
+}
+
+/// The gate's own spelling of a recorded [`crate::scan::MergedProof`]. `plan_done` writes
+/// `in main a1b9c3d via ancestry #142`; `plan_confirm` writes
+/// `in main a1b9c3d — squash merged by hand`. Both open with the same two words and both
+/// name a commit, because neither value can be minted without a SHA git resolved.
+///
+/// MIRRORED rather than shared: `scan::CONFIRM_NOTE` and `scan::confirm_note_sha` are both
+/// private, and `scan.rs` is S5's file. `the_note_grammar_mirrors_the_gates_own_spelling`
+/// below is what keeps the mirror honest.
+const PROOF_NOTE: &str = "in main";
+
+/// The durable half of a `--no-code` close. `scan::NoCodeWaiver::record` appends
+/// `  no-code waiver by <actor> at <ts>: <why>` as PROSE under `## Log` — deliberately not
+/// shaped like a [`LogEntry`], so `replay` skips it — and refuses an empty reason.
+/// Mirrored for the same reason as [`PROOF_NOTE`].
+const NO_CODE_WAIVER: &str = "no-code waiver by ";
+
+/// The commit a close's own log entry names, when the gate recorded one.
+fn note_sha(note: &str) -> Option<&str> {
+    let rest = note.trim().strip_prefix(PROOF_NOTE)?.trim_start();
+    let tok = rest.split_whitespace().next()?;
+    // git's own shape: 7 to 64 lowercase hex. A `via`/`—` that arrived where a SHA should
+    // be is a note that names no commit, which is the answer, not a parse failure.
+    (tok.len() >= 7
+        && tok.len() <= 64
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
+    .then_some(tok)
+}
+
+/// What stands behind a close BESIDES the ticket's own claim of one.
+///
+/// [`logged_close`] can only answer "is there a close-shaped line here?". This asks the
+/// question that actually gates trust: **what did a one-line append not also write?** A
+/// hand-edited `state: done` plus one fabricated `done` line replays perfectly and carries
+/// a close, and every existing check is silent on it — the trail is well-formed, and no
+/// `repair` verb appears. What such a forgery cannot produce is corroboration.
+///
+/// Five answers, and every legitimate close has one:
+///
+/// - **`Attested`** — a human vouched for the state (D-12). `doctor::check_attested_state`
+///   already reports and badges this one; it is listed first so nothing says it twice.
+/// - **`InMain`** — a ladder run put this ticket in main. Read out of `s.git`, the
+///   gitignored cache, which is computed from git and which no verb can write.
+/// - **`Proof`** — the commit the gate recorded when it granted the close, or the one a
+///   `scan --confirm` named. Git-tracked, so it survives `rm -rf cache/`.
+/// - **`NoCode`** — the recorded `--no-code` waiver, signed and dated in the file.
+/// - **`NothingToLand`** — the ticket names no branch, no head and no PR, so there is no
+///   code for git to place and nothing to corroborate against. Demanding proof there would
+///   be theatre, not detection, and this is the boundary DESIGN.md's invariant 10 now
+///   states out loud.
+///
+/// `None` is the forged close: a terminal state reached by a line that only says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseEvidence {
+    Attested,
+    InMain,
+    Proof(String),
+    NoCode,
+    NothingToLand,
+}
+
+pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
+    if attested(t).is_some() {
+        return Some(CloseEvidence::Attested);
+    }
+    if merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::Merged) {
+        return Some(CloseEvidence::InMain);
+    }
+    let sha = t.log.iter().rev().find_map(|e| match e.verb {
+        Verb::Done | Verb::Confirm => e.note.as_deref().and_then(note_sha),
+        _ => None,
+    });
+    if let Some(sha) = sha {
+        return Some(CloseEvidence::Proof(sha.to_string()));
+    }
+    if t.body
+        .lines()
+        .any(|l| l.trim_start().starts_with(NO_CODE_WAIVER))
+    {
+        return Some(CloseEvidence::NoCode);
+    }
+    if !names_a_rev(t) {
+        return Some(CloseEvidence::NothingToLand);
+    }
+    None
+}
+
+/// Whether git has anything to be asked ABOUT this ticket: a branch, a head commit, or a
+/// PR number. Mirrors `scan::ticket_rev`'s "head-or-tip, non-empty" and widens it by `pr:`,
+/// because rung 2 answers from a PR number alone.
+fn names_a_rev(t: &Ticket) -> bool {
+    let named = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && s != "null")
+    };
+    named(&t.fm.head) || named(&t.fm.branch) || t.fm.pr.is_some()
 }
 
 /// The badge every card carries — **never a guess**. Precedence is evidence-first: a
@@ -1375,6 +1479,153 @@ mod tests {
         let t = &s.tickets[&tid("t-0001")];
         assert!(in_main(&s, t).is_none(), "done is done, not in-main");
         assert_eq!(column(&s, t), Column::Done);
+    }
+
+    // ── what stands behind a close ───────────────────────────────────────────
+
+    /// A ticket closed the way the gate closes one: a branch, a head, and a `done` entry
+    /// naming the commit the close was granted against.
+    fn closed(id: &str) -> Ticket {
+        let mut t = ticket(id, State::Done);
+        t.fm.branch = Some(format!("ks/{id}"));
+        t.fm.head = Some("3f2a19c7d4b6e8a0c1f5920b7e6d4a3c8b1f0e29".into());
+        t.log = vec![
+            entry(ago(3), "trevor", Verb::New, State::Todo),
+            entry(ago(2), "trevor", Verb::Start, State::Doing),
+            entry(ago(1), "trevor", Verb::Ship, State::Review),
+            LogEntry {
+                at: ago(1),
+                state: State::Done,
+                actor: "trevor".into(),
+                verb: Verb::Done,
+                note: Some("in main a1b9c3d via gh-pr #142".into()),
+            },
+        ];
+        t
+    }
+
+    /// `note_sha` mirrors a grammar that lives in `scan.rs` behind private items, so this
+    /// runs the REAL `plan_confirm` and reads its note back through the mirror. A gate
+    /// that changed its spelling would fail here rather than silently stop corroborating.
+    #[test]
+    fn the_note_grammar_mirrors_the_gates_own_spelling() {
+        use crate::ctx::Actor;
+        use crate::plan::Op;
+        use crate::scan::{plan_confirm, ConfirmFacts};
+
+        let mut s = snap();
+        let mut t = ticket("t-0001", State::Review);
+        t.fm.head = Some("3f2a19c7d4b6e8a0c1f5920b7e6d4a3c8b1f0e29".into());
+        put(&mut s, t);
+
+        let plan = plan_confirm(
+            &s,
+            &ConfirmFacts {
+                sha: None, // falls back to `head:`, exactly as a real `--confirm` does
+                actor: Actor::Human {
+                    name: "trevor".into(),
+                },
+                at: now(),
+                why: "squash merged by hand, verified".into(),
+                invocation: "kanspec scan --confirm t-0001".into(),
+            },
+            &tid("t-0001"),
+        )
+        .expect("a confirm with a head and a reason is legal");
+        let detail = plan
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::Transition { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("plan_confirm writes one transition");
+        assert_eq!(
+            note_sha(&detail),
+            Some("3f2a19c7d4b6e8a0c1f5920b7e6d4a3c8b1f0e29"),
+            "the mirror must read the gate's own note back: {detail}"
+        );
+
+        // `plan_done`'s half of the same grammar, in the shapes it actually emits.
+        assert_eq!(note_sha("in main a1b9c3d via gh-pr #142"), Some("a1b9c3d"));
+        assert_eq!(
+            note_sha("in main a1b9c3d via trailer · spawned t-c412 · dropped 1 step(s)"),
+            Some("a1b9c3d")
+        );
+        // Everything that names no commit reads as no commit, rather than as a parse error.
+        for note in [
+            "done",
+            "no-code: docs only",
+            "in main",
+            "in main via ancestry",
+            "in main deadbeg via ancestry", // 'g' is not hex
+            "in main A1B9C3D via ancestry", // git prints lowercase
+            "in mainland somewhere",
+        ] {
+            assert_eq!(note_sha(note), None, "{note:?}");
+        }
+    }
+
+    #[test]
+    fn a_close_is_corroborated_by_four_things_and_a_forgery_by_none_of_them() {
+        // the gate's own record of the commit — git-tracked, so it outlives the cache
+        let mut s = snap();
+        put(&mut s, closed("t-0001"));
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0001")]),
+            Some(CloseEvidence::Proof("a1b9c3d".into()))
+        );
+
+        // THE forgery: the same trail, with the gate's note stripped off the close. It
+        // still replays perfectly — and nothing outside the log says the work landed.
+        let mut s = snap();
+        let mut forged = closed("t-0002");
+        forged.log.last_mut().unwrap().note = None;
+        put(&mut s, forged);
+        assert_eq!(close_evidence(&s, &s.tickets[&tid("t-0002")]), None);
+
+        // a ladder run that actually saw it in main outranks the missing note
+        s.git.tickets.insert(tid("t-0002"), merged(&[]));
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0002")]),
+            Some(CloseEvidence::InMain)
+        );
+
+        // the recorded `--no-code` waiver — prose under `## Log`, which `replay` skips
+        let mut s = snap();
+        let mut t = closed("t-0003");
+        t.log.last_mut().unwrap().note = Some("no-code: docs only".into());
+        t.body =
+            "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
+        put(&mut s, t);
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0003")]),
+            Some(CloseEvidence::NoCode)
+        );
+
+        // an attestation (D-12) answers first, so `doctor` says it in exactly one voice
+        let mut s = snap();
+        let mut t = closed("t-0004");
+        t.log.last_mut().unwrap().note = None;
+        t.log
+            .push(entry(ago(1), "trevor", Verb::Repair, State::Done));
+        put(&mut s, t);
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0004")]),
+            Some(CloseEvidence::Attested)
+        );
+
+        // and a ticket with no branch, head or PR leaves git nothing to be asked about
+        let mut s = snap();
+        let mut t = closed("t-0005");
+        t.log.last_mut().unwrap().note = None;
+        t.fm.branch = None;
+        t.fm.head = None;
+        put(&mut s, t);
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0005")]),
+            Some(CloseEvidence::NothingToLand)
+        );
     }
 
     // ── the tripwires ────────────────────────────────────────────────────────
