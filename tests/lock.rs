@@ -186,7 +186,7 @@ fn the_lockfile_lives_in_the_gitignored_cache_and_never_reaches_git() {
     );
     assert!(!ctx.git.is_tracked(token.path()));
     assert_eq!(
-        ctx.git.dirty_kanspec().unwrap(),
+        ctx.git.dirty_kanspec(&[]).unwrap(),
         0,
         "taking the lock must not show up as a pending tracker change"
     );

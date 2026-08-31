@@ -583,3 +583,58 @@ fn a_ticket_whose_filename_disagrees_with_its_frontmatter_is_refused_loudly() {
     assert!(e.to_string().contains("t-9c41"), "{e}");
     assert!(e.fixes().iter().next().is_some());
 }
+
+/// `status`'s sync remediation has to be runnable *where it is printed*, and has to name
+/// every file it counts. It failed both ways: it counted only `.kanspec/**`, so a
+/// regenerated `KANSPEC-FEATURES.md` stayed uncommitted while `status` reported nothing
+/// pending — leaving the committed feature map stale, the exact rot the projections exist
+/// to prevent; and it emitted a bare `git`, which from the linked worktree that
+/// `start --worktree` sends the agent into finds a clean tree, exits 1, and leaves the
+/// primary dirty.
+#[test]
+fn the_sync_fix_is_runnable_from_a_linked_worktree_and_names_the_projections() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "-m", "seed"]);
+    let wt = repo.worktree("t-9c41");
+
+    // A dirty projection at the repo ROOT — outside `.kanspec/`, which is the blind spot.
+    repo.write("KANSPEC-FEATURES.md", "<!-- GENERATED -->\n# Feature map\n");
+
+    let out = repo.ks_in(&wt, ["status", "--json"]);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let v: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    let fix = v["sync_fix"].as_str().unwrap();
+
+    assert!(
+        v["pending_changes"].as_u64().unwrap() >= 1,
+        "a dirty root projection must count as a pending tracker change: {v}"
+    );
+    assert!(
+        fix.contains("KANSPEC-FEATURES.md"),
+        "the fix must name the projections it counted: {fix}"
+    );
+    // Canonicalized: on macOS the temp root resolves through /private.
+    let primary = repo.root.canonicalize().unwrap();
+    assert!(
+        fix.contains(&format!("-C {}", primary.display())),
+        "printed inside a linked worktree, the fix must target the primary: {fix}"
+    );
+
+    // The real test of advice: follow it verbatim and the thing it promised must happen.
+    let ran = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(fix)
+        .current_dir(&wt)
+        .output()
+        .unwrap();
+    assert!(ran.status.success(), "{}", String::from_utf8_lossy(&ran.stderr));
+    let after = repo.ks_in(&wt, ["status", "--json"]);
+    let v2: serde_json::Value = serde_json::from_str(&after.stdout).unwrap();
+    assert_eq!(
+        v2["pending_changes"].as_u64().unwrap(),
+        0,
+        "after following the fix, nothing may still be pending: {v2}"
+    );
+}

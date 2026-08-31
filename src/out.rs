@@ -166,7 +166,12 @@ impl Line {
             // carries ANSI escapes, so `t-ec64` is 6 chars plain and 14 painted, and the
             // width specifier padded nothing at all — the id and the title rendered jammed
             // together for every colour user, on every command. See `pad_visible`.
-            left.push_str(&pad_visible(&paint(id, Color::Bold, st.color), ID_COL));
+            // `ID_COL` is a floor, not the width: `id_width` is a config knob clamped to
+            // 4..=16, so an id at or past `ID_COL` would abut the text with no separator —
+            // the same jam, from a different cause, and invisible to a colour-vs-plain diff.
+            let painted = paint(id, Color::Bold, st.color);
+            let col = ID_COL.max(visible_len(&painted) + 1);
+            left.push_str(&pad_visible(&painted, col));
         }
         left.push_str(&self.text);
         if let Some(d) = &self.dim {
@@ -446,6 +451,36 @@ mod tests {
         assert_eq!(pad_visible(&paint("wide-id-here", Color::Bold, true), 4), {
             paint("wide-id-here", Color::Bold, true)
         });
+    }
+
+    /// `id_width` is a config knob clamped to 4..=16, so `ID_COL` cannot be the whole
+    /// story: at width 7 the id reached the column and the text abutted it with no gap —
+    /// the original jam, from a second cause, and colour-independent, so the
+    /// colour-vs-plain property could not see it.
+    #[test]
+    fn an_id_never_abuts_its_text_at_any_configured_width() {
+        for width in 4..=16 {
+            let id = format!("t-{}", "a".repeat(width - 2));
+            assert_eq!(id.len(), width);
+            for color in [false, true] {
+                let mut buf: Vec<u8> = Vec::new();
+                Line::state(crate::transitions::State::Todo, "ready")
+                    .id(&id)
+                    .write(
+                        &mut buf,
+                        &Style {
+                            color,
+                            ..Style::plain()
+                        },
+                    )
+                    .unwrap();
+                let rendered = strip_ansi(&String::from_utf8(buf).unwrap());
+                assert!(
+                    rendered.contains(&format!("{id} ")),
+                    "id abuts its text at id_width={width}, color={color}: {rendered:?}"
+                );
+            }
+        }
     }
 
     /// The property that generalises the fix: a painted line is the plain line plus

@@ -24,6 +24,9 @@ pub struct StatusReport {
     pub pending_changes: u32,
     /// how old the merge-detection cache is, so a badge never lies about its freshness
     pub cache_age_secs: Option<u64>,
+    /// The remediation for `pending_changes`, resolved against the primary worktree —
+    /// built here rather than in `Render` because only the handler can see the repo.
+    pub sync_fix: String,
     pub next: Vec<String>,
 }
 
@@ -63,8 +66,36 @@ pub fn status(ctx: &Ctx, a: &StatusArgs) -> Result<StatusReport> {
     // A read-only query must not fail because git had a bad day: a working tree we cannot
     // read is reported as "nothing pending" rather than as a refusal.
     let pending_changes = match ctx.cfg.sync {
-        SyncMode::Batch => ctx.git.dirty_kanspec().unwrap_or(0),
+        SyncMode::Batch => ctx
+            .git
+            .dirty_kanspec(&[&ctx.cfg.paths.features, &ctx.cfg.paths.architecture])
+            .unwrap_or(0),
         SyncMode::Commit | SyncMode::Branch => 0,
+    };
+
+    // The tracker lives in the PRIMARY worktree, but `start --worktree` sends the agent
+    // into a linked one — where a bare `git add` finds a clean tree, exits 1, and leaves
+    // the primary dirty. The remediation has to name the tree it applies to.
+    let sync_fix = {
+        // Name a projection only when it is on disk: `git add` treats a pathspec matching
+        // neither a file nor an index entry as fatal, so advice that named an
+        // ungenerated projection would abort before staging anything at all.
+        let mut paths = String::from(".kanspec");
+        for p in [&ctx.cfg.paths.features, &ctx.cfg.paths.architecture] {
+            if ctx.layout.repo_root().join(p).exists() {
+                paths.push(' ');
+                paths.push_str(&p.to_string_lossy());
+            }
+        }
+        if ctx.repo.linked() {
+            format!(
+                "git -C {} add -A {paths} && git -C {} commit -m \"kanspec: sync\"",
+                ctx.repo.primary_root().display(),
+                ctx.repo.primary_root().display()
+            )
+        } else {
+            format!("git add -A {paths} && git commit -m \"kanspec: sync\"")
+        }
     };
 
     let mut next: Vec<String> = Vec::new();
@@ -86,6 +117,7 @@ pub fn status(ctx: &Ctx, a: &StatusArgs) -> Result<StatusReport> {
         watching,
         pending_changes,
         cache_age_secs: snap.git.age(snap.now).map(|d| d.as_secs()),
+        sync_fix,
         next,
     })
 }
@@ -139,7 +171,7 @@ impl Render for StatusReport {
                 '⧗',
                 format!("{} tracker changes pending", self.pending_changes),
             )
-            .fix("git add -A .kanspec && git commit -m \"kanspec: sync\"")
+            .fix(&self.sync_fix)
             .write(w, st)?;
         }
 

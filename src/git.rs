@@ -726,8 +726,14 @@ impl Git {
 
     /// How many `.kanspec/` changes are pending — what `sync = "batch"` reminds about.
     /// `status` respects gitignore, so the disposable `cache/` never inflates the count.
-    pub fn dirty_kanspec(&self) -> Result<u32> {
-        let ps = [Pathspec::glob(".kanspec/**")];
+    /// `extra` carries the generated projections, which live at the REPO ROOT rather than
+    /// under `.kanspec/` and are renameable via `[paths]`. Counting only `.kanspec/**` made
+    /// `status` report "nothing pending" while a regenerated `KANSPEC-FEATURES.md` sat
+    /// uncommitted — so following kanspec's own sync advice left the committed feature map
+    /// stale, which is precisely the rot the projections exist to prevent.
+    pub fn dirty_kanspec(&self, extra: &[&Path]) -> Result<u32> {
+        let mut ps = vec![Pathspec::glob(".kanspec/**")];
+        ps.extend(extra.iter().map(|p| Pathspec::glob(&p.to_string_lossy())));
         let o = self.run_ps(&["status", "--porcelain=v2", "-z"], &ps)?;
         if o.code != 0 {
             return Err(self.git_err(

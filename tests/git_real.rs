@@ -534,11 +534,11 @@ fn worktree_add_classifies_its_failures_by_stderr_not_by_exit_code() {
 fn dirty_kanspec_counts_pending_tracker_changes_and_ignores_the_cache() {
     let repo = TestRepo::new();
     let ctx = common::ctx_at(&repo.root);
-    assert_eq!(ctx.git.dirty_kanspec().unwrap(), 0, "the fixture is clean");
+    assert_eq!(ctx.git.dirty_kanspec(&[]).unwrap(), 0, "the fixture is clean");
 
     repo.write(".kanspec/tickets/t-9c41.md", "---\nid: t-9c41\n---\n");
     assert_eq!(
-        ctx.git.dirty_kanspec().unwrap(),
+        ctx.git.dirty_kanspec(&[]).unwrap(),
         1,
         "an untracked ticket counts"
     );
@@ -547,14 +547,14 @@ fn dirty_kanspec_counts_pending_tracker_changes_and_ignores_the_cache() {
         "main = \"origin/main\"\nport = 5758\n",
     );
     assert_eq!(
-        ctx.git.dirty_kanspec().unwrap(),
+        ctx.git.dirty_kanspec(&[]).unwrap(),
         2,
         "a modified file counts"
     );
 
     // The disposable cache is gitignored, so a `scan` every 60s never inflates the count.
     repo.write(".kanspec/cache/gitstate.json", "{\"version\":1}");
-    assert_eq!(ctx.git.dirty_kanspec().unwrap(), 2, "cache/ is invisible");
+    assert_eq!(ctx.git.dirty_kanspec(&[]).unwrap(), 2, "cache/ is invisible");
     assert!(ctx.git.is_ignored(&repo.root.join(".kanspec/cache")));
     assert!(ctx
         .git
@@ -589,7 +589,7 @@ fn commit_kanspec_stages_only_the_tracker_and_is_a_no_op_when_clean() {
     let files = repo.git(&["show", "--name-only", "--format=", "HEAD"]);
     assert_eq!(files.trim(), ".kanspec/tickets/t-9c41.md");
     assert_eq!(
-        ctx.git.dirty_kanspec().unwrap(),
+        ctx.git.dirty_kanspec(&[]).unwrap(),
         0,
         "the tracker is committed"
     );
