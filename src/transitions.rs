@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{KsError, Result};
+use crate::error::{Fix, KsError, Result};
 use crate::ids::TicketId;
 use crate::logentry::LogEntry;
 use crate::model::Ticket;
@@ -98,6 +98,47 @@ impl Verb {
     }
     pub fn parse(s: &str) -> Option<Verb> {
         ALL_VERBS.iter().copied().find(|v| v.as_str() == s)
+    }
+
+    /// The verb's REAL invocation, mandatory flags included — mint it here, never by
+    /// lowercasing the name.
+    ///
+    /// [`Verb::as_str`] is the `## Log` spelling, and FIVE of the eight verbs are not
+    /// invoked that way: `confirm` is an **option on `scan`**, not a subcommand;
+    /// `park`/`drop`/`repair`/`scan --confirm` all refuse without `--why`; and `new` takes a
+    /// title, not the id it has not minted yet. So the obvious
+    /// `format!("kanspec {verb} {id}")` answered `kanspec start <a done ticket>` — the
+    /// single most common mistake there is — with `kanspec confirm t-ea32`, which exits 64
+    /// with `unrecognized subcommand`. Invariant 9 does not say "name a fix", it says name
+    /// the *one command that fixes it*, so a fix that cannot be run is the invariant broken.
+    ///
+    /// The match is exhaustive on purpose: a ninth `Verb` cannot compile until someone
+    /// writes down how it is actually invoked. `tests/transition_table.rs` then parses every
+    /// string produced here against the real clap tree, so a flag that later becomes
+    /// mandatory is a failing test rather than advice that fails in the user's terminal.
+    pub fn command(self, id: &TicketId) -> String {
+        self.command_as(crate::cli::invoked_as(), id)
+    }
+
+    /// [`Verb::command`] against an explicit binary name — `kanspec` or `ks`, whichever the
+    /// user actually typed. Split out because [`require`]'s signature is the frozen one in
+    /// ARCHITECTURE §2.4 and carries no `&Ctx`: `command` reads the same process-wide
+    /// `invoked_as` that `Ctx` is built from, and this is the seam tests pin both spellings
+    /// through without racing a `OnceLock`.
+    pub fn command_as(self, ks: &str, id: &TicketId) -> String {
+        match self {
+            // `new` MINTS an id, so it takes the title it has instead of the id it lacks.
+            Verb::New => format!("{ks} new \"...\""),
+            Verb::Start => format!("{ks} start {id}"),
+            Verb::Ship => format!("{ks} ship {id}"),
+            Verb::Done => format!("{ks} done {id}"),
+            // `--why` is a `String`, not an `Option<String>` — clap refuses without it.
+            Verb::Park => format!("{ks} park {id} --why \"...\""),
+            Verb::Drop => format!("{ks} drop {id} --why \"...\""),
+            // NOT a subcommand: `--confirm` is an option on `scan`, and it `requires = "why"`.
+            Verb::Confirm => format!("{ks} scan --confirm {id} --why \"...\""),
+            Verb::Repair => format!("{ks} repair {id} --why \"...\""),
+        }
     }
 }
 
@@ -225,6 +266,10 @@ fn join_or(parts: &[&str]) -> String {
 }
 
 /// The typed refusal every mutating verb goes through.
+///
+/// Both fix lines are built from [`Verb::command`] and `invoked_as`, never from the verb's
+/// name and never from a hardcoded `kanspec`: a `ks` user is told to run `ks`, and the
+/// suggested verb is spelled the way clap actually accepts it.
 pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State> {
     match next(Some(from), verb) {
         Some(to) => Ok(to),
@@ -234,8 +279,8 @@ pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State> {
             verb,
             allowed: allowed_slice(Some(from)),
             fix: fixes![
-                fix!("kanspec show {id}"),
-                fix!("kanspec {} {id}", allowed_slice(Some(from))[0]),
+                fix!("{} show {id}", crate::cli::invoked_as()),
+                Fix::cmd(allowed_slice(Some(from))[0].command(id)),
             ],
         }),
     }
