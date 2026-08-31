@@ -116,6 +116,18 @@ pub enum Op {
 }
 
 impl Op {
+    /// Does this step change a file git tracks?
+    ///
+    /// Only `WriteGitState` does not: `cache/` is gitignored, disposable, and rebuilt from
+    /// nothing by the next `scan`. `Store::transact` reads this to decide whether
+    /// `sync = "commit"` has anything to commit — without it, a `scan` (whose entire plan is
+    /// one cache write) runs `git add -A -- .kanspec/**` and sweeps whatever tracker edits
+    /// happened to be pending into a commit labelled after the scan, and the `post-merge`
+    /// hook's `kanspec scan --quiet` reaches for git's index in the middle of a merge.
+    pub fn writes_tracked_file(&self) -> bool {
+        !matches!(self, Op::WriteGitState { .. })
+    }
+
     /// The entity a plan step is about, when it has one. `MoveDir`, `AppendJsonl`,
     /// `WriteGenerated` and `WriteGitState` name raw paths instead.
     pub fn entity(&self) -> Option<&EntityRef> {

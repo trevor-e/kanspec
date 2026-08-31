@@ -104,7 +104,11 @@ pub static CHECKS: &[Check] = &[
     },
     Check {
         id: "dead_globs",
-        about: "spec code globs, quirk paths and decision scopes match at least one file",
+        // Spec `code:` globs ONLY, and the string says so: `cache::SpecAnchor.dead_globs` is
+        // the only glob liveness `scan` records, and a registry that promises more than it
+        // checks is worse than one that checks less. Covering quirk `paths:` and decision
+        // `scope:` needs a scan-side change (a glob-liveness map in `GitState`) — v0.2.
+        about: "every spec `code:` glob matches at least one tracked file",
         run: check_dead_globs,
         fix: None,
     },

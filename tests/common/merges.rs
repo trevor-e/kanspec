@@ -23,7 +23,8 @@ pub enum Shape {
     Rebase,
     /// a one-commit squash — rung 4 still sees it
     SquashOneCommit,
-    /// never merged at all — the only shape that may legitimately answer NotMerged
+    /// never merged at all — and STILL `unknown`, not `not merged`, because a `+` cherry
+    /// line cannot tell an unmerged branch from a multi-commit squash (D-3)
     Never,
 }
 
@@ -75,14 +76,21 @@ impl Shape {
     }
 
     /// What a correct ladder must conclude WITHOUT `gh`.
+    ///
+    /// **Two shapes land on `unknown`**, which is ARCHITECTURE.md §10's round-2 gate and
+    /// invariant 2 at its sharpest. `SquashGhTitleOnly` is the one recon named: all four
+    /// rungs decline (R-4). `Never` joins it — corrected in round B, where this helper said
+    /// `NotMerged` and the ladder observably disagreed — because rung 4's only non-merged
+    /// output is a `+` cherry line, and a `+` cannot distinguish a branch that never merged
+    /// from a multi-commit squash that did (D-3). Saying `not merged` there would be a
+    /// confident wrong answer for the squash, which is the one thing this ladder may never
+    /// produce. `Verdict::NotLanded` is consequently unreachable in v0.1 — see §11 D-25.
     pub const fn expected(self) -> ExpectedStatus {
         match self {
             Shape::TrueMerge | Shape::SquashGitNative | Shape::Rebase | Shape::SquashOneCommit => {
                 ExpectedStatus::Merged
             }
-            // Verified by recon: all four rungs decline. `unknown`, never `not merged`.
-            Shape::SquashGhTitleOnly => ExpectedStatus::Unknown,
-            Shape::Never => ExpectedStatus::NotMerged,
+            Shape::SquashGhTitleOnly | Shape::Never => ExpectedStatus::Unknown,
         }
     }
     pub const fn all() -> [Shape; 6] {

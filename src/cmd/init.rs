@@ -203,9 +203,7 @@ fn refuse_taken_projections(ctx: &Ctx) -> Result<()> {
         .join(", ");
     Err(KsError::gate(
         "projection_path_taken",
-        format!(
-            "{names} already exists and kanspec did not generate it — refusing to claim it"
-        ),
+        format!("{names} already exists and kanspec did not generate it — refusing to claim it"),
         fixes![
             fix!(
                 "set [paths] {key} = \"...\" in {} and re-run `{} init`",

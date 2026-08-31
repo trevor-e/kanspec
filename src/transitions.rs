@@ -310,22 +310,49 @@ impl std::fmt::Display for LogViolation {
 /// three things: legal sequence, each entry's RECORDED state against the legal successor
 /// (a doctored log LINE, not just a doctored frontmatter field), and timestamp
 /// monotonicity.
+///
+/// # Two passes, and why the split is load-bearing (D-12)
+///
+/// `Verb::Repair` is the one verb whose logged state is **authoritative** rather than
+/// derived, so the legality fold begins at the LAST repair entry and everything before it
+/// is what the attested reset is *for*. Folding strictly forward instead — returning at the
+/// first bad entry, never reaching a later reset — left `repair` unable to rescue an
+/// `IllegalStep` or a `StateMismatch`, which is exactly what an import and a union-merged
+/// `## Log` (two `start` lines) produce. `Store::transact` re-proves the staged bytes with
+/// no repair exemption, so such a ticket could not even have the repair written to it: D-12
+/// says those repos must be recoverable rather than permanently unwritable.
+///
+/// The clock, by contrast, is checked over the **whole** log, before and after any reset. A
+/// `## Log` is a chronological record, and a repair line must never be usable to launder a
+/// temporal anomaly — so an out-of-order pair stays a refusal whatever is appended after
+/// it, and its fix is the safe, mechanical one the message names: put the lines back in
+/// order. Attesting a state is a human's to do; rewriting when things happened is not.
 pub fn replay(entries: &[LogEntry]) -> std::result::Result<State, LogViolation> {
-    let mut cur: Option<State> = None;
+    // ── pass 1: the clock, over every entry — no repair exemption ────────────
     let mut last: Option<DateTime<Utc>> = None;
     for (i, e) in entries.iter().enumerate() {
-        if let Some(prev) = last {
-            if e.at < prev {
-                return Err(LogViolation::OutOfOrder { index: i, at: e.at });
-            }
+        if last.is_some_and(|prev| e.at < prev) {
+            return Err(LogViolation::OutOfOrder { index: i, at: e.at });
         }
         last = Some(e.at);
+    }
+
+    // ── pass 2: legality, from the last attested reset ───────────────────────
+    let start = entries
+        .iter()
+        .rposition(|e| e.verb == Verb::Repair)
+        .unwrap_or(0);
+    let mut cur: Option<State> = None;
+    for (i, e) in entries.iter().enumerate().skip(start) {
         cur = match e.verb {
-            // Repair is the ONE verb whose logged state is authoritative rather than
-            // derived: the human-attested reset that makes an imported or already-broken
-            // repo RECOVERABLE instead of permanently unwritable (D-12).
             Verb::Repair => Some(e.state),
             v => {
+                // `next` has exactly one `(None, verb)` entry — `new` — so a log opening
+                // with anything else is a missing genesis. Naming it that way is the
+                // wording a human can act on; `IllegalStep { from: None }` is not.
+                if cur.is_none() && v != Verb::New {
+                    return Err(LogViolation::NoGenesis { first: v });
+                }
                 let n = next(cur, v).ok_or(LogViolation::IllegalStep {
                     index: i,
                     from: cur,

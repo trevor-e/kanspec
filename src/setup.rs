@@ -119,7 +119,13 @@ pub fn install(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
 
     let before = read(&files.context);
     let after = insert_snippet(&before, &snippet(ctx.invoked_as));
-    changes.push(plan_text(&mut edits, files.context, "agent context", before, after));
+    changes.push(plan_text(
+        &mut edits,
+        files.context,
+        "agent context",
+        before,
+        after,
+    ));
 
     if let Some(path) = files.settings {
         let before = read(&path);
@@ -155,15 +161,17 @@ pub fn remove(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
 
     let before = read(&files.context);
     let after = before.as_deref().map(excise_snippet);
-    changes.push(plan_text(&mut edits, files.context, "agent context", before, after));
+    changes.push(plan_text(
+        &mut edits,
+        files.context,
+        "agent context",
+        before,
+        after,
+    ));
 
     if let Some(path) = files.settings {
         let before = read(&path);
-        let after = before
-            .as_deref()
-            .map(strip_settings)
-            .transpose()?
-            .flatten();
+        let after = before.as_deref().map(strip_settings).transpose()?.flatten();
         let gone = after.is_none();
         let parent = path.parent().map(std::path::Path::to_path_buf);
         changes.push(plan_text(&mut edits, path, "agent hooks", before, after));
@@ -343,7 +351,10 @@ fn word(cmd: &str, bin: &str, verb: &str) -> bool {
 /// Everything foreign is preserved: other events, other matchers inside our events, other
 /// commands inside our matcher group, and every key outside `hooks`. The only thing that
 /// is ever rewritten is an entry that is already ours.
-pub fn merge_settings(existing: Option<&str>, entries: &[(&str, String, String)]) -> Result<String> {
+pub fn merge_settings(
+    existing: Option<&str>,
+    entries: &[(&str, String, String)],
+) -> Result<String> {
     let mut root = parse(existing)?;
     let hooks = root
         .entry("hooks")
@@ -463,7 +474,11 @@ mod tests {
     fn entries() -> Vec<(&'static str, String, String)> {
         vec![
             ("SessionStart", String::new(), "kanspec prime".into()),
-            ("PostToolUse", EDIT_TOOLS.into(), "kanspec quirks --touch x".into()),
+            (
+                "PostToolUse",
+                EDIT_TOOLS.into(),
+                "kanspec quirks --touch x".into(),
+            ),
         ]
     }
 
@@ -487,7 +502,10 @@ mod tests {
             "<!-- kanspec:begin -->\nNEW\n<!-- kanspec:end -->\n",
         )
         .unwrap();
-        assert_eq!(upgraded, "intro\n\n<!-- kanspec:begin -->\nNEW\n<!-- kanspec:end -->\ntrailer\n");
+        assert_eq!(
+            upgraded,
+            "intro\n\n<!-- kanspec:begin -->\nNEW\n<!-- kanspec:end -->\ntrailer\n"
+        );
     }
 
     #[test]
@@ -503,9 +521,16 @@ mod tests {
         let v: Value = serde_json::from_str(&merged).unwrap();
 
         assert_eq!(v["permissions"]["allow"][0], json!("Bash(git:*)"));
-        assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], json!("guard.sh"));
+        assert_eq!(
+            v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            json!("guard.sh")
+        );
         let ss = &v["hooks"]["SessionStart"][0]["hooks"];
-        assert_eq!(ss[0]["command"], json!("echo mine"), "the foreign hook stays");
+        assert_eq!(
+            ss[0]["command"],
+            json!("echo mine"),
+            "the foreign hook stays"
+        );
         assert_eq!(ss[1]["command"], json!("kanspec prime"), "ours joins it");
         assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], json!(EDIT_TOOLS));
 
@@ -535,8 +560,17 @@ mod tests {
         )
         .unwrap();
         let v: Value = serde_json::from_str(&upgraded).unwrap();
-        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap().len(), 1);
-        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"], json!("ks prime --json"));
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            v["hooks"]["SessionStart"][0]["hooks"][0]["command"],
+            json!("ks prime --json")
+        );
     }
 
     #[test]

@@ -288,32 +288,28 @@ fn every_legal_trail_replays_to_the_state_its_last_entry_records() {
     }
 }
 
-/// **FINDING, reported to F as a request against the frozen `transitions.rs`:**
-/// `LogViolation::NoGenesis` is UNCONSTRUCTIBLE. `replay` folds from `cur = None`, and the
-/// table has no `(None, verb)` entry but `new`, so a log that opens with anything else
-/// trips `IllegalStep { index: 0, from: None }` first and `NoGenesis` is never built.
+/// A log that does not open with `new` is a MISSING GENESIS, and says so.
 ///
-/// The break IS caught either way — this is a message-quality gap, not a safety one — but
-/// `NoGenesis`'s wording ("the ## Log opens with `start`, not `new`") is the one a human
-/// can act on, and the variant is currently dead code. The fix is one branch at the top of
-/// `replay`; it is F's file, so this test pins TODAY'S behaviour and names the gap rather
-/// than quietly asserting the nicer message.
+/// (History, so it is not re-broken: `replay` used to fold from `cur = None` straight into
+/// `next`, and since the table has exactly one `(None, verb)` entry — `new` — every such
+/// log tripped `IllegalStep { index: 0, from: None }` first and `NoGenesis` was dead code.
+/// The break was caught either way; the wording was not the one a human can act on. Round B
+/// added the branch.)
 #[test]
-fn a_log_that_does_not_open_with_new_is_caught_as_an_illegal_step_not_as_no_genesis() {
-    assert_eq!(
-        replay(&[e(0, V::Start, Doing)]),
-        Err(LogViolation::IllegalStep {
-            index: 0,
-            from: Option::None,
-            verb: V::Start,
-        }),
-        "if this ever returns NoGenesis, delete this test and restore the one below"
-    );
-    // The variant still renders, so the day `replay` starts building it nothing else moves.
+fn a_log_that_does_not_open_with_new_is_a_missing_genesis_by_name() {
+    for opener in [V::Start, V::Ship, V::Done, V::Park, V::Drop, V::Confirm] {
+        assert_eq!(
+            replay(&[e(0, opener, Doing)]),
+            Err(LogViolation::NoGenesis { first: opener }),
+            "a `## Log` opening with `{opener}` has no genesis"
+        );
+    }
     assert_eq!(
         LogViolation::NoGenesis { first: V::Start }.to_string(),
         "the ## Log opens with `start`, not `new`"
     );
+    // `repair` is the exception, and the whole of D-12: an attested reset IS a genesis.
+    assert_eq!(replay(&[e(0, V::Repair, Doing)]), Ok(Doing));
 }
 
 #[test]
@@ -415,38 +411,62 @@ fn repair_resets_the_replay_to_its_own_recorded_state() {
     assert_eq!(replay(&onward), Ok(Done));
 }
 
-/// **FINDING, reported to F as a request against the frozen `transitions.rs`:**
-/// `replay` folds strictly forward and returns on the FIRST bad entry, so a `Verb::Repair`
-/// line appended after an `IllegalStep` / `StateMismatch` / `OutOfOrder` is never reached.
-/// D-12 says repair exists so that "an imported or already-broken repo" is recoverable
-/// rather than permanently unwritable — and those three violations are exactly what an
-/// import and a union-merged `## Log` produce (see the two-`start` case above).
-///
-/// `Store::transact` step 8 re-proves the STAGED bytes with no `Repair` exemption, so the
-/// repair cannot even be written: the ticket stays unwritable forever.
-///
-/// The fix is local to `replay`: begin the fold at the LAST `Repair` entry, seeding
-/// `cur = Some(entry.state)` and `last = Some(entry.at)` and skipping everything before
-/// it. That is F's file, so this test pins TODAY'S behaviour and names the gap.
+/// D-12 in full: `replay` folds legality from the LAST `Repair`, so an attested reset
+/// rescues a log whose EARLIER entries are illegal — an import, or the two-`start` line
+/// pair a union-merged `## Log` produces. Before round B the fold returned at the first bad
+/// entry and never reached the reset, and since `Store::transact` re-proves the staged
+/// bytes with no repair exemption, such a ticket could not even have the repair written to
+/// it: permanently unwritable, which is the exact outcome D-12 exists to prevent.
 #[test]
-fn repair_does_not_yet_rescue_a_log_whose_earlier_entries_are_illegal() {
+fn repair_rescues_a_log_whose_earlier_entries_are_illegal() {
     for broken in [
-        // an illegal step (an import, or two machines' claims union-merged)
+        // an illegal step — an import, or two machines' claims union-merged
         vec![e(0, V::New, Todo), e(1, V::Done, Done)],
-        // a doctored line
+        vec![
+            e(0, V::New, Todo),
+            by(1, "a", V::Start, Doing),
+            by(2, "b", V::Start, Doing),
+        ],
+        // a doctored LINE, not just a doctored frontmatter field
         vec![e(0, V::New, Todo), e(1, V::Start, Done)],
-        // lines interleaved out of order by a merge
-        vec![e(5, V::New, Todo), e(1, V::Start, Doing)],
+        // no genesis at all
+        vec![e(0, V::Ship, Review)],
     ] {
-        assert!(replay(&broken).is_err());
-        let mut attempted = broken.clone();
-        attempted.push(e(9, V::Repair, Todo));
         assert!(
-            replay(&attempted).is_err(),
-            "if this starts passing, `repair` became the reset D-12 describes — \
-             delete this test and assert Ok(Todo) instead: {attempted:#?}"
+            replay(&broken).is_err(),
+            "the fixture must actually be broken: {broken:#?}"
+        );
+        let mut attested = broken.clone();
+        attested.push(e(9, V::Repair, Todo));
+        assert_eq!(
+            replay(&attested),
+            Ok(Todo),
+            "an attested reset is a new genesis: {attested:#?}"
         );
     }
+}
+
+/// The half repair deliberately does NOT rescue. A `## Log` is a chronological record, and
+/// an appended attestation must not be able to launder a temporal anomaly — otherwise the
+/// one record that binds the human (R-2) is forgeable by a line at the bottom. The clock is
+/// therefore checked over the whole log, with no repair exemption, and the fix the message
+/// names is the safe mechanical one: put the lines back in order.
+#[test]
+fn repair_cannot_launder_a_log_that_runs_backwards_in_time() {
+    let interleaved = vec![e(5, V::New, Todo), e(1, V::Start, Doing)];
+    assert!(matches!(
+        replay(&interleaved),
+        Err(LogViolation::OutOfOrder { index: 1, .. })
+    ));
+    let mut attested = interleaved;
+    attested.push(e(9, V::Repair, Todo));
+    assert!(
+        matches!(
+            replay(&attested),
+            Err(LogViolation::OutOfOrder { index: 1, .. })
+        ),
+        "a repair line at the bottom must not make an out-of-order log replay clean"
+    );
 }
 
 #[test]

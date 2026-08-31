@@ -99,12 +99,15 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
         ));
     }
 
-    // Simulate the exact line `Store::transact` is about to write, and replay the whole
-    // log with it. `Verb::Repair` is authoritative for its OWN entry, so it recovers an
-    // empty log and a hand-edited `state:` — but `replay` fails at the FIRST illegal entry
-    // and never reaches a later reset, so a log with an illegal step in the middle is
-    // beyond this verb. Saying so here beats letting `transact` refuse the write from
-    // three layers down with a message about a plan the user never wrote.
+    // Simulate the exact line `Store::transact` is about to write, and replay the whole log
+    // with it. `replay` folds legality from the LAST repair entry, so an empty log, a
+    // hand-edited `state:` and an illegal step or doctored line anywhere before the reset
+    // are all recovered. What survives is the clock: `replay` checks timestamp
+    // monotonicity over the whole log with no repair exemption, so a `## Log` whose lines
+    // are interleaved out of order — or an attestation dated before the last entry — is
+    // still beyond this verb. Saying so HERE, naming the violation and the file, beats
+    // letting `transact` refuse the write from three layers down with a message about a
+    // plan the user never wrote.
     let entry = LogEntry {
         at: f.at,
         state: t.fm.state,
@@ -289,17 +292,49 @@ mod tests {
         }
     }
 
-    /// `replay` fails at the FIRST illegal entry and never reaches a later reset, so a log
-    /// broken in the middle is beyond this verb. Saying so — naming the entry and the file
-    /// — beats a refusal from three layers down inside `transact`.
+    /// D-12's harder half, and the reason `replay` folds legality from the LAST repair: an
+    /// illegal step in the MIDDLE of the log is what an import and a union-merged `## Log`
+    /// actually produce, and before the fold moved it made the ticket permanently
+    /// unwritable — `transact` re-proves the staged bytes, so not even the repair could
+    /// land.
     #[test]
-    fn a_log_broken_in_the_middle_is_named_rather_than_silently_wedged() {
+    fn a_log_broken_in_the_middle_is_exactly_what_the_attested_reset_recovers() {
         let s = snap_with(
             State::Review,
             vec![
                 entry(9, State::Todo, Verb::New),
                 // `ship` is not legal from `todo`.
                 entry(10, State::Review, Verb::Ship),
+            ],
+        );
+        assert!(
+            transitions::replay(&s.ticket(&TicketId::parse("t-9c41").unwrap()).unwrap().log)
+                .is_err(),
+            "the fixture must actually be broken, or this test proves nothing"
+        );
+        let p = plan(&s, &args("imported mid-flight from the old tracker")).expect("repairable");
+        assert_eq!(p.ops.len(), 1);
+        match p.ops.first() {
+            Some(Op::Transition { verb, detail, .. }) => {
+                assert_eq!(*verb, Verb::Repair);
+                // The attested state is the frontmatter's, not one the caller chose.
+                assert!(detail.starts_with("attested review"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// What repair still cannot do, deliberately: rewrite WHEN things happened. A log whose
+    /// lines a union merge interleaved is refused by name, because letting an appended
+    /// attestation launder a temporal anomaly would make the one record that binds the
+    /// human (R-2) forgeable by a line at the bottom.
+    #[test]
+    fn a_log_whose_lines_run_backwards_in_time_is_still_refused_by_name() {
+        let s = snap_with(
+            State::Review,
+            vec![
+                entry(11, State::Todo, Verb::New),
+                entry(9, State::Doing, Verb::Start),
             ],
         );
         assert_eq!(

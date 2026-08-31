@@ -47,11 +47,15 @@ fn fact(s: &GitState, id: &str) -> MergeFact {
 
 /// What the ladder must conclude for each shape from LOCAL GIT ALONE, rung by rung.
 ///
-/// `Shape::expected()` (foundation-owned) predicts `NotMerged` for `Never`. The ladder
-/// cannot honestly say that: `git cherry origin/main <head>` reports `+2`, and a `+` line
+/// The `Method` half is this table's alone — `Shape::expected()` records only the status —
+/// and the two are cross-checked against each other below.
+///
+/// (History: `Shape::expected()` predicted `NotMerged` for `Never`, and the ladder
+/// observably disagreed. `git cherry origin/main <head>` reports `+2`, and a `+` line
 /// cannot distinguish an unmerged branch from a multi-commit squash (D-3) — so the answer
-/// is `unknown`, never "no". That is why ARCHITECTURE.md §10's round-2 gate reads "all six
-/// shapes with exact `Method`, **two** landing on `unknown`" while the helper predicts one.
+/// is `unknown`, never "no", which is why §10's round-2 gate reads "**two** landing on
+/// `unknown`" while the helper predicted one. Round B corrected the helper; the two tables
+/// now agree on all six.)
 fn expected(shape: Shape) -> (MergeStatus, Method, &'static str) {
     match shape {
         // The branch tip is literally reachable from main. Rung 1 is exact, and cheap.
@@ -126,12 +130,9 @@ fn the_six_real_merge_shapes_land_on_exact_methods_with_two_honest_unknowns() {
          a ladder that answers all six confidently is a ladder that guesses"
     );
 
-    // Five of the six agree with the foundation's own prediction table; `Never` is the
-    // documented divergence above.
+    // ALL SIX agree with the foundation's own prediction table, which is written from the
+    // merge shapes rather than from this file — so a wrong answer has to be wrong twice.
     for shape in Shape::all() {
-        if shape == Shape::Never {
-            continue;
-        }
         let predicted = match shape.expected() {
             common::merges::ExpectedStatus::Merged => MergeStatus::Merged,
             common::merges::ExpectedStatus::NotMerged => MergeStatus::NotMerged,
@@ -276,6 +277,62 @@ fn quiet_prints_nothing_at_all_for_the_git_hooks() {
     );
 }
 
+/// A scan's whole plan is one write to the GITIGNORED cache, so under `sync = "commit"` it
+/// must commit NOTHING — round B's fix to `Store::transact` step 10.
+///
+/// Two things break otherwise, and both are shipped surfaces. A scan would `git add -A --
+/// .kanspec/**` and sweep whatever tracker edits happened to be pending — the normal
+/// resting state under the `sync = "batch"` default a user just switched off — into a
+/// commit labelled after the scan. And the `post-merge` hook's `kanspec scan --quiet` would
+/// reach for git's index in the middle of a merge.
+#[test]
+fn a_scan_commits_nothing_under_sync_commit_because_it_only_wrote_the_cache() {
+    let repo = TestRepo::with_merges();
+    repo.write(
+        ".kanspec/config.toml",
+        "main = \"origin/main\"\nid_width = 4\nsync = \"commit\"\n",
+    );
+    repo.git(&["add", "-A", "--", ".kanspec"]);
+    repo.git(&["commit", "--quiet", "-m", "sync = commit"]);
+
+    // An unfinished tracker edit, exactly as a human leaves one lying around.
+    let id = Shape::TrueMerge.ticket();
+    let rel = format!(".kanspec/tickets/{id}.md");
+    let edited = format!("{}\nA thought someone is still typing.\n", repo.read(&rel));
+    repo.write(&rel, &edited);
+
+    let before = repo.sha("HEAD");
+    repo.ks(["scan"]).ok();
+    assert_eq!(
+        repo.sha("HEAD"),
+        before,
+        "a cache-only plan must not commit — and must not label someone else's edit `scan`"
+    );
+    assert_eq!(repo.read(&rel), edited, "the pending edit is still pending");
+    // The scan did happen; it just had nothing git tracks to commit.
+    assert_eq!(fact(&gitstate(&repo), id).status, MergeStatus::Merged);
+
+    // …while a plan that DOES write a tracked file still commits, subject and all.
+    repo.ks([
+        "scan",
+        "--confirm",
+        Shape::SquashGhTitleOnly.ticket(),
+        "--why",
+        "squash merged by hand, verified",
+    ])
+    .ok();
+    assert_ne!(
+        repo.sha("HEAD"),
+        before,
+        "the attestation is a tracker write"
+    );
+    assert!(
+        repo.git(&["log", "-1", "--format=%s"])
+            .contains(Shape::SquashGhTitleOnly.ticket()),
+        "the commit names the ticket it was actually about"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // rung 2 — the only rung that sees a title-only squash
 // ─────────────────────────────────────────────────────────────────────────────
@@ -405,10 +462,17 @@ fn the_done_gate_refuses_an_undetectable_merge_and_hands_back_the_ladder() {
     let proof = scan::proof_for_done(&ctx, t).expect("ancestry proves this one");
     assert_eq!(proof.method(), Method::Ancestry);
     assert_eq!(proof.ticket().as_str(), Shape::TrueMerge.ticket());
-    assert!(
-        proof.badge().starts_with("IN MAIN (ancestry"),
-        "{}",
-        proof.badge()
+    // The badge takes the CALLER'S clock (round B), so it is deterministic under
+    // `KANSPEC_NOW` and a transcript that shows it can be snapshotted. A `Utc::now()` in
+    // here would render "checked 3h ago" against the injected clock and this would fail.
+    assert_eq!(
+        proof.badge(ctx.now),
+        "IN MAIN (ancestry · checked 0s ago)",
+        "the ladder ran at ctx.now, so the proof is exactly zero seconds old"
+    );
+    assert_eq!(
+        proof.badge(ctx.now + chrono::Duration::hours(2)),
+        "IN MAIN (ancestry · checked 2h ago)"
     );
 }
 

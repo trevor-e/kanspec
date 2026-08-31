@@ -567,8 +567,14 @@ impl<'c> Store<'c> {
             touched.push(to.clone());
         }
 
-        // 10
-        if ctx.cfg.sync == crate::config::SyncMode::Commit {
+        // 10 — but only for a plan that changed something git tracks. A `scan`'s entire
+        // plan is one write to the GITIGNORED cache, and committing for it would (a) sweep
+        // whatever tracker edits were pending into a commit labelled after the scan, and
+        // (b) have the `post-merge` hook's `kanspec scan --quiet` reach for git's index in
+        // the middle of a merge.
+        if ctx.cfg.sync == crate::config::SyncMode::Commit
+            && plan.ops.iter().any(Op::writes_tracked_file)
+        {
             let subject = plan
                 .ops
                 .iter()

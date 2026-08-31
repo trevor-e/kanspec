@@ -143,12 +143,18 @@ impl MergedProof {
         self.checked_at
     }
     /// `"IN MAIN (gh-pr #142 · checked 11s ago)"`
-    pub fn badge(&self) -> String {
+    ///
+    /// `now` is the CALLER'S clock — `ctx.now` — never `Utc::now()`. Determinism in this
+    /// crate comes from exactly three env overrides (§9), and a badge that reads the wall
+    /// clock renders "checked 3h ago" under `KANSPEC_NOW`, making every snapshot test of a
+    /// transcript that shows it unstable. `derive::Badge::text` takes the same argument for
+    /// the same reason.
+    pub fn badge(&self, now: DateTime<Utc>) -> String {
         let pr = self.pr.map(|n| format!(" #{n}")).unwrap_or_default();
         format!(
             "IN MAIN ({}{pr} · checked {})",
             self.method,
-            crate::out::rel_time(self.checked_at, Utc::now())
+            crate::out::rel_time(self.checked_at, now)
         )
     }
 }
@@ -815,7 +821,11 @@ const TRAILER_DIFF_MAX: usize = 20;
 /// identifiable by the `Kanspec:` trailer the commit hook writes, so the fallback asks each
 /// of them directly. A true merge with no trailers (a repo that never ran `init`) records
 /// no paths, which is the honest answer rather than main's whole history.
-fn touched_paths(git: &Git, t: &Ticket, main: &str) -> Vec<String> {
+///
+/// **Public because `done` needs exactly this** for `DoneFacts.touched` (§2.16): a second
+/// caller reaching for `Git::changed_paths` directly would silently reacquire the three-dot
+/// hole this function exists to close.
+pub fn touched_paths(git: &Git, t: &Ticket, main: &str) -> Vec<String> {
     let Some(rev) = ticket_rev(t) else {
         return Vec::new();
     };

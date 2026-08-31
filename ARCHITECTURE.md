@@ -433,19 +433,49 @@ pub enum LogViolation {
 /// each missed one of: legal sequence, each entry's RECORDED state against the
 /// legal successor (a doctored log LINE, not just a doctored frontmatter field),
 /// and timestamp monotonicity.
+///
+/// ROUND-B CORRECTION — two passes, and the split is load-bearing. Legality folds
+/// from the LAST `Verb::Repair`; the clock is checked over the WHOLE log with no
+/// repair exemption. Folding strictly forward (returning at the first bad entry,
+/// never reaching a later reset) left `repair` unable to rescue an `IllegalStep`
+/// or a `StateMismatch` — which is exactly what an import and a union-merged
+/// `## Log` (two `start` lines) produce — and since `transact` step 8 re-proves
+/// the STAGED bytes with no repair exemption, the repair could not even be
+/// written: the ticket was permanently unwritable, the precise outcome D-12
+/// exists to prevent. Verified end-to-end in round B against a real repo.
+/// Conversely the clock stays global, because a `## Log` is a chronological
+/// record and an appended attestation must never launder a temporal anomaly —
+/// otherwise the one thing that binds the human (R-2) is forgeable by a line at
+/// the bottom. An out-of-order pair therefore stays a refusal whatever follows
+/// it, and its fix is the safe mechanical one the message names: reorder the
+/// lines. Attesting a STATE is a human's to do; rewriting WHEN is not.
 pub fn replay(entries: &[LogEntry]) -> std::result::Result<State, LogViolation> {
-    let mut cur: Option<State> = None;
+    // pass 1 — the clock, over every entry, no repair exemption
     let mut last: Option<DateTime<Utc>> = None;
     for (i, e) in entries.iter().enumerate() {
-        if let Some(prev) = last { if e.at < prev {
-            return Err(LogViolation::OutOfOrder { index: i, at: e.at }); } }
+        if last.is_some_and(|prev| e.at < prev) {
+            return Err(LogViolation::OutOfOrder { index: i, at: e.at });
+        }
         last = Some(e.at);
+    }
+    // pass 2 — legality, from the last attested reset
+    let start = entries.iter().rposition(|e| e.verb == Verb::Repair).unwrap_or(0);
+    let mut cur: Option<State> = None;
+    for (i, e) in entries.iter().enumerate().skip(start) {
         cur = match e.verb {
             // Repair is the ONE verb whose logged state is authoritative rather
             // than derived: the human-attested reset that makes an imported or
             // already-broken repo RECOVERABLE instead of permanently unwritable.
             Verb::Repair => Some(e.state),
             v => {
+                // `next` has exactly one `(None, verb)` entry, so a log opening
+                // with anything else is a MISSING GENESIS. Round B added this
+                // branch: without it `NoGenesis` was unconstructible dead code
+                // and the break surfaced as `IllegalStep { from: None }`, which
+                // is not wording a human can act on.
+                if cur.is_none() && v != Verb::New {
+                    return Err(LogViolation::NoGenesis { first: v });
+                }
                 let n = next(cur, v)
                     .ok_or(LogViolation::IllegalStep { index: i, from: cur, verb: v })?;
                 if n != e.state {
@@ -808,6 +838,14 @@ pub enum Op {
     /// INSIDE the lock. ✅ (One Gate allowlisted cache.rs for unlocked writes.)
     WriteGitState { token: ScanToken, state: GitState },
 }
+impl Op {
+    pub fn entity(&self) -> Option<&EntityRef>;
+    /// ROUND-B ADDITION. False for `WriteGitState` alone — `cache/` is gitignored,
+    /// disposable, and rebuilt from nothing by the next `scan`. `Store::transact`
+    /// step 9 reads this so `sync = "commit"` has nothing to commit for a scan
+    /// (§2.13). A future op that writes another gitignored path belongs here.
+    pub fn writes_tracked_file(&self) -> bool;
+}
 
 #[derive(Default)]
 pub struct Plan { pub ops: Vec<Op>, pub minted: Vec<EntityRef>, pub note: Option<String> }
@@ -1075,8 +1113,25 @@ impl<'c> Store<'c> {
     ///  8. `transitions::prove()` on every touched ticket — the write path proves
     ///     its own legality, so a hand-edit is caught by the very NEXT VERB
     ///     instead of by CI weeks later ✅ (best enforcement timing in the field)
-    ///  9. `sync = "commit"` -> `git add -A .kanspec && git commit -m "kanspec: <verb> <id>"`
+    ///  9. `sync = "commit"` AND the plan wrote something git tracks
+    ///     (`plan.ops.iter().any(Op::writes_tracked_file)`, §2.10)
+    ///     -> `git add -A .kanspec && git commit -m "kanspec: <verb> <id>"`
     /// 10. drop the lock; return the post-write snapshot with `rev + 1`
+    ///
+    /// ROUND-B CORRECTION to step 9's condition. A `scan`'s ENTIRE plan is one
+    /// `Op::WriteGitState` against the gitignored cache, and committing for it
+    /// (a) ran `git add -A -- .kanspec/**`, sweeping whatever tracker edits were
+    /// pending — the normal resting state under the `sync = "batch"` default —
+    /// into a commit labelled after the scan, and (b) had the `post-merge` hook's
+    /// `kanspec scan --quiet` reach for git's index in the middle of a merge.
+    /// Pinned by `scan_ladder.rs::a_scan_commits_nothing_under_sync_commit_…`.
+    ///
+    /// `verb` is a TICKET transition verb and reaches ONLY that commit subject,
+    /// so a plan that transitions nothing passes `Verb::Confirm` (the table's own
+    /// "non-transition, recorded" verb) purely to satisfy the parameter. With
+    /// step 9 skipped for cache-only plans it now reaches nothing at all, which
+    /// is why the signature stays as-is rather than growing an `Option<Verb>`
+    /// that every slice would have to be rewritten against mid-build.
     ///
     /// gh/network calls MUST happen BEFORE `transact` (see `Facts`, §2.16): a
     /// wedged subprocess inside the lock stalls the browser and every CLI verb.
@@ -1171,7 +1226,13 @@ impl MergedProof {
     pub fn ticket(&self) -> &TicketId;  pub fn sha(&self) -> &Sha;
     pub fn method(&self) -> Method;     pub fn pr(&self) -> Option<u64>;
     pub fn checked_at(&self) -> DateTime<Utc>;
-    pub fn badge(&self) -> String;      // "IN MAIN (gh-pr #142 · checked 11s ago)"
+    /// "IN MAIN (gh-pr #142 · checked 11s ago)". ROUND-B CORRECTION: takes the
+    /// CALLER'S clock (`ctx.now`), never `Utc::now()`. Determinism comes from
+    /// exactly three env overrides (§9), and a badge reading the wall clock
+    /// renders "checked 3h ago" under `KANSPEC_NOW` — which would make every
+    /// snapshot test of `done`'s transcript unstable. `derive::Badge::text`
+    /// already took `now` for the same reason; these two now agree.
+    pub fn badge(&self, now: DateTime<Utc>) -> String;
 }
 
 /// The chore/docs escape — a DIFFERENT type, so the landed path cannot accept
@@ -1181,9 +1242,21 @@ impl MergedProof {
 #[derive(Clone, Debug, Serialize)]
 pub struct NoCodeWaiver { why: String, by: String, at: DateTime<Utc> }
 impl NoCodeWaiver {
+    /// Refuses an empty `why`. The durable op it pushes is a PROSE line under the
+    /// ticket's `## Log` (`  no-code waiver by <actor> at <ts>: <why>`),
+    /// deliberately shaped so `logentry::parse_log` skips it and `replay` is
+    /// unaffected — a second PARSEABLE entry for one act would break the very
+    /// proof the log exists for, and there is no `no_code` `TicketKey` (invariant
+    /// 1). Pinned by a unit test asserting the line does NOT parse as a log entry.
+    ///
+    /// S5 NOTE: `record` needs `&mut Plan` while `DoneFacts.landed` is built
+    /// BEFORE `plan_done` runs, so call it from INSIDE `plan_done` (it is pure —
+    /// no IO), not from the handler.
     pub fn record(plan: &mut Plan, id: &TicketId, why: &str, by: &Actor, at: DateTime<Utc>)
         -> Result<NoCodeWaiver>;         // refuses an empty `why`
     pub fn why(&self) -> &str;
+    pub fn by(&self) -> &str;
+    pub fn at(&self) -> DateTime<Utc>;
 }
 #[derive(Clone, Debug, Serialize)] pub enum Landed { Proof(MergedProof), NoCode(NoCodeWaiver) }
 
@@ -1227,10 +1300,13 @@ impl Detection {
 ///
 ///  0.  guard  rev-parse --verify --quiet '<head>^{commit}'
 ///                                          -> Unknown::HeadNotInObjectStore
-///  0b. guard  rev-list --count <main>..<head> == 0
+///  0b. guard  ONLY when the SHA came from a live branch tip with no recorded
+///             `head:` — rev-list --count <main>..<head> == 0
 ///                                          -> Unknown::ZeroCommitBranch
 ///             (a fresh `start` branch is trivially an ancestor of main —
-///              a VERIFIED false MERGED for work that never happened)
+///              a VERIFIED false MERGED for work that never happened. The
+///              provenance condition is round B's correction: see §7, and the ⚠
+///              on `StartFacts` in §2.16 for what would re-break it.)
 ///  1.  ANCESTRY  merge-base --is-ancestor <head> <main>   0=Merged 1=next 128=Unknown
 ///  2.  GH        pr view <n> | pr list --head <branch>; MERGED -> RE-VERIFY with
 ///                is-ancestor(mergeCommit.oid); mismatch -> Unknown::GhMergedButNotAncestor;
@@ -1259,6 +1335,22 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof>;
 pub fn scan_all(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<(GitState, ScanToken)>;
 pub struct ScanOpts { pub fetch: bool, pub only: Option<TicketId>, pub quiet: bool }
 
+/// ROUND-B ADDITION. `--explain` needs the `Detection` behind each fact and the
+/// cache DTO cannot carry a trace, so the sealed runs come back BESIDE the DTO
+/// rather than being re-derived — there is still exactly one ladder run per
+/// ticket per scan. `scan_all` delegates and keeps its signature above, which is
+/// what `server.rs` calls.
+pub type ScanOutcome = (GitState, ScanToken, Vec<(TicketId, Detection)>);
+pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<ScanOutcome>;
+
+/// ROUND-B ADDITION, public because `done` needs exactly this for
+/// `DoneFacts.touched` (§2.16). `Git::changed_paths` is three-dot only, so it
+/// reports NOTHING for a branch that landed as a true merge (merge-base(main,
+/// head) is then the head itself); this diffs each trailer-matched commit on main
+/// to recover the paths. A second caller reaching for `Git::changed_paths`
+/// directly silently reacquires that hole.
+pub fn touched_paths(git: &Git, t: &Ticket, main: &str) -> Vec<String>;
+
 /// The recorded human override. Appends an attributed `Verb::Confirm` line to the
 /// TICKET'S `## Log`, not a cache entry: a human attestation is an ASSERTED ACT
 /// WITH AN ACTOR, so it must survive `rm -rf cache/` and be visibly signed. ✅
@@ -1267,8 +1359,22 @@ pub struct ConfirmFacts { pub sha: Option<Sha>, pub actor: Actor,
                           pub at: DateTime<Utc>, pub why: String, pub invocation: String }
 /// Reads a recorded confirmation back out of the log — the ONLY non-ladder route
 /// to a `MergedProof`.
-pub fn confirmed_proof(t: &Ticket) -> Option<MergedProof>;
+///
+/// ROUND-B CORRECTION — takes `&Git`. The original `(t: &Ticket)` is
+/// UNIMPLEMENTABLE: `Sha`'s only constructor is private to `git.rs`, so a
+/// function with no `&Git` cannot fill `MergedProof.sha`. `&Git` is also the
+/// stronger seal — the attested commit is re-resolved through git, so an
+/// attestation naming a commit this repo does not have yields no proof at all.
+pub fn confirmed_proof(git: &Git, t: &Ticket) -> Option<MergedProof>;
 ```
+
+**Where the confirmation actually lives, end to end (D-11).** `plan_confirm` writes one
+attributed `Verb::Confirm` line to the ticket's `## Log` whose NOTE IS THE STORAGE —
+`in main <sha> — <why>` — and every later `scan_all` reads it back out of the log and
+projects it into a fresh cache as a `Method::HumanConfirm` fact. That projection is what
+makes the override survive `rm -rf .kanspec/cache` rather than needing to be repeated, and
+`proof_for_done` consults it only AFTER the ladder declines, so an attestation can never
+overrule fresh git truth.
 
 ### 2.16 The planner shape — pure, with `Facts`
 
@@ -1279,6 +1385,14 @@ pub fn confirmed_proof(t: &Ticket) -> Option<MergedProof>;
 /// planner Git/Gh/Ui/clock and its own worked example shelled out to git inside
 /// the lock, falsifying the purity claim for exactly `ship` and `done`.
 pub struct Facts { pub actor: Actor, pub at: DateTime<Utc>, pub invocation: String }
+/// ⚠ **`plan_start` must NOT write `TicketKey::Head`.** `StartFacts.head` is the
+/// branch's fork point, for the `## Log` note and the branch fact — not for the
+/// frontmatter. `head:` is written by `ship`/`done` out of real git output, and
+/// guard 0b (§7) keys off exactly that: a SHA from a live branch tip with no
+/// recorded `head:` is how the ladder recognises a branch that never carried a
+/// commit. Set `head:` at claim time and every freshly-started ticket reads back
+/// as MERGED by ancestry — a VERIFIED false positive for work that never
+/// happened, which is the single worst answer this tool can give.
 pub struct StartFacts { pub base: Facts, pub branch: String,
                         pub worktree: Option<PathBuf>, pub head: HeadSha }
 pub struct ShipFacts  { pub base: Facts, pub head: HeadSha }
@@ -1522,12 +1636,23 @@ over struct literals in microseconds. Every derived fact in the product is one o
 pub fn dep_satisfied(s: &Snapshot, dep: &TicketId) -> bool;
 pub fn is_ready(s: &Snapshot, t: &Ticket) -> bool;                 // todo && all deps satisfied
 pub fn ready_queue(s: &Snapshot) -> Vec<&Ticket>;
-pub fn blocked_by(s: &Snapshot, t: &Ticket) -> Vec<&TicketId>;
+/// ROUND-B CORRECTION — `t` borrows from the snapshot too (`&'s Ticket`). The
+/// original `&Ticket` cannot return a dep that is MISSING from the snapshot, since
+/// there is no `&'s TicketId` for a ticket that does not exist — and silently
+/// dropping exactly the broken deps renders "blocked by nothing" for the case a
+/// human most needs named. Every real call site takes its ticket out of the
+/// snapshot, so no caller is affected.
+pub fn blocked_by<'s>(s: &'s Snapshot, t: &'s Ticket) -> Vec<&'s TicketId>;
 pub fn dep_cycles(s: &Snapshot) -> Vec<Vec<TicketId>>;
 
 // ── the git overlay (reads ONLY s.git — the gitignored cache) ────────────────
 pub fn merge_fact(s: &Snapshot, t: &Ticket) -> Option<&MergeFact>;
-pub fn in_main(s: &Snapshot, t: &Ticket) -> Option<&MergeFact>;    // doing|review && Merged
+/// ROUND-B CORRECTION — NON-TERMINAL && Merged, wider than the original
+/// `doing|review`. A ticket parked back to `todo` after its branch landed is in
+/// the same "git says this shipped, nobody closed it" situation, and is the one
+/// the tripwire most needs to catch. If S8's board wants Todo+merged in Backlog
+/// rather than In-main, `derive::column` is the one line to change.
+pub fn in_main(s: &Snapshot, t: &Ticket) -> Option<&MergeFact>;
 pub fn badge(s: &Snapshot, t: &Ticket) -> Badge;
 #[derive(Serialize)] pub enum Badge { Unpushed, Pushed, PrOpen { n: u64 },
     InMain { method: Method, sha: String, checked_at: DateTime<Utc> },
@@ -1603,12 +1728,26 @@ pub fn ladder(git: &Git, gh: &Gh, t: &Ticket, main: &str,
         tr.push(trace(Method::None, "rev-parse --verify --quiet", 1, "absent", "unknown"));
         done!(Verdict::Unknown(Unknown::HeadNotInObjectStore { sha: head.as_str().into() }))
     }
-    // ── guard 0b: a fresh `start` branch is trivially an ancestor of main ─────
-    match git.commits_ahead(main, &head) {
-        Tri::Yes(0) => { tr.push(trace(Method::None, "rev-list --count", 0, "0", "not-merged"));
-                         done!(Verdict::Unknown(Unknown::ZeroCommitBranch)) }
-        Tri::Unknown(u) => done!(Verdict::Unknown(u)),
-        _ => {}
+    // ── guard 0b: a branch that never carried a commit is not "merged" ───────
+    //
+    // ROUND-B CORRECTION, keyed off PROVENANCE rather than reachability. The
+    // ordering above was unimplementable as written: after a TRUE merge the branch
+    // tip is reachable from main, so `rev-list --count main..head` is 0 for a real
+    // merge exactly as for a branch that never committed. Run before rung 1 the
+    // guard answers `unknown` for the one shape ancestry can prove; run after a
+    // NEGATIVE ancestry it can never fire at all, since count == 0 implies
+    // ancestry. The two cases are genuinely indistinguishable by reachability, so
+    // the guard fires only when the SHA came from a LIVE BRANCH TIP with no
+    // recorded `head:` — and `head:` is written by `ship` out of real git output,
+    // so its presence means the branch demonstrably carried work. See the ⚠ on
+    // `StartFacts` (§2.16): `plan_start` writing `head:` would re-break this.
+    if origin == HeadOrigin::BranchTip {
+        match git.commits_ahead(main, &head) {
+            Tri::Yes(0) => { tr.push(trace(Method::None, "rev-list --count", 0, "0", "unknown"));
+                             done!(Verdict::Unknown(Unknown::ZeroCommitBranch)) }
+            Tri::Unknown(u) => done!(Verdict::Unknown(u)),
+            _ => {}
+        }
     }
 
     // ── rung 1: ANCESTRY — exact for true merges and fast-forwards ────────────
@@ -1925,7 +2064,7 @@ round per wave; fewer than five should be needed across the build.
 | **2** | **S3 (ancestry rung + `cache.rs` first, then rungs 2–4)** and **S4 in parallel** | `scan_ladder.rs` all six shapes with exact `Method`, **two landing on `unknown`** · `proof_is_sealed.rs` · `transition_table.rs` (all 40 pairs) · `doctor_replay.rs` · `purity.rs` |
 | | *Ancestry moves this early on purpose: the `done` gate's primary path must be real from birth, or three milestones of dogfooding tune the UX against `scan --confirm` and wear the human override smooth.* | |
 | **3** | **S5** — the walking skeleton | `lifecycle.rs`: `new → ready → start --worktree → ship --pr → (REAL squash merge) → scan → done`, run **from inside a linked worktree**, asserting every write landed in the primary `.kanspec/` and the `## Log` replays clean. **Dogfooding starts here.** |
-| **4** | **S6 + S7 in parallel** | `invariants_rules.rs` byte-identity across N scopes on the real binary · `cache_wipe.rs` · `setup_hooks.rs` (`setup claude --remove` restores a pre-existing husky-style hook exactly; `core.hooksPath` honoured) |
+| **4** | **S6 + S7 in parallel** | `invariants_rules.rs` byte-identity across N scopes on the real binary · `cache_wipe.rs` · `setup_hooks.rs` (`setup claude --remove` restores a pre-existing husky-style hook exactly; `core.hooksPath` honoured) · **D-20 MUST BE WIRED HERE**: `cmd/scan.rs` carries a marked comment at the exact call site where `project::plan_regenerate` (S6's, `todo!()` through round B, so calling it would panic every `scan`) pushes its two `Op`s into the same transaction. Close it or the committed `KANSPEC-*.md` projections silently rot — the exact failure the projections exist to prevent — and add the test the corrections doc asks for: *a scan after a spec edit rewrites the root files*. |
 | **5** | **S8** — last, because it consumes every view and every `cmd::*` fn and adds no new semantics | `json_matrix.rs` · `board.rs` insta snapshots · manual: `up` with two SSE tabs open, **Ctrl-C exits in under a second**; a CLI `start` in another terminal refreshes the board; a POST and the equivalent CLI verb produce byte-identical files |
 | **6** | Release cut | `cargo-dist`; `init --refresh-hooks` against the dogfood repo; **one manual run against a real GitHub squash-merged PR** before the ladder is trusted |
 
@@ -1991,6 +2130,17 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-22 | Server snapshot freshness | `up` holds `Arc<Ctx>` and a `rev`-stamped memoized snapshot that `transact` **publishes synchronously** on write; the watcher only invalidates. A POST's own refetch can never see the pre-write snapshot. |
 | D-23 | SSE payload granularity | `{rev, n}` **only**; the SPA refetches `/api/board`. macOS FSEvents coalesces create+remove+modify for one delete, so any event-kind-derived delta is a bug farm. |
 | D-24 | `rusqlite` in v0.1 | Behind a **non-default** `ci-homerunner` feature until `ci.rs` lands. Bundled SQLite is the largest clean-build cost in the set for code v0.1 never calls. |
+
+### Round-B resolutions (integration of S3 + S4)
+
+| # | Question | Decision |
+|---|---|---|
+| D-25 | `Verdict::NotLanded` is effectively **unreachable** — rung 4's only non-merged outputs are `+` (`SquashSuspectedNoGh`) and an empty `cherry` (`ConflictingSignals`), and `git cherry` never yields `Tri::No`. So `ScanReport.not_landed` is always empty and every in-flight ticket badges `unknown`. | **Kept, deliberately.** This is R-4 arriving as predicted, and it is the honest answer: a `+` line cannot distinguish an unmerged branch from a multi-commit squash (D-3). The plausible narrowing — a `+` becomes a real `NotLanded` when `gh` DID answer and reported no merged PR for the branch — is **v0.2 at the earliest**, because it is wrong for a branch merged by hand with no PR, which is exactly the confident-wrong-answer invariant 2 forbids. `tests/common/merges.rs::Shape::expected()` was corrected in round B (it predicted `NotMerged` for `Never`); **two** of the six shapes land on `unknown`, matching §10's round-2 gate. |
+| D-26 | `doctor --fix` cannot strip a hand-edited derived key (`merged: true`), because removing it needs an op that NAMES the key and `keys::Key` deliberately has no such variant. Proposed: `Op::RemoveFields { entity, keys: Vec<String> }` over RAW key names. | **Rejected for v0.1 and v0.2.** That op is a hole straight through invariant 1's type-level defence — `Key` has no derived variant *precisely* so that no code path can name one — and it would be added to make a lint auto-fixable. The finding stays `fixable: false` and names the file and the line to delete, which is what invariant 9 actually asks for. R-2 already says the seals bind the tool and the Log binds the human; this is that boundary, working. |
+| D-27 | `doctor::check_frontmatter_writable` cannot run the real `fm::writable()` check: entities carry `body` (everything after the closing fence) but not the raw frontmatter TEXT. Proposed: add `fm_text: String` to all five entity structs. | **Deferred.** It touches `model.rs` (F) *and* `store.rs` (S1) *and* every entity literal in every slice's unit tests, mid-build, for a check the write path already enforces — `fm::set` hard-errors on a multi-line value before any byte moves. S4 implemented the pure subset visible from `extra` (unindexable keys, multi-line values) and documents exactly what it does and does not catch. Revisit with the v0.2 `doctor` cut. |
+| D-28 | `doctor::check_dead_globs` covers spec `code:` globs only, while its registry `about` promised quirk `paths:` and decision `scope:` too. | **`about` corrected to match reality** in round B. `cache::SpecAnchor.dead_globs` is the only glob liveness `scan` records; covering the other two needs a glob-liveness map in `GitState` (S3's `cache.rs`) — v0.2. A registry that promises more than it checks is worse than one that checks less. |
+| D-29 | `doctor::check_immutable_decisions` needs a git diff of an accepted decision's body against its last commit, which `RunCheck = fn(&Snapshot)` cannot do. | **Deferred, half implemented.** The record half (accepted **and** `superseded_by` set) is checked purely; the body-diff half needs `scan` to record a per-decision body hash. Do not move the check off the pure registry — `purity.rs` holds `doctor.rs` to `fn(&Snapshot)` on purpose, and a check that shells out is a second, slower, un-unit-testable copy of `scan`. |
+| D-30 | The in-main and settling dwells anchor on ticket **activity** (last log entry / last branch commit), not on when the work actually landed. | **Correct as built.** The cache records `checked_at` — when the ladder *ran* — not a merge date, and anchoring on `checked_at` would let `up`'s 60s scan loop reset the tripwire forever, making it unfireable. `derive.rs` has a test named for exactly that. If `scan` ever records a real merge timestamp, switch the in-main dwell to it. |
 
 ### Known limits carried forward, stated out loud
 

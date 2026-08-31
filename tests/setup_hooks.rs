@@ -132,8 +132,14 @@ fn init_is_idempotent_and_never_clobbers_an_edit() {
     repo.ks(["init"]).ok();
 
     // Everything a user might have touched by hand.
-    repo.write(".kanspec/config.toml", "port = 6001\nmain = \"origin/trunk\"\n");
-    repo.write(".gitattributes", "*.png binary\n.kanspec/proposals/**/comments.jsonl merge=union\n");
+    repo.write(
+        ".kanspec/config.toml",
+        "port = 6001\nmain = \"origin/trunk\"\n",
+    );
+    repo.write(
+        ".gitattributes",
+        "*.png binary\n.kanspec/proposals/**/comments.jsonl merge=union\n",
+    );
     repo.write(".kanspec/tickets/t-aaaa.md", "---\nid: t-aaaa\n---\nbody\n");
 
     let r = repo.ks(["init"]).ok();
@@ -171,7 +177,10 @@ fn init_appends_the_union_line_to_a_gitattributes_it_did_not_write() {
 fn init_refuses_to_claim_a_projection_path_that_already_exists_ungenerated() {
     let repo = TestRepo::new();
     without_store(&repo);
-    repo.write("KANSPEC-FEATURES.md", "# our own hand-written feature list\n");
+    repo.write(
+        "KANSPEC-FEATURES.md",
+        "# our own hand-written feature list\n",
+    );
 
     let r = repo.ks(["init"]);
     assert_eq!(r.code, 1, "stdout: {}\nstderr: {}", r.stdout, r.stderr);
@@ -229,7 +238,12 @@ fn init_installs_every_hook_executable_and_identifiable() {
     without_store(&repo);
     repo.ks(["init"]).ok();
 
-    for hook in ["post-merge", "post-checkout", "prepare-commit-msg", "commit-msg"] {
+    for hook in [
+        "post-merge",
+        "post-checkout",
+        "prepare-commit-msg",
+        "commit-msg",
+    ] {
         let p = hook_path(&repo, hook);
         let body = read(&p);
         assert!(body.starts_with("#!/bin/sh\n"), "{hook} has no shebang");
@@ -253,7 +267,11 @@ fn a_pre_existing_hook_survives_install_and_is_restored_exactly_by_remove() {
     repo.ks(["setup", "claude"]).ok();
 
     let displaced = repo.root.join(".git/hooks/post-merge.d/10-post-merge");
-    assert_eq!(read(&displaced), HUSKY, "the foreign hook was not preserved");
+    assert_eq!(
+        read(&displaced),
+        HUSKY,
+        "the foreign hook was not preserved"
+    );
     assert!(
         read(&hook).contains("kanspec-managed hook"),
         "kanspec did not take the entrypoint"
@@ -267,7 +285,11 @@ fn a_pre_existing_hook_survives_install_and_is_restored_exactly_by_remove() {
 
     repo.ks(["setup", "claude", "--remove"]).ok();
 
-    assert_eq!(read(&hook), HUSKY, "--remove did not restore it byte for byte");
+    assert_eq!(
+        read(&hook),
+        HUSKY,
+        "--remove did not restore it byte for byte"
+    );
     assert!(
         !repo.root.join(".git/hooks/post-merge.d").exists(),
         "the .d/ directory should be gone once it is empty"
@@ -288,7 +310,10 @@ fn the_displaced_hook_runs_first_and_its_exit_code_wins() {
     write_exec(
         &hook,
         // Builtins only, so this proves the dispatcher and nothing about the environment.
-        &format!("#!/bin/sh\n: > {}\nexit 0\n", shell_quote(&marker.to_string_lossy())),
+        &format!(
+            "#!/bin/sh\n: > {}\nexit 0\n",
+            shell_quote(&marker.to_string_lossy())
+        ),
     );
     repo.ks(["init"]).ok();
 
@@ -420,7 +445,10 @@ fn the_trailer_hook_stamps_a_ticket_branch_and_nothing_else() {
     repo.write("README.md", "# fixture\n\nmore\n");
     repo.commit("unrelated");
     let msg = repo.git(&["log", "-1", "--format=%B"]);
-    assert!(!msg.contains("Kanspec:"), "stamped a branch with no ticket:\n{msg}");
+    assert!(
+        !msg.contains("Kanspec:"),
+        "stamped a branch with no ticket:\n{msg}"
+    );
 }
 
 #[test]
@@ -468,7 +496,11 @@ fn setup_claude_installs_the_snippet_and_removes_it_byte_exactly() {
     assert_eq!(repo.read("CLAUDE.md"), text, "a second setup stacked up");
 
     repo.ks(["setup", "claude", "--remove"]).ok();
-    assert_eq!(repo.read("CLAUDE.md"), original, "--remove is not byte-exact");
+    assert_eq!(
+        repo.read("CLAUDE.md"),
+        original,
+        "--remove is not byte-exact"
+    );
 }
 
 #[test]
@@ -511,9 +543,15 @@ fn settings_json_merge_preserves_foreign_hooks() {
 
     let v: serde_json::Value = serde_json::from_str(&repo.read(".claude/settings.json")).unwrap();
     assert_eq!(v["permissions"]["allow"][0], "Bash(git:*)");
-    assert_eq!(v["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "guard.sh");
+    assert_eq!(
+        v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "guard.sh"
+    );
     let session = v["hooks"]["SessionStart"][0]["hooks"].as_array().unwrap();
-    assert_eq!(session[0]["command"], "echo mine", "the foreign hook was clobbered");
+    assert_eq!(
+        session[0]["command"], "echo mine",
+        "the foreign hook was clobbered"
+    );
     assert!(
         session.iter().any(|h| h["command"] == "kanspec prime"),
         "ours never landed: {session:?}"
@@ -530,7 +568,8 @@ fn settings_json_merge_preserves_foreign_hooks() {
     );
 
     repo.ks(["setup", "claude", "--remove"]).ok();
-    let back: serde_json::Value = serde_json::from_str(&repo.read(".claude/settings.json")).unwrap();
+    let back: serde_json::Value =
+        serde_json::from_str(&repo.read(".claude/settings.json")).unwrap();
     let want: serde_json::Value = serde_json::from_str(foreign).unwrap();
     assert_eq!(back, want, "--remove did not restore the user's settings");
 }
@@ -604,7 +643,11 @@ fn completions_print_a_script_and_nothing_else() {
     let repo = TestRepo::new();
     let r = repo.ks(["completions", "bash"]).ok();
     assert!(r.stdout.contains("kanspec"), "{}", r.stdout);
-    assert!(!r.stdout.contains('→'), "a script must be pipeable: {}", r.stdout);
+    assert!(
+        !r.stdout.contains('→'),
+        "a script must be pipeable: {}",
+        r.stdout
+    );
 }
 
 fn shell_quote(s: &str) -> String {

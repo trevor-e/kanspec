@@ -470,7 +470,11 @@ mod tests {
 
     #[test]
     fn a_displaced_hook_runs_before_ours_and_its_exit_code_wins() {
-        let s = dispatcher_script("post-merge", &action_for("post-merge", "kanspec"), "kanspec");
+        let s = dispatcher_script(
+            "post-merge",
+            &action_for("post-merge", "kanspec"),
+            "kanspec",
+        );
         let loop_at = s.find("for ks_hook").expect("the .d/ loop");
         let action_at = s.find("scan --quiet").expect("the kanspec action");
         assert!(loop_at < action_at, "ours must run last");
@@ -487,7 +491,10 @@ mod tests {
             assert!(!a.contains("scan"), "{hook}");
             assert!(a.contains("Kanspec: $ks_ticket"), "{hook}");
             // Already stamped -> nothing to do, which is what lets both hooks exist.
-            assert!(a.contains(r#"grep -q "^Kanspec: $ks_ticket$" "$1""#), "{hook}");
+            assert!(
+                a.contains(r#"grep -q "^Kanspec: $ks_ticket$" "$1""#),
+                "{hook}"
+            );
         }
         assert!(action_for("prepare-commit-msg", "kanspec")
             .contains(r#"case "${2:-}" in merge|squash|commit) exit 0 ;; esac"#));
