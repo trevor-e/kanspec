@@ -988,3 +988,179 @@ fn start_moves_the_primary_onto_the_branch_only_when_the_source_tree_is_clean() 
         "when it does not switch, it must say how — {next:?}"
     );
 }
+
+/// ROUND-D REGRESSION — **the `git add -A` wedge**, hit unprompted by an adversarial
+/// auditor on a first scripted run.
+///
+/// `start` without `--worktree` leaves the PRIMARY worktree — the tree that owns
+/// `.kanspec/` — standing on the ticket branch. Under `sync = "batch"` (the default, D-13)
+/// the tracker is *meant* to be dirty there, so the near-universal
+/// `git add -A && git commit` sweeps `.kanspec/tickets/t-xxxx.md` onto the feature branch.
+/// The next verb re-dirties that file, and from then on `git checkout main` refuses:
+///
+/// ```text
+/// error: Your local changes to the following files would be overwritten by checkout:
+///         .kanspec/tickets/t-c7ec.md
+/// ```
+///
+/// As shipped, every kanspec surface said all was well — `doctor` 13/13, `status` "nothing
+/// owed" — while the agent could not move. Worse, the one remediation `status` DID print
+/// (`git add -A .kanspec && git commit`) commits the ship record onto the feature branch,
+/// where main never sees it: following kanspec's own advice deepened the hole.
+///
+/// kanspec does not own the user's git commands, so this cannot be prevented outright. The
+/// contract this test pins is the three things it CAN do: say so at claim time, see the
+/// wedge afterwards, and name a recovery that genuinely undoes it — which the test proves by
+/// running the printed command verbatim rather than by reading it.
+#[test]
+fn the_git_add_dash_a_wedge_is_visible_and_the_printed_recovery_undoes_it() {
+    let repo = TestRepo::new();
+    let root = repo.root.clone();
+
+    // ── claim WITHOUT --worktree: the primary itself moves onto the branch ────
+    let t = json_in(&repo, &root, &["new", "Rate-limit login endpoint"]);
+    let id = t["id"].as_str().expect("an id").to_string();
+    let ticket = format!(".kanspec/tickets/{id}.md");
+    // The ordinary rhythm: the tracker is committed to main between verbs, so main's board
+    // holds `todo` and the branch is what drifts away from it.
+    repo.commit("kanspec: sync the tracker, as a real repo does");
+    repo.push("main");
+
+    let started = json_in(&repo, &root, &["start", &id]);
+    let branch = started["branch"].as_str().expect("a branch").to_string();
+    assert_eq!(started["checked_out"], Value::Bool(true), "{started}");
+
+    // PREVENT: one line, at claim time, naming the hazard and the alternative.
+    let note = started["tracker_note"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a --worktree-less claim must name the hazard: {started}"));
+    assert!(
+        note.contains("git add -A") && note.contains("--worktree"),
+        "the notice has to name the command that causes it and the flag that avoids it: {note}"
+    );
+
+    // NO FALSE POSITIVE. A merely-dirty tracker is the resting state of `sync = "batch"`:
+    // the ticket file is still byte-identical to main's, `git switch` carries it across, and
+    // a warning here would be noise on every single claim.
+    let quiet = json_in(&repo, &root, &["status"]);
+    assert!(
+        quiet["tracker_drift"].is_null(),
+        "a freshly claimed branch has drifted nowhere yet: {quiet}"
+    );
+    assert!(
+        repo.git_try(&["checkout", "main"]).0 == 0,
+        "and it proves it"
+    );
+    repo.git(&["checkout", &branch]);
+
+    // ── the agent runs the near-universal commit, sweeping the tracker along ──
+    write_at(
+        &root,
+        "src/auth/limit.ts",
+        "export const limit = () => {};\n",
+    );
+    repo.git(&["add", "-A"]);
+    repo.git(&["commit", "--quiet", "-m", "feat: rate limit login"]);
+
+    // ── any further verb re-dirties the swept file ───────────────────────────
+    json_in(&repo, &root, &["ship", &id, "--pr", "7"]);
+
+    // ── THE WEDGE, with real git and no mocking ──────────────────────────────
+    let (code, _, err) = repo.git_try(&["checkout", "main"]);
+    assert_ne!(
+        code, 0,
+        "the wedge must actually reproduce, or this proves nothing"
+    );
+    assert!(
+        err.contains("would be overwritten by checkout") && err.contains(&ticket),
+        "{err}"
+    );
+
+    // ── DETECT ───────────────────────────────────────────────────────────────
+    let st = json_in(&repo, &root, &["status"]);
+    let drift = &st["tracker_drift"];
+    assert!(
+        !drift.is_null(),
+        "status was cheerfully silent while the working tree was wedged: {st}"
+    );
+    assert_eq!(drift["branch"], Value::String(branch.clone()));
+    assert_eq!(
+        drift["main"], "main",
+        "`main = \"origin/main\"` is a REMOTE ref — a fix that pasted it into `git switch` \
+         would detach HEAD and hand the user a second wedge: {drift}"
+    );
+    assert_eq!(drift["blocking"][0], Value::String(ticket.clone()));
+    assert_eq!(drift["committed"][0], Value::String(ticket.clone()));
+
+    let fix = str_at(drift, "fix").to_string();
+    assert_eq!(
+        st["next"][0],
+        Value::String(fix.clone()),
+        "no ticket verb can run until the checkout works, so the recovery leads: {st}"
+    );
+
+    let human = repo.ks(["status"]).stdout;
+    assert!(
+        human.contains("is blocked") && human.contains(&branch),
+        "the human surface has to say it too: {human}"
+    );
+    assert!(
+        !human.contains("nothing owed"),
+        "\"nothing owed\" printed above a wedged tree is the exact silence this ends: {human}"
+    );
+    assert!(
+        !human.contains("tracker changes pending"),
+        "the batch reminder's advice commits the ship record onto the feature branch — under \
+         drift it must be REPLACED, not printed alongside: {human}"
+    );
+
+    // ── RECOVER: run what was printed, verbatim, and require that it works ────
+    let ran = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&fix)
+        .current_dir(&root)
+        .output()
+        .expect("sh runs");
+    assert!(
+        ran.status.success(),
+        "the named recovery must actually run:\n{}\n{}",
+        String::from_utf8_lossy(&ran.stdout),
+        String::from_utf8_lossy(&ran.stderr)
+    );
+
+    assert_eq!(
+        repo.git(&["branch", "--show-current"]).trim(),
+        "main",
+        "the checkout that was refused is the thing the fix had to deliver"
+    );
+    assert!(
+        repo.git(&["status", "--porcelain"]).trim().is_empty(),
+        "and it leaves no rubble behind"
+    );
+    // The whole point of getting to main: main's board can now see the ship record.
+    let on_main = repo.read(&ticket);
+    assert!(
+        on_main.contains("state: review") && on_main.contains("pr: 7"),
+        "the ship record has to survive the move, not be traded for a clean checkout:\n{on_main}"
+    );
+    let after = json_in(&repo, &root, &["status"]);
+    assert!(after["tracker_drift"].is_null(), "{after}");
+    assert_eq!(after["pending_changes"], 0, "{after}");
+    // And the work is not stranded: the ticket branch is checkoutable again.
+    assert_eq!(repo.git_try(&["checkout", &branch]).0, 0);
+    repo.git(&["checkout", "main"]);
+
+    // ── the arrangement that never wedges says nothing at all ────────────────
+    let w = json_in(&repo, &root, &["new", "Second ticket"]);
+    let w_id = w["id"].as_str().expect("an id").to_string();
+    let claimed = json_in(&repo, &root, &["start", &w_id, "--worktree"]);
+    assert!(
+        claimed["tracker_note"].is_null(),
+        "`--worktree` leaves the primary on main; there is no hazard to warn about: {claimed}"
+    );
+    let still = json_in(&repo, &root, &["status"]);
+    assert!(
+        still["tracker_drift"].is_null(),
+        "the primary never left main, so nothing drifted: {still}"
+    );
+}
