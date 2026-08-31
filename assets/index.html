@@ -1,6 +1,51 @@
 <!doctype html>
+<html lang="en">
+<head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>kanspec</title>
 <link rel="stylesheet" href="/style.css">
-<div id="app">loading…</div>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='14'>◈</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">
+    <span class="mark">◈</span>
+    <span class="name">kanspec</span>
+  </div>
+
+  <nav class="tabs" id="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="all" aria-selected="true">All tasks</button>
+    <button class="tab" role="tab" data-tab="spec" aria-selected="false">By spec</button>
+    <button class="tab" role="tab" data-tab="worktrees" aria-selected="false">Worktrees</button>
+    <button class="tab" role="tab" data-tab="rules" aria-selected="false">Rules</button>
+  </nav>
+
+  <div class="top-right">
+    <button class="pill ghost" id="rescan" title="run merge detection now">scan</button>
+    <span class="pill" id="cache-age" title="every merge badge was computed from the cache">—</span>
+    <span class="live" id="live" title="live updates"><i></i><span id="live-text">connecting</span></span>
+    <button class="icon" id="theme" title="light / dark" aria-label="toggle theme">◐</button>
+  </div>
+</header>
+
+<!-- Pinned strip, top: the `kanspec status` attention list. -->
+<section class="strip attention" id="attention" hidden></section>
+
+<main id="main" aria-live="polite">
+  <div class="loading">loading the board…</div>
+</main>
+
+<!-- Pinned strip, bottom: the feature map with staleness dots. -->
+<footer class="strip features" id="features" hidden></footer>
+
+<!-- One ticket, opened by a click or by a /t/<id> deep link. -->
+<aside class="drawer" id="drawer" hidden aria-label="ticket detail"></aside>
+<div class="scrim" id="scrim" hidden></div>
+
+<div class="toasts" id="toasts" aria-live="assertive"></div>
+
 <script src="/app.js"></script>
+</body>
+</html>
