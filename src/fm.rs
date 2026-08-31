@@ -240,6 +240,17 @@ pub enum Yv {
     Int(i64),
     Str(String),
     List(Vec<Yv>),
+    /// A one-line FLOW mapping — `{sha: a1b9c3d, at: 2026-08-31T12:00:00Z, …}`.
+    ///
+    /// ADDED BY S6 (reported as a request to F). `spec.stale_ack` is the one v0.1 field
+    /// whose type is a struct, and `SpecKey::StaleAck` + `model::StaleAck` were both in the
+    /// frozen contract with no `Yv` able to express their value: every other spelling
+    /// (`Yv::Str` of `"{…}"`, a flow sequence) comes back from `serde_yaml_ng` as a scalar
+    /// or a sequence and fails to deserialize into `StaleAck`, which would make the whole
+    /// spec unreadable. Flow style — never a block map — keeps the value on ONE line, so
+    /// `index` reports `multiline: false` and a second `features --confirm` is an ordinary
+    /// `SetOutcome::Replaced` rather than R-9's hard refusal.
+    Map(Vec<(String, Yv)>),
 }
 
 impl Yv {
@@ -360,6 +371,15 @@ pub fn emit(v: &Yv, flow: bool) -> String {
         Yv::List(items) => {
             let inner: Vec<String> = items.iter().map(|i| emit(i, true)).collect();
             format!("[{}]", inner.join(", "))
+        }
+        Yv::Map(entries) => {
+            let inner: Vec<String> = entries
+                .iter()
+                // Every VALUE is emitted in flow context, so a `,` `{` or `}` inside one is
+                // quoted rather than ending the mapping.
+                .map(|(k, v)| format!("{k}: {}", emit(v, true)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
         }
     }
 }

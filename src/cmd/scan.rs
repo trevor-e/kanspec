@@ -136,11 +136,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
 
     // A SHORT transaction, holding the lock only for the write itself. `ScanToken` is what
     // makes "gitstate.json is written by scan and nothing else" a type fact.
-    //
-    // NOTE (D-20, reported): the `KANSPEC-FEATURES.md` / `KANSPEC-ARCHITECTURE.md`
-    // regeneration belongs in this same plan — `project::plan_regenerate` is S6's and is
-    // still `todo!()`, so wiring it now would panic every `scan`. It is two pushed `Op`s
-    // when S6 lands.
     Store::open(ctx).transact(
         // `Verb` is a TICKET transition verb and a scan transitions nothing; it reaches
         // only the `sync = "commit"` message. `Confirm` is the table's own "non-transition,
@@ -150,6 +145,15 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
         &ctx.invocation(),
         move |_s, _m| Ok(Plan::of(vec![Op::WriteGitState { token, state }])),
     )?;
+
+    // D-20, wired by S6 (the one line S6 writes in this file). The committed
+    // `KANSPEC-FEATURES.md` / `KANSPEC-ARCHITECTURE.md` projections are rewritten from the
+    // state this scan just produced — a *second* transaction, deliberately, because the
+    // `Fresh?` column is computed from the very `GitState` the plan above wrote and a
+    // planner only ever sees the snapshot as it was BEFORE its own plan. Regenerating
+    // inside that closure would publish a feature map exactly one scan out of date, for
+    // ever. See `project::regenerate`.
+    crate::project::regenerate(ctx)?;
     Ok(report)
 }
 

@@ -5,18 +5,22 @@
 //! safe to put in plain sight. Regenerated on `scan`, and on any `transact` that touched a
 //! spec or a decision (D-20), through `Op::WriteGenerated` inside the same lock.
 //!
+//! **Nothing rendered here reads a clock.** DESIGN.md's mock-up carries a "regenerated
+//! <date>" line; it is deliberately absent, because these two files are *committed*. A
+//! timestamp would make every `scan` — which the `post-merge` and `post-checkout` hooks run
+//! on every checkout — produce a one-line git diff, and a projection that dirties the tree
+//! on every checkout is one a human deletes from their repo within a week. Rendered purely
+//! from the snapshot, an unchanged corpus rewrites byte-identical bytes and `git status`
+//! stays silent.
+//!
 //! Owner: **S6**.
-
-// Wave-0 skeleton. The bodies below are `todo!("S6: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by S6 when the bodies land.
-#![allow(unused_variables, dead_code)]
 
 use serde::Serialize;
 
-use crate::derive::Staleness;
+use crate::derive::{self, Staleness};
 use crate::error::Result;
 use crate::ids::SpecName;
-use crate::model::Snapshot;
+use crate::model::{DecisionStatus, QuirkStatus, Severity, Snapshot};
 use crate::paths::Layout;
 use crate::plan::Op;
 
@@ -35,20 +39,202 @@ pub struct FeatureRow {
 
 /// The `KANSPEC-FEATURES.md` table, and the same rows `features --json` prints.
 pub fn feature_rows(s: &Snapshot) -> Vec<FeatureRow> {
-    todo!("S6: one row per spec — frontmatter feature + code globs + the last proposal that shipped a change + derive::staleness")
+    s.specs
+        .values()
+        .map(|spec| FeatureRow {
+            feature: spec.fm.feature.clone(),
+            spec: spec.name.clone(),
+            code: spec.fm.code.clone(),
+            // "the last proposal that shipped a change to this spec" — read off the
+            // `{p-xxxx}` provenance tokens the implementing branch wrote into the rule
+            // bullets. There is no second ledger to disagree with them.
+            last_shipped: spec
+                .rules
+                .iter()
+                .rev()
+                .find_map(|r| r.provenance.last())
+                .map(|p| p.to_string()),
+            staleness: derive::staleness(s, spec),
+        })
+        .collect()
 }
 
 pub fn render_features(rows: &[FeatureRow]) -> String {
-    todo!("S6: GENERATED_HEADER + the DESIGN.md feature-map table")
+    let mut o = String::new();
+    o.push_str(GENERATED_HEADER);
+    o.push_str("\n# Feature map\n\n");
+    if rows.is_empty() {
+        o.push_str("No specs yet — `kanspec spec new <name> --code \"src/**\"`.\n");
+        return o;
+    }
+    o.push_str("| Feature | Spec | Code | Last shipped change | Fresh? |\n");
+    o.push_str("|---|---|---|---|---|\n");
+    for r in rows {
+        o.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            cell(&r.feature),
+            r.spec,
+            if r.code.is_empty() {
+                "—".to_string()
+            } else {
+                cell(&r.code.join(", "))
+            },
+            r.last_shipped.as_deref().unwrap_or("—"),
+            fresh_cell(&r.staleness),
+        ));
+    }
+    o
+}
+
+/// The one wording for a staleness verdict, shared by the projection, `features` and the
+/// `spec show` footer — so the table, the terminal and the board cannot disagree.
+pub fn fresh_cell(s: &Staleness) -> String {
+    match s {
+        Staleness::Ok => "ok".to_string(),
+        Staleness::Stale { merges, .. } => format!("STALE: {merges} merges since"),
+        Staleness::DeadGlobs { globs } => format!("dead globs: {}", globs.join(", ")),
+        Staleness::NeverScanned => "never scanned".to_string(),
+    }
 }
 
 pub fn render_architecture(s: &Snapshot) -> String {
-    todo!("S6: GENERATED_HEADER + accepted decisions with scope and provenance, plus active landmine quirks")
+    let mut o = String::new();
+    o.push_str(GENERATED_HEADER);
+    o.push_str("\n# Architecture decisions\n\n");
+
+    let accepted: Vec<_> = s
+        .decisions
+        .values()
+        .filter(|d| d.fm.status == DecisionStatus::Accepted)
+        .collect();
+    o.push_str(&format!("## Accepted decisions ({})\n", accepted.len()));
+    if accepted.is_empty() {
+        o.push_str("\nNone yet — `kanspec decide \"...\"` proposes one; a human accepts it.\n");
+    }
+    for d in &accepted {
+        o.push_str(&format!("\n### {} — {}\n", d.fm.id, d.fm.title));
+        o.push_str(&format!("\n- accepted {}\n", d.fm.date));
+        if let Some(src) = &d.fm.source {
+            o.push_str(&format!("- source: {src}\n"));
+        }
+        if !d.scope.is_empty() {
+            o.push_str(&format!(
+                "- scope: {}\n",
+                d.scope
+                    .iter()
+                    .map(|g| format!("`{g}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(sup) = &d.fm.supersedes {
+            o.push_str(&format!("- supersedes: {sup}\n"));
+        }
+        let body = d.body.trim_matches(['\n', '\r']).trim_end();
+        if !body.is_empty() {
+            o.push('\n');
+            o.push_str(&demote(body));
+            o.push('\n');
+        }
+    }
+
+    // Landmine-grade quirks ride along: a teammate reading the architecture page needs to
+    // know what will bite them, and it is the same registry `prime` injects path-scoped.
+    let mines: Vec<_> = s
+        .quirks
+        .values()
+        .filter(|q| q.fm.status == QuirkStatus::Active && q.fm.severity == Severity::Landmine)
+        .collect();
+    o.push_str(&format!("\n## Landmines ({})\n\n", mines.len()));
+    if mines.is_empty() {
+        o.push_str("None recorded.\n");
+    }
+    for q in &mines {
+        o.push_str(&format!(
+            "- **{}** {} — {}{}\n",
+            q.fm.id,
+            q.fm.title,
+            if q.fm.paths.is_empty() {
+                "everywhere".to_string()
+            } else {
+                q.fm.paths
+                    .iter()
+                    .map(|g| format!("`{g}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            },
+            q.fm.source
+                .as_ref()
+                .map(|t| format!(" (learned in {t})"))
+                .unwrap_or_default(),
+        ));
+    }
+    o
 }
 
 /// Both projections as ops, so regeneration rides the ordinary write path.
+///
+/// D-20: every caller that changes a spec, a decision or a quirk pushes these into its OWN
+/// plan, so the projections are rewritten inside the same lock that changed their source.
+/// No caller may regenerate in a second transaction — that is the window in which the two
+/// disagree.
 pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
-    todo!("S6: two Op::WriteGenerated, one per projection path from [paths]")
+    Ok(vec![
+        Op::WriteGenerated {
+            path: layout.features_md().to_path_buf(),
+            contents: render_features(&feature_rows(s)),
+        },
+        Op::WriteGenerated {
+            path: layout.architecture_md().to_path_buf(),
+            contents: render_architecture(s),
+        },
+    ])
+}
+
+/// Rewrite both projections from whatever is on disk **now**.
+///
+/// D-20 asks for regeneration "inside the same lock" as the write that changed a spec or a
+/// decision. This deliberately runs as its own short transaction immediately after that
+/// write, for a reason the D-20 wording did not anticipate: a planner receives the
+/// snapshot as it was **before** its own plan applies. Regenerating from that snapshot
+/// would leave `KANSPEC-FEATURES.md` permanently one write behind — a brand-new spec would
+/// be missing from the table until some *later* verb happened to run — which is precisely
+/// the silent rot the projections exist to prevent. `Store::transact` reloads a fresh
+/// snapshot inside the lock, so a second transaction sees the write that just landed.
+///
+/// The cost is R-1's window, one lock cycle wide: a crash between the two leaves the
+/// projections one write stale, and the next verb or `scan` heals it. Being briefly stale
+/// after a crash is recoverable; being permanently stale by construction is not.
+/// Nothing is written when nothing changed. `scan` runs from the `post-merge` and
+/// `post-checkout` hooks, i.e. on every checkout: rewriting two identical files each time
+/// would take the advisory lock, bump `Snapshot::rev` and push an SSE frame at every open
+/// browser tab, for no change anyone can see.
+pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<()> {
+    let want = plan_regenerate(&ctx.snapshot()?, &ctx.layout)?;
+    if want.iter().all(unchanged) {
+        return Ok(());
+    }
+    crate::store::Store::open(ctx).transact(
+        // A projection rewrite transitions no ticket; `Confirm` is the transition table's
+        // own "non-transition, recorded" verb and reaches only the `sync = "commit"`
+        // message (the same reason `cmd/scan.rs` passes it).
+        crate::transitions::Verb::Confirm,
+        &ctx.invocation(),
+        // Re-planned against the FRESH in-lock snapshot, never against the one read above:
+        // that read happened without exclusivity, and trusting it is the TOCTOU
+        // `Store::transact` reloads to avoid.
+        |s, _m| Ok(crate::plan::Plan::of(plan_regenerate(s, &ctx.layout)?)),
+    )?;
+    Ok(())
+}
+
+fn unchanged(op: &Op) -> bool {
+    match op {
+        Op::WriteGenerated { path, contents } => {
+            std::fs::read_to_string(path).is_ok_and(|on_disk| &on_disk == contents)
+        }
+        _ => false,
+    }
 }
 
 /// `init` refuses to claim a path that already exists un-generated.
@@ -56,13 +242,160 @@ pub fn is_ours(text: &str) -> bool {
     text.trim_start().starts_with(GENERATED_HEADER)
 }
 
+/// A markdown table cell: a literal `|` would end the column, and a newline would end the
+/// row. Both are reachable from a `feature:` one-liner a human typed.
+fn cell(s: &str) -> String {
+    s.replace('|', "\\|").replace(['\n', '\r'], " ")
+}
+
+/// A decision body is MADR-minimal — `## Context` / `## Decision` / `## Consequences` — and
+/// it is embedded here under an `###` record heading. Left alone, its `##` headings would
+/// un-nest the record they belong to and the page's own `## Landmines` section would read
+/// as part of the last decision. Two levels down keeps the outline true.
+fn demote(body: &str) -> String {
+    body.lines()
+        .map(|l| {
+            if l.starts_with("##") {
+                format!("##{l}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::ids::{DecisionId, ProposalId, QuirkId, TicketId};
+    use crate::model::{Decision, DecisionFm, Quirk, QuirkFm, Rule, Spec, SpecFm};
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use std::collections::BTreeMap;
+
+    fn snap() -> Snapshot {
+        Snapshot::empty(
+            Config::default(),
+            Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap(),
+        )
+    }
+
+    fn spec(name: &str) -> Spec {
+        Spec {
+            name: SpecName::parse(name).unwrap(),
+            fm: SpecFm {
+                feature: "Login | lockout".into(),
+                code: vec!["src/auth/**".into()],
+                stale_ack: None,
+                extra: BTreeMap::new(),
+            },
+            path: "x".into(),
+            body: String::new(),
+            rules: vec![Rule {
+                anchor: "auth.lockout".into(),
+                text: "5 failed logins lock the account.".into(),
+                provenance: vec![ProposalId::parse("p-7de2").unwrap()],
+                line: 1,
+            }],
+        }
+    }
 
     #[test]
     fn a_hand_written_file_is_not_ours_to_overwrite() {
         assert!(is_ours(&format!("{GENERATED_HEADER}\n# Feature map\n")));
         assert!(!is_ours("# Our own FEATURES.md\n"));
+    }
+
+    #[test]
+    fn both_projections_wear_the_header_that_stops_hand_edits() {
+        let mut s = snap();
+        let sp = spec("auth");
+        s.specs.insert(sp.name.clone(), sp);
+        assert!(is_ours(&render_features(&feature_rows(&s))));
+        assert!(is_ours(&render_architecture(&s)));
+    }
+
+    #[test]
+    fn a_pipe_in_a_feature_one_liner_cannot_break_the_table() {
+        let mut s = snap();
+        let sp = spec("auth");
+        s.specs.insert(sp.name.clone(), sp);
+        let md = render_features(&feature_rows(&s));
+        let row = md
+            .lines()
+            .find(|l| l.contains("auth"))
+            .expect("the auth row");
+        assert_eq!(row.matches('|').count() - row.matches("\\|").count(), 6);
+    }
+
+    #[test]
+    fn regeneration_is_byte_stable_so_a_scan_does_not_dirty_the_tree() {
+        let mut s = snap();
+        let sp = spec("auth");
+        s.specs.insert(sp.name.clone(), sp);
+        // No clock, no env, no ordering surprise: the same corpus renders the same bytes,
+        // which is what keeps the committed projections out of every checkout's diff.
+        assert_eq!(
+            render_features(&feature_rows(&s)),
+            render_features(&feature_rows(&s))
+        );
+        assert_eq!(render_architecture(&s), render_architecture(&s));
+    }
+
+    #[test]
+    fn only_accepted_decisions_and_active_landmines_reach_the_architecture_page() {
+        let mut s = snap();
+        for (id, status) in [
+            ("D-8c1a", DecisionStatus::Accepted),
+            ("D-2c77", DecisionStatus::Proposed),
+            ("D-3d88", DecisionStatus::Revoked),
+        ] {
+            let d = Decision {
+                fm: DecisionFm {
+                    id: DecisionId::parse(id).unwrap(),
+                    title: format!("decision {id}"),
+                    status,
+                    date: NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+                    source: Some("p-7de2#p1".into()),
+                    scope: vec!["src/auth/**".into()],
+                    supersedes: None,
+                    superseded_by: None,
+                    extra: BTreeMap::new(),
+                },
+                path: "x".into(),
+                body: "## Decision\nRedis.\n".into(),
+                scope: vec!["src/auth/**".into()],
+            };
+            s.decisions.insert(d.fm.id.clone(), d);
+        }
+        for (id, sev, st) in [
+            ("q-11ba", Severity::Landmine, QuirkStatus::Active),
+            ("q-22cd", Severity::Gotcha, QuirkStatus::Active),
+            ("q-33ef", Severity::Landmine, QuirkStatus::Fixed),
+        ] {
+            let q = Quirk {
+                fm: QuirkFm {
+                    id: QuirkId::parse(id).unwrap(),
+                    title: format!("quirk {id}"),
+                    paths: vec!["src/billing/**".into()],
+                    severity: sev,
+                    status: st,
+                    source: Some(TicketId::parse("t-8812").unwrap()),
+                    fixed_by: None,
+                    extra: BTreeMap::new(),
+                },
+                path: "x".into(),
+                body: String::new(),
+            };
+            s.quirks.insert(q.fm.id.clone(), q);
+        }
+        let md = render_architecture(&s);
+        assert!(md.contains("D-8c1a"));
+        assert!(!md.contains("D-2c77"), "proposed is not architecture");
+        assert!(!md.contains("D-3d88"), "revoked is not architecture");
+        assert!(md.contains("q-11ba"));
+        assert!(!md.contains("q-22cd"), "only landmine-grade rides along");
+        assert!(!md.contains("q-33ef"), "a fixed quirk is retired");
     }
 }
