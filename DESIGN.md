@@ -44,7 +44,7 @@ kanspec is a single static binary that turns a `.kanspec/` directory of plain fi
 7. **Comments travel browser → localhost POST → in-repo JSONL → `--json` CLI read.** Never a clipboard hop; never server-only memory.
 8. **Agents never self-accept standing rules.** Promotion mints a *proposed* decision; only the human accepts.
 9. **Every anomaly names its one-command fix**, and the anomaly list is injected into agent sessions, so drift self-heals.
-10. **Every state change appends to a per-ticket transition log with actor + verb**, so `kanspec doctor` mechanically proves every state was reached legally — a hand-edited frontmatter field has no matching log entry and fails CI.
+10. **Every state change appends to a per-ticket transition log with actor + verb**, so `kanspec doctor` mechanically proves every state was reached legally — a hand-edited frontmatter field has no matching log entry and fails CI. The single exception is `kanspec repair` (see *Ticket lifecycle → Repairing a broken trail*): a recorded human attestation whose logged state is authoritative, so an imported or hand-broken repo is recoverable instead of permanently unwritable. It is bounded on both sides — it cannot attest a `done` the merge gate never granted, and every state it does attest stays visibly *attested* on `ls`, the board, `show` and `doctor` — so a vouched-for state never quietly ages into a proven one.
 
 ---
 
@@ -241,6 +241,9 @@ TICKETS
   kanspec drop <id> --why "..."       any -> dropped
   kanspec show <id> | kanspec log <id> | kanspec where     (`where` = which ticket owns this branch/worktree)
   kanspec ls [--spec S|--mine|--stalled|--unmerged|--all]
+  kanspec repair <id> --why "..."     LAST RESORT: attest the state already in the file when its ## Log
+                                      no longer replays (import, bad merge, hand-edit). Refuses to attest
+                                      a `done` the merge gate never granted; what it attests stays badged
 
 STATUS & GIT TRUTH
   kanspec status                      THE anti-stuck query: everything non-terminal grouped by who owes
@@ -525,6 +528,14 @@ stateDiagram-v2
       detected on origin/main (cache-only fact,
       single writer, never stored in the ticket)
     end note
+
+    note left of todo
+      repair --why is a self-loop on every state:
+      it moves nothing, it records that a human
+      vouched for the state already in the file.
+      It cannot attest `done` without a logged
+      close, and what it attests stays badged.
+    end note
 ```
 
 Stored states: `todo · doing · review · done · dropped`. Derived: **ready** (todo, no open deps), **in-main** (git-detected overlay), **STALLED** (doing, no commits/updates for the window). Every transition is a CLI verb that appends actor + verb to the Log.
@@ -545,6 +556,16 @@ If signals conflict or all fail, the result is **`unknown`**, rendered as such w
 2. **Leftover triage:** every unchecked Step must be spawned (`--spawn "..."` → linked `followup_of` ticket), dropped with a logged reason, or marked actually-done — no fourth option; non-interactive mode *requires* `--followup`/`--no-followups`, so "nothing left" is always a recorded claim.
 3. **Knowledge checkpoint:** spec edited on branch, or recorded `--spec-unchanged "reason"`; one-key quirk and decision prompts.
 4. Log the transition; if this was the proposal's last live ticket, flag it settling and print `→ kanspec close p-x`.
+
+**Repairing a broken trail (`kanspec repair <id> --why "..."`) — the one place a human overrides the log.** Invariant 10 makes the `## Log` the proof of every state, and `Store::transact` re-proves it on the way *in*: a ticket whose log no longer replays cannot be written by any verb. That is the right default and a trap at the edges — an imported tracker, a union-merged log with two `start` lines, a `sed` someone ran last month — because it turns a broken file into a permanently unwritable one. `repair` is the escape: it appends an attributed, timestamped, human-signed `repair` line whose recorded state is **authoritative**, so replay restarts from it and the ticket becomes writable again. It never lets anyone *choose* a state — the state it attests is the one already in the frontmatter — and it refuses without a `--why`, and refuses on a ticket that already replays cleanly.
+
+Three limits keep it from being a way around the rest of the design:
+
+1. **It cannot buy a close.** `done` is the one state computed from git rather than accepted on anyone's word, so `repair` refuses to attest `done` unless the ticket's own `## Log` already carries the close — a `done` line (only ever written by the gate, against a detected merge or a recorded `--no-code` waiver) or a `scan --confirm` attestation (D-11, which itself demands a commit SHA and a reason). This mirrors `done --no-code`, which refuses on a ticket that has a branch; without it, `sed` + `repair` was a strictly *more* permissive route to `done` than the escape that was carefully guarded. `dropped` is not gated — a drop is an act, not a merge, and `--why` is its whole evidence — and neither is any non-terminal state, since none of them claims work shipped.
+2. **It cannot rewrite when things happened.** Timestamp monotonicity is checked across the whole log with no repair exemption, so an attestation can never launder an out-of-order `## Log`; the fix for that is to put the lines back in order.
+3. **What it attests stays visible.** The reset is a derived fact read back out of the log — never a frontmatter field (invariant 1) — so a ticket resting on an attested terminal state carries an `attested <state> by <actor>` badge on `ls`, `show` and the board instead of a merge badge (invariant 2: the badge never guesses, and a human's word is not a detection), and `doctor` reports it: a warning when the record supports it, an **error** when a `done` rests on nothing but the assertion, which then leads `status` too. The badge is spent the moment an ordinary verb moves the ticket on.
+
+`doctor`'s `log_trail` finding therefore prescribes the *lossless* remedy first — put the frontmatter back to the state the log reached, or put the log's lines right — and names `repair` only as the last resort, with its consequence attached. A warning whose printed fix is the laundering command is its own laundry.
 
 **Followups vs discovered work — two link types, two behaviors.** `followup_of` is unfinished scope from a ticket's own steps — minted by the `done` triage, part of its proposal's story. `discovered_in` is tangential work uncovered *while* doing a ticket that should be handled separately: `kanspec new "..."` captures it in one command (when the session has a claimed ticket, provenance is stamped automatically; `--from t-x` overrides, `--no-link` opts out), no spec required. Discovered tickets land in Backlog with a ◇ discovered chip and a link back to where they were found — and they are deliberately outside the proposal they interrupted: they never block `done` or `close`, so capturing a rabbit hole costs nothing and derails nothing. They can't rot silently either: the `done` summary lists what was captured along the way ("parked 2 discovered tickets"), and `status` raises a WATCHING line when discovered tickets sit untriaged past the window (default 7d) — give each a spec, a dep, or a drop.
 
