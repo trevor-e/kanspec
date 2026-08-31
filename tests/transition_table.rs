@@ -180,6 +180,165 @@ fn the_refusal_reads_like_the_contracts_worked_example() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Invariant 9, mechanically: a suggested fix that does not RUN is not a fix
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `error.rs` makes `Fixes` non-empty by type, which proves a refusal names *something*.
+// Nothing proved the something was a command. It was not: `require` built the second line
+// by lowercasing the first legal `Verb`, so every refusal from a terminal state — i.e. the
+// most common mistake there is, acting on an already-closed ticket — advised
+// `kanspec confirm t-ea32`, which clap answers with `unrecognized subcommand` and exit 64.
+// `confirm` is a flag on `scan`; four verbs need a `--why`; `new` needs a title.
+//
+// So the property is checked against the REAL clap tree rather than against a second list
+// of what the tree is believed to contain. A flag that later becomes mandatory, a verb that
+// is renamed, a ninth `Verb` — each one fails here instead of in a user's terminal.
+
+/// Split a fix line the way a shell would: the placeholders are quoted (`--why "..."`), and
+/// `split_whitespace` would hand clap a literal `"..."` with the quotes still attached —
+/// which parses, and would let a broken quoting bug through.
+fn argv(cmd: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut started) = (Vec::new(), String::new(), false, false);
+    for c in cmd.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    out.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    assert!(!quoted, "unbalanced quote in {cmd:?}");
+    if started {
+        out.push(cur);
+    }
+    out
+}
+
+#[test]
+fn the_shell_split_the_other_assertions_lean_on_actually_works() {
+    assert_eq!(
+        argv("ks park t-9c41 --why \"a b\""),
+        ["ks", "park", "t-9c41", "--why", "a b"]
+    );
+    assert_eq!(argv("kanspec show t-9c41"), ["kanspec", "show", "t-9c41"]);
+    assert_eq!(argv("kanspec new \"\""), ["kanspec", "new", ""]);
+}
+
+/// Parses `cmd` against the real tree, `Cli::try_parse_from` and all.
+#[track_caller]
+fn must_run(cmd: &str, why: &str) {
+    use clap::Parser;
+    let argv = argv(cmd);
+    assert!(argv.len() > 1, "{why}: `{cmd}` names no subcommand");
+    if let Err(e) = kanspec::cli::Cli::try_parse_from(&argv) {
+        panic!("{why}: `{cmd}` is not a runnable command — clap says:\n{e}");
+    }
+}
+
+/// THE regression: every illegal `(state, verb)` pair, every fix line it names, parsed.
+#[test]
+fn every_illegal_pair_suggests_commands_the_real_cli_accepts() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    let mut checked = 0;
+    for &(from, verb, to) in TABLE {
+        let (Some(from), None) = (from, to) else {
+            continue;
+        };
+        let e = require(&id, from, verb).unwrap_err();
+        for fix in e.fixes().iter() {
+            must_run(
+                fix.as_str(),
+                &format!("invariant 9: `{verb}` from {from} offered a fix"),
+            );
+            checked += 1;
+        }
+    }
+    // 21 illegal pairs from a real state (the 40-pair matrix minus 19 legal), 2 fixes each.
+    assert_eq!(checked, 42, "every illegal pair's every fix was parsed");
+}
+
+/// ...and the mapping itself, over ALL_VERBS. `require` only ever names the FIRST legal verb
+/// of a state, which reaches just `start`, `ship` and `confirm` — so the other five would
+/// never be parsed by the test above, and `park`'s missing `--why` would ship unnoticed
+/// until the day someone reordered `FROM_DOING`.
+#[test]
+fn every_verb_names_an_invocation_the_real_cli_accepts() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    for &v in ALL_VERBS {
+        for ks in ["kanspec", "ks"] {
+            let cmd = v.command_as(ks, &id);
+            assert!(
+                cmd.starts_with(&format!("{ks} ")),
+                "`{v}` ignored how the binary was invoked: {cmd}"
+            );
+            must_run(&cmd, &format!("Verb::{v}'s invocation"));
+        }
+        // the default spelling is the process-wide `invoked_as`, unset here => `kanspec`
+        assert_eq!(v.command(&id), v.command_as("kanspec", &id));
+    }
+}
+
+/// The four verbs whose command carries a mandatory flag, written out literally, so an edit
+/// that drops one fails by NAME rather than only as "clap rejected something".
+#[test]
+fn the_verbs_that_are_not_their_own_subcommand_are_spelled_out() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    assert_eq!(
+        V::Confirm.command_as("kanspec", &id),
+        // `confirm` is not a subcommand at all — this is the spelling docs/done.md prints
+        "kanspec scan --confirm t-ea32 --why \"...\"",
+    );
+    assert_eq!(
+        V::Repair.command_as("ks", &id),
+        "ks repair t-ea32 --why \"...\""
+    );
+    assert_eq!(
+        V::Park.command_as("ks", &id),
+        "ks park t-ea32 --why \"...\""
+    );
+    assert_eq!(
+        V::Drop.command_as("ks", &id),
+        "ks drop t-ea32 --why \"...\""
+    );
+    // and the plain ones stay plain
+    assert_eq!(V::Start.command_as("ks", &id), "ks start t-ea32");
+    assert_eq!(V::Ship.command_as("ks", &id), "ks ship t-ea32");
+    assert_eq!(V::Done.command_as("ks", &id), "ks done t-ea32");
+}
+
+/// The bug as the audit hit it, end to end: `kanspec start <a done ticket>`.
+#[test]
+fn starting_a_done_ticket_is_refused_with_a_command_that_exists() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    for terminal in [Done, Dropped] {
+        let e = require(&id, terminal, V::Start).unwrap_err();
+        let fixes: Vec<&str> = e.fixes().iter().map(|f| f.as_str()).collect();
+        assert!(
+            !fixes.contains(&"kanspec confirm t-ea32"),
+            "`confirm` is a flag on `scan`, never a subcommand: {fixes:?}"
+        );
+        assert_eq!(
+            fixes,
+            [
+                "kanspec show t-ea32",
+                "kanspec scan --confirm t-ea32 --why \"...\"",
+            ],
+            "from {terminal}"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // replay — the mechanical proof (invariant 10)
 // ─────────────────────────────────────────────────────────────────────────────
 
