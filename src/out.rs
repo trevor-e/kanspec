@@ -162,7 +162,11 @@ impl Line {
     pub fn write(&self, w: &mut dyn Write, st: &Style) -> std::io::Result<()> {
         let mut left = format!(" {} ", self.glyph);
         if let Some(id) = &self.id {
-            left.push_str(&format!("{:<9}", paint(id, Color::Bold, st.color)));
+            // MUST be `pad_visible`, never `{:<9}`: `paint` returns a string that already
+            // carries ANSI escapes, so `t-ec64` is 6 chars plain and 14 painted, and the
+            // width specifier padded nothing at all — the id and the title rendered jammed
+            // together for every colour user, on every command. See `pad_visible`.
+            left.push_str(&pad_visible(&paint(id, Color::Bold, st.color), ID_COL));
         }
         left.push_str(&self.text);
         if let Some(d) = &self.dim {
@@ -191,8 +195,31 @@ impl Line {
     }
 }
 
+/// The id column in [`Line::write`] — wide enough for `t-31aa` plus the three spaces
+/// DESIGN.md's transcripts show before the text.
+const ID_COL: usize = 9;
+
+/// Pad `s` on the right to `width` **visible** columns, never truncating.
+///
+/// THE ONE WAY to pad in this crate, because `format!("{:<9}", s)` counts `char`s and a
+/// painted `s` carries ANSI escapes that occupy no columns at all: `{:<9}` over a painted
+/// six-character id saw fourteen chars, decided the field was already full, and emitted no
+/// padding — which is why colour output jammed every id into its title while the piped,
+/// colourless output every test captures stayed perfectly aligned.
+///
+/// Any future column in this file pads through here; nothing painted may reach a `{:<N}`.
+pub fn pad_visible(s: &str, width: usize) -> String {
+    let visible = visible_len(s);
+    let mut out = String::with_capacity(s.len() + width.saturating_sub(visible));
+    out.push_str(s);
+    for _ in visible..width {
+        out.push(' ');
+    }
+    out
+}
+
 /// ANSI escapes do not occupy columns; count what the terminal actually shows.
-fn visible_len(s: &str) -> usize {
+pub fn visible_len(s: &str) -> usize {
     let mut n = 0usize;
     let mut in_esc = false;
     for c in s.chars() {
@@ -378,6 +405,122 @@ mod tests {
         assert_eq!(paint("x", Color::Red, false), "x");
         assert!(paint("x", Color::Red, true).len() > 1);
         assert_eq!(visible_len(&paint("abc", Color::Red, true)), 3);
+    }
+
+    /// ROUND-D REGRESSION, ranked #1 by the adversarial audit: it hit 100% of human
+    /// sessions on every id-bearing command, and all 463 tests were blind to it because a
+    /// test captures a pipe and a pipe has colour off.
+    ///
+    /// `format!("{:<9}", paint(id, Bold, true))` sees fourteen `char`s, not six, so it pads
+    /// nothing:
+    ///
+    /// ```text
+    ///  o t-ec64   Padding probe ticket · auth      # --color never
+    ///  o <b>t-ec64</b>Padding probe ticket · auth  # --color always  ← jammed
+    /// ```
+    #[test]
+    fn padding_counts_visible_columns_not_chars() {
+        let painted = paint("t-ec64", Color::Bold, true);
+        assert!(
+            painted.chars().count() > 6,
+            "the premise: a painted id is longer than it looks — {painted:?}"
+        );
+        assert_eq!(visible_len(&painted), 6);
+
+        // The helper pads a PAINTED id to nine visible columns…
+        let padded = pad_visible(&painted, ID_COL);
+        assert_eq!(visible_len(&padded), ID_COL, "{padded:?}");
+        assert!(padded.ends_with("   "), "{padded:?}");
+        // …which is exactly what the old `{:<9}` failed to do.
+        assert_eq!(
+            visible_len(&format!("{painted:<9}")),
+            6,
+            "the bug itself: a width specifier over a painted string is a no-op"
+        );
+
+        // Plain input is byte-identical to the specifier it replaces.
+        assert_eq!(pad_visible("t-ec64", ID_COL), format!("{:<9}", "t-ec64"));
+        // Over-wide input is never truncated — an id wider than the column pushes the
+        // text right rather than losing characters.
+        assert_eq!(pad_visible("t-abcdefghij", ID_COL), "t-abcdefghij");
+        assert_eq!(pad_visible(&paint("wide-id-here", Color::Bold, true), 4), {
+            paint("wide-id-here", Color::Bold, true)
+        });
+    }
+
+    /// The property that generalises the fix: a painted line is the plain line plus
+    /// escapes, and **nothing else** — same columns, same right-aligned fix.
+    #[test]
+    fn a_painted_line_is_the_plain_line_plus_escapes() {
+        let lines = [
+            Line::new(glyph::IN_MAIN, "in main 2h (gh-pr #142 · checked 4m ago)")
+                .id("t-31aa")
+                .fix("kanspec done t-31aa"),
+            Line::state(
+                crate::transitions::State::Todo,
+                "Padding probe ticket · auth",
+            )
+            .id("t-ec64")
+            .fix("kanspec start t-ec64"),
+            Line::state(
+                crate::transitions::State::Doing,
+                "STALLED: no commits for 3h",
+            )
+            .id("t-88fe")
+            .dim("claimed by trevor")
+            .fix("kanspec park t-88fe --why \"...\""),
+            // No id, no fix: the shape that was already correct must stay correct.
+            Line::new('·', "no open tickets").dim("nothing to do"),
+            // A tail too long for the width falls to its own continuation line.
+            Line::new('◈', "a very long title ".repeat(6))
+                .id("t-0001")
+                .fix("kanspec done t-0001"),
+        ];
+        for line in &lines {
+            let mut plain: Vec<u8> = Vec::new();
+            line.write(&mut plain, &Style::plain()).unwrap();
+            let mut painted: Vec<u8> = Vec::new();
+            line.write(
+                &mut painted,
+                &Style {
+                    color: true,
+                    ..Style::plain()
+                },
+            )
+            .unwrap();
+            let plain = String::from_utf8(plain).unwrap();
+            let painted = String::from_utf8(painted).unwrap();
+            assert_eq!(
+                strip_ansi(&painted),
+                plain,
+                "colour changed the LAYOUT, not just the bytes:\n{painted:?}"
+            );
+        }
+    }
+
+    /// Deliberately NOT `visible_len` in reverse: a bug shared by the code under test and
+    /// its test cancels out and proves nothing.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut it = s.chars().peekable();
+        while let Some(c) = it.next() {
+            if c != '\u{1b}' {
+                out.push(c);
+                continue;
+            }
+            if it.peek() == Some(&'[') {
+                it.next();
+                // CSI: parameter and intermediate bytes, then a final byte in `@`..=`~`.
+                for c in it.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            } else {
+                it.next();
+            }
+        }
+        out
     }
 
     #[test]
