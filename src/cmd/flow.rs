@@ -7,22 +7,25 @@
 //!
 //! Owner: **S5**.
 
-// Wave-0 skeleton. The bodies below are `todo!("S5: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by S5 when the bodies land.
-#![allow(unused_variables, dead_code)]
+use std::path::{Path, PathBuf};
 
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use crate::cli::{DropArgs, ParkArgs, ReadyArgs, ShipArgs, StartArgs};
 use crate::ctx::Ctx;
-use crate::derive::Badge;
-use crate::error::Result;
+use crate::derive::{self, Badge};
+use crate::error::{KsError, Result};
+use crate::fm::Yv;
 use crate::ids::Minter;
 use crate::ids::{ProposalId, QuirkId, SpecName, TicketId};
-use crate::model::Snapshot;
-use crate::out::{Render, Style};
-use crate::plan::{Facts, Plan, ShipFacts, StartFacts};
-use crate::transitions::State;
+use crate::keys::TicketKey;
+use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Ticket};
+use crate::out::{glyph, Color, Line, Render, Style};
+use crate::plan::{Facts, Op, Plan, ShipFacts, StartFacts};
+use crate::store::Store;
+use crate::transitions::{self, State, Verb};
+use crate::{fix, fixes};
 
 // ── ready ────────────────────────────────────────────────────────────────────
 
@@ -51,13 +54,93 @@ pub struct BlockedRow {
 }
 
 pub fn ready(ctx: &Ctx, a: &ReadyArgs) -> Result<ReadyReport> {
-    todo!("S5: derive::ready_queue, filtered by --spec and truncated to --limit, plus the blocked tail")
+    ctx.require_initialized()?;
+    let snap = ctx.snapshot()?;
+    let spec = a.spec.as_deref().map(SpecName::parse).transpose()?;
+    let matches = |t: &Ticket| spec.as_ref().is_none_or(|s| t.fm.spec.as_ref() == Some(s));
+
+    let rows: Vec<ReadyRow> = derive::ready_queue(&snap)
+        .into_iter()
+        .filter(|t| matches(t))
+        .take(a.limit)
+        .map(|t| ReadyRow {
+            id: t.fm.id.clone(),
+            title: t.fm.title.clone(),
+            spec: t.fm.spec.clone(),
+            proposal: t.fm.proposal.clone(),
+            deps: t.fm.deps.clone(),
+        })
+        .collect();
+
+    // The blocked tail is not decoration: "nothing is ready" and "everything is waiting on
+    // t-31aa" are different situations with different next commands.
+    let blocked: Vec<BlockedRow> = snap
+        .tickets
+        .values()
+        .filter(|t| t.fm.state == State::Todo && !derive::is_ready(&snap, t))
+        .filter(|t| matches(t))
+        .map(|t| BlockedRow {
+            id: t.fm.id.clone(),
+            title: t.fm.title.clone(),
+            blocked_by: derive::blocked_by(&snap, t).into_iter().cloned().collect(),
+        })
+        .collect();
+
+    let next = match rows.first() {
+        Some(r) => vec![format!("{} start {}", ctx.invoked_as, r.id)],
+        None if blocked.is_empty() => vec![format!("{} new \"...\"", ctx.invoked_as)],
+        None => vec![format!("{} status", ctx.invoked_as)],
+    };
+    Ok(ReadyReport {
+        rows,
+        blocked,
+        next,
+    })
 }
 
 impl Render for ReadyReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S5: one out::Line per claimable ticket, then the blocked list with what holds it")
+        for r in &self.rows {
+            let mut chips: Vec<String> = Vec::new();
+            if let Some(s) = &r.spec {
+                chips.push(s.to_string());
+            }
+            if let Some(p) = &r.proposal {
+                chips.push(p.to_string());
+            }
+            let mut line = Line::state(State::Todo, &r.title)
+                .id(&r.id)
+                .fix(format!("kanspec start {}", r.id));
+            if !chips.is_empty() {
+                line = line.dim(format!("· {}", chips.join(" · ")));
+            }
+            line.write(w, st)?;
+        }
+        if self.rows.is_empty() {
+            Line::new('·', "nothing is claimable")
+                .fix(self.next.first().cloned().unwrap_or_default())
+                .write(w, st)?;
+        }
+        for b in &self.blocked {
+            Line::new(
+                '·',
+                format!("{} — blocked by {}", b.title, ids(&b.blocked_by)),
+            )
+            .id(&b.id)
+            .write(w, st)?;
+        }
+        Ok(())
     }
+}
+
+fn ids(v: &[TicketId]) -> String {
+    if v.is_empty() {
+        return "nothing".to_string();
+    }
+    v.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ── start ────────────────────────────────────────────────────────────────────
@@ -77,21 +160,439 @@ pub struct StartReport {
     pub quirks_matching: Vec<QuirkId>,
     pub url: Option<String>,
     pub next: Vec<String>,
+    /// whether the primary worktree was switched onto the ticket branch
+    pub checked_out: bool,
 }
 
 pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
-    todo!("S5: resolve branch name + head SHA + optional worktree BEFORE the lock into StartFacts, then transact(Verb::Start, .., plan_start)")
+    ctx.require_initialized()?;
+    let id = TicketId::parse(&a.id)?;
+    let snap = ctx.snapshot()?;
+    let t = snap.ticket(&id)?;
+
+    // Refuse the illegal move BEFORE creating a branch. The authoritative check still
+    // happens inside the lock against a fresh snapshot — this one exists so a second
+    // claimant does not leave a branch behind on its way to being told no.
+    transitions::require(&id, t.fm.state, Verb::Start)?;
+
+    // ── every subprocess happens HERE, before the lock ───────────────────────
+    let base = ctx.git.resolve_main(&ctx.cfg.main)?;
+    let branch = branch_name(ctx, &id, &t.fm.title);
+    let existed = branch_exists(ctx, &branch);
+    let (wt_display, wt_abs) = if a.worktree {
+        let rel = worktree_rel(ctx, &id);
+        let abs = ctx.repo.primary_root().join(&rel);
+        (Some(rel), Some(abs))
+    } else {
+        (None, None)
+    };
+
+    // The branch's fork point, for the `## Log` note and the branch fact — NEVER for
+    // `head:`. `head:` is written by `ship` out of real git output, and the ladder's guard
+    // 0b keys off exactly that: a SHA from a live branch tip with no recorded `head:` is
+    // how it recognises a branch that never carried a commit. Stamp it here and every
+    // freshly-started ticket reads back as MERGED by ancestry (§2.16).
+    let head = ctx.git.head_sha(if existed { &branch } else { &base })?;
+
+    let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
+
+    let f = StartFacts {
+        base: Facts {
+            actor: ctx.actor.clone(),
+            at: ctx.now,
+            invocation: ctx.invocation(),
+        },
+        branch: branch.clone(),
+        worktree: wt_display.clone(),
+        head,
+    };
+    let committed = match Store::open(ctx).transact(Verb::Start, &ctx.invocation(), |s, m| {
+        plan_start(s, &f, a, m)
+    }) {
+        Ok(c) => c,
+        // The claim is what makes any of this real. If it is refused, undo exactly what
+        // this invocation created — an orphan branch a later `start` would then refuse to
+        // reuse is a worse failure than the one being reported.
+        Err(e) => {
+            unmake(ctx, &made);
+            return Err(e);
+        }
+    };
+
+    // The per-branch dispatch key the `prepare-commit-msg` / `commit-msg` pair reads back
+    // (D-5). Spelled through `hooks::branch_ticket_key` so `start` and the hook cannot
+    // disagree about it. Best effort: a repo whose config is read-only still has a claim.
+    let _ = ctx.git.run(&[
+        "config",
+        &crate::hooks::branch_ticket_key(&branch),
+        id.as_str(),
+    ]);
+
+    let checked_out = wt_abs.is_none() && switch_if_safe(ctx, &branch);
+
+    let t = committed.snapshot.ticket(&id)?;
+    let cx = claim_context(&committed.snapshot, t);
+    let mut next: Vec<String> = Vec::new();
+    if let Some(p) = &wt_display {
+        next.push(format!("cd {}", p.display()));
+    } else if !checked_out {
+        next.push(format!("git switch {branch}"));
+    }
+    next.push(format!("{} ship {id} --pr <n>", ctx.invoked_as));
+
+    Ok(StartReport {
+        title: t.fm.title.clone(),
+        state: t.fm.state,
+        branch,
+        worktree: wt_display.map(|p| p.display().to_string()),
+        claimed_by: t.fm.claimed_by.clone().unwrap_or_else(|| ctx.actor.label()),
+        spec: t.fm.spec.clone(),
+        spec_rules: cx.spec_rules,
+        decisions_in_scope: cx.decisions,
+        quirks_matching: cx.quirks,
+        url: Some(format!("http://127.0.0.1:{}/t/{id}", ctx.cfg.port)),
+        next,
+        checked_out,
+        id,
+    })
 }
 
 /// PURE. Refuses a second claim, and `require(from, Start)` supplies the typed refusal.
-pub fn plan_start(s: &Snapshot, f: &StartFacts, a: &StartArgs, m: &Minter) -> Result<Plan> {
-    todo!("S5: require(Start); Op::Transition with also = [Branch, Worktree, ClaimedBy, Head]")
+pub fn plan_start(s: &Snapshot, f: &StartFacts, a: &StartArgs, _m: &Minter) -> Result<Plan> {
+    let id = TicketId::parse(&a.id)?;
+    let t = s.ticket(&id)?;
+    transitions::require(&id, t.fm.state, Verb::Start)?;
+
+    // A `todo` ticket that still names a claimant was never released. `park` clears it, and
+    // saying so beats silently stealing the claim.
+    if t.fm.state == State::Todo {
+        if let Some(who) = t.fm.claimed_by.as_deref().filter(|c| !c.is_empty()) {
+            if who != f.base.actor.label() {
+                return Err(KsError::conflict(
+                    format!("{id} is still claimed by {who}"),
+                    fixes![
+                        fix!("kanspec park {id} --why \"reclaiming\""),
+                        fix!("kanspec show {id}"),
+                    ],
+                ));
+            }
+        }
+    }
+
+    // DESIGN.md's own log note, verbatim.
+    let detail = if f.worktree.is_some() {
+        "branch + worktree created"
+    } else {
+        "branch created"
+    };
+
+    // NOTE the absent key: `TicketKey::Head` is NOT written here (§2.16's ⚠). The wave-0
+    // stub's sketch listed it; writing it would make every freshly-started ticket read back
+    // as MERGED by ancestry, a verified false positive for work that never happened.
+    let mut also = vec![
+        (TicketKey::Branch, Yv::s(f.branch.clone())),
+        (TicketKey::ClaimedBy, Yv::s(f.base.actor.label())),
+    ];
+    also.push((
+        TicketKey::Worktree,
+        Yv::opt_s(f.worktree.as_ref().map(|p| p.display().to_string())),
+    ));
+
+    Ok(Plan::of(vec![Op::Transition {
+        id,
+        verb: Verb::Start,
+        actor: f.base.actor.clone(),
+        at: f.base.at,
+        detail: detail.to_string(),
+        also,
+    }]))
 }
 
 impl Render for StartReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S5: the four-line `claimed / branch / context / board` transcript from DESIGN.md")
+        // DESIGN.md's claim transcript, line for line.
+        writeln!(
+            w,
+            "  {}  {}  {}          ({})",
+            crate::out::paint("claimed", Color::Green, st.color),
+            crate::out::paint(self.id.as_str(), Color::Bold, st.color),
+            self.title,
+            crate::out::paint(
+                &format!("logged: {} · {}", self.state, self.claimed_by),
+                Color::Dim,
+                st.color
+            ),
+        )?;
+        let wt = match &self.worktree {
+            Some(p) => format!("    worktree {p}"),
+            None if self.checked_out => "    (checked out here)".to_string(),
+            None => String::new(),
+        };
+        writeln!(w, "  branch   {}{wt}", self.branch)?;
+        writeln!(w, "  context  {}", self.context_line())?;
+        if let Some(u) = &self.url {
+            writeln!(w, "  board    {u}")?;
+        }
+        for n in &self.next {
+            writeln!(w, "  {} {n}", glyph::FIX)?;
+        }
+        Ok(())
     }
+}
+
+impl StartReport {
+    /// `spec auth (3 rules) · 1 decision in scope (D-8c1a) · 2 quirks match paths (q-11ba)`
+    pub fn context_line(&self) -> String {
+        let spec = match &self.spec {
+            Some(s) => format!(
+                "spec {s} ({} rule{})",
+                self.spec_rules,
+                plural(self.spec_rules)
+            ),
+            None => "no spec".to_string(),
+        };
+        let d = format!(
+            "{} decision{} in scope{}",
+            self.decisions_in_scope.len(),
+            plural(self.decisions_in_scope.len()),
+            listed(&self.decisions_in_scope)
+        );
+        let q = format!(
+            "{} quirk{} {} paths{}",
+            self.quirks_matching.len(),
+            plural(self.quirks_matching.len()),
+            if self.quirks_matching.len() == 1 {
+                "matches"
+            } else {
+                "match"
+            },
+            listed(
+                &self
+                    .quirks_matching
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            )
+        );
+        format!("{spec} · {d} · {q}")
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
+fn listed(v: &[String]) -> String {
+    if v.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", v.join(", "))
+    }
+}
+
+// ── the claim-time context ───────────────────────────────────────────────────
+
+/// What is already known about the ground this ticket is about to touch.
+///
+/// Read from the REAL knowledge entities in the snapshot — `specs/`, `decisions/`,
+/// `quirks/` — which `store::load_snapshot` has parsed since wave 1. It deliberately does
+/// NOT go through `rulesdoc::build`: that is S6's generator and is still `todo!()`, so
+/// calling it would panic every `start`. When S6 lands, the *scoping* here can move to
+/// `rulesdoc::Scope`; the counts come from the same three maps either way.
+struct ClaimContext {
+    spec_rules: usize,
+    decisions: Vec<String>,
+    quirks: Vec<QuirkId>,
+}
+
+fn claim_context(s: &Snapshot, t: &Ticket) -> ClaimContext {
+    let spec = t.fm.spec.as_ref().and_then(|n| s.specs.get(n));
+    let globs: Vec<String> = spec.map(|sp| sp.fm.code.clone()).unwrap_or_default();
+
+    let mut decisions: Vec<String> = Vec::new();
+    for (id, d) in &s.decisions {
+        // Proposed decisions are NOT standing rules (invariant 8): they sit in `status`
+        // until a human accepts them, and they must not steer a claim.
+        if d.fm.status != DecisionStatus::Accepted {
+            continue;
+        }
+        if overlaps(&d.scope, &globs) {
+            decisions.push(id.to_string());
+        }
+    }
+    let mut quirks: Vec<QuirkId> = Vec::new();
+    for (id, q) in &s.quirks {
+        if q.fm.status != QuirkStatus::Active {
+            continue;
+        }
+        if overlaps(&q.fm.paths, &globs) {
+            quirks.push(id.clone());
+        }
+    }
+    ClaimContext {
+        spec_rules: spec.map(|sp| sp.rules.len()).unwrap_or(0),
+        decisions,
+        quirks,
+    }
+}
+
+/// Do two glob SETS describe overlapping ground?
+///
+/// At claim time there is no diff to match against — the work has not happened yet — so the
+/// only honest scope is the spec's own `code:` globs. Glob-versus-glob has no exact answer,
+/// so this asks it both ways: `src/auth/**` covers `src/auth/login.ts`, and a decision
+/// scoped at `src/auth/login.ts` is in scope for a spec that owns `src/auth/**`. It
+/// over-reports rather than under-reports, which is the right direction for a landmine
+/// warning.
+fn overlaps(a: &[String], b: &[String]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    matches_any(a, b) || matches_any(b, a)
+}
+
+fn matches_any(patterns: &[String], candidates: &[String]) -> bool {
+    let Some(set) = compile(patterns) else {
+        return false;
+    };
+    candidates.iter().any(|c| set.is_match(c))
+}
+
+fn compile(globs: &[String]) -> Option<GlobSet> {
+    let mut b = GlobSetBuilder::new();
+    let mut any = false;
+    for g in globs {
+        if let Ok(glob) = GlobBuilder::new(g).literal_separator(true).build() {
+            b.add(glob);
+            any = true;
+        }
+    }
+    any.then(|| b.build().ok()).flatten()
+}
+
+// ── the git plumbing `start` owns ────────────────────────────────────────────
+
+/// `ks/<id>-<slug>` — `branch_prefix` is configurable (D-21).
+fn branch_name(ctx: &Ctx, id: &TicketId, title: &str) -> String {
+    format!("{}{id}-{}", ctx.cfg.branch_prefix, crate::ids::slug(title))
+}
+
+/// `<worktree_dir>/<id>`, kept RELATIVE to the primary root exactly as DESIGN.md's
+/// frontmatter shows it — an absolute temp path in a committed file is not portable.
+fn worktree_rel(ctx: &Ctx, id: &TicketId) -> PathBuf {
+    ctx.cfg.worktree_dir.join(id.as_str())
+}
+
+fn branch_exists(ctx: &Ctx, branch: &str) -> bool {
+    ctx.git
+        .run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .map(|o| o.code == 0)
+        .unwrap_or(false)
+}
+
+/// What this invocation created, so a refused claim can put it back.
+#[derive(Default)]
+struct Made {
+    branch: Option<String>,
+    worktree: Option<PathBuf>,
+}
+
+fn create_branch(
+    ctx: &Ctx,
+    branch: &str,
+    base: &str,
+    existed: bool,
+    worktree: Option<&Path>,
+) -> Result<Made> {
+    let mut made = Made::default();
+    match (worktree, existed) {
+        // `worktree add -b` creates both in one call, and `--no-track` is mandatory:
+        // without it a later `git push` from the ticket branch targets main (D-21).
+        (Some(p), false) => {
+            ctx.git.worktree_add(p, branch, base)?;
+            made.branch = Some(branch.to_string());
+            made.worktree = Some(p.to_path_buf());
+        }
+        (Some(p), true) => {
+            if !p.exists() {
+                let out = ctx.git.run(&[
+                    "worktree",
+                    "add",
+                    "--no-track",
+                    &p.to_string_lossy(),
+                    branch,
+                ])?;
+                if out.code != 0 {
+                    return Err(KsError::conflict(
+                        format!("cannot attach a worktree to `{branch}`: {}", out.err.trim()),
+                        fixes![
+                            fix!("git worktree list"),
+                            fix!("kanspec where --branch {branch}")
+                        ],
+                    ));
+                }
+                made.worktree = Some(p.to_path_buf());
+            }
+        }
+        (None, false) => {
+            let out = ctx.git.run(&["branch", "--no-track", branch, base])?;
+            if out.code != 0 {
+                return Err(KsError::conflict(
+                    format!("cannot create branch `{branch}`: {}", out.err.trim()),
+                    fixes![
+                        fix!("git branch -D {branch}"),
+                        fix!("kanspec where --branch {branch}"),
+                    ],
+                ));
+            }
+            made.branch = Some(branch.to_string());
+        }
+        (None, true) => {}
+    }
+    Ok(made)
+}
+
+/// Best effort, and deliberately silent: this runs while a refusal is already on its way
+/// out, and a second error would bury the first.
+fn unmake(ctx: &Ctx, made: &Made) {
+    if let Some(p) = &made.worktree {
+        let _ = ctx.git.worktree_remove(p, true);
+    }
+    if let Some(b) = &made.branch {
+        let _ = ctx.git.branch_delete(b, true);
+    }
+}
+
+/// Move the PRIMARY worktree onto the ticket branch — but only when that cannot surprise
+/// anyone: no separate worktree was asked for, the caller is standing in the primary, and
+/// the tracked tree is clean. Otherwise the report names `git switch` and nothing moves.
+fn switch_if_safe(ctx: &Ctx, branch: &str) -> bool {
+    if ctx.repo.linked() {
+        return false;
+    }
+    // `-uno`: an untracked file never blocks a checkout, and the tracker's own pending
+    // edits under `sync = "batch"` are the normal resting state.
+    let clean = ctx
+        .git
+        .run(&["status", "--porcelain", "-uno"])
+        .map(|o| o.code == 0 && o.out.trim().is_empty())
+        .unwrap_or(false);
+    if !clean {
+        return false;
+    }
+    ctx.git
+        .run(&["switch", branch])
+        .map(|o| o.code == 0)
+        .unwrap_or(false)
 }
 
 // ── ship ─────────────────────────────────────────────────────────────────────
@@ -110,18 +611,134 @@ pub struct ShipReport {
 }
 
 pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
-    todo!("S5: read the head SHA from git BEFORE the lock into ShipFacts, then transact(Verb::Ship, .., plan_ship)")
+    ctx.require_initialized()?;
+    let id = TicketId::parse(&a.id)?;
+    let snap = ctx.snapshot()?;
+    let t = snap.ticket(&id)?;
+    transitions::require(&id, t.fm.state, Verb::Ship)?;
+
+    // Every subprocess happens HERE, before the lock. The SHA is read FROM GIT — the only
+    // value that can reach `head:` comes from a `HeadSha`, which only `git.rs` mints, so
+    // "never typed by an agent" is a property of the type rather than of anyone's manners.
+    let rev = t.fm.branch.clone().unwrap_or_else(|| "HEAD".to_string());
+    let head = ctx.git.head_sha(&rev).map_err(|e| {
+        // A ticket claimed without a branch, or a branch someone deleted: say which,
+        // because "cannot resolve HEAD" is not actionable.
+        KsError::gate(
+            "no_head_to_record",
+            format!("{id}: cannot read a head SHA from `{rev}` — {e}"),
+            fixes![
+                fix!("git switch -c {rev}"),
+                fix!("kanspec show {id}"),
+                fix!("kanspec park {id} --why \"no branch\""),
+            ],
+        )
+    })?;
+
+    // A branch that never carried a commit has nothing to review, and shipping it would
+    // record MAIN'S OWN SHA as `head:` — which the ladder then answers MERGED by ancestry,
+    // a verified false positive for work that never happened. The ladder's guard 0b covers
+    // the branch-tip case; this covers the recorded-`head:` case, which guard 0b cannot see
+    // by construction (§2.15). "Cannot answer" is not a refusal: only a measured zero is.
+    if let Ok(base) = ctx.git.resolve_main(&ctx.cfg.main) {
+        if matches!(
+            ctx.git.commits_ahead(&base, head.sha()),
+            crate::git::Tri::Yes(0)
+        ) {
+            return Err(KsError::gate(
+                "nothing_to_ship",
+                format!("{id}: `{rev}` carries no commits that {base} does not already have"),
+                fixes![
+                    fix!("git commit -m \"...\" && git push origin {rev}"),
+                    fix!("kanspec park {id} --why \"not started yet\""),
+                    fix!("kanspec done {id} --no-code --why \"docs only\""),
+                ],
+            ));
+        }
+    }
+
+    let f = ShipFacts {
+        base: Facts {
+            actor: ctx.actor.clone(),
+            at: ctx.now,
+            invocation: ctx.invocation(),
+        },
+        head,
+    };
+    let committed =
+        Store::open(ctx).transact(Verb::Ship, &ctx.invocation(), |s, m| plan_ship(s, &f, a, m))?;
+
+    let t = committed.snapshot.ticket(&id)?;
+    Ok(ShipReport {
+        title: t.fm.title.clone(),
+        state: t.fm.state,
+        head: t.fm.head.clone().unwrap_or_default(),
+        pr: t.fm.pr,
+        badge: derive::badge(&committed.snapshot, t),
+        // v0.2 (S7's `ci.rs`, behind the non-default `ci-homerunner` feature): DESIGN.md's
+        // "ship warns when the head SHA's latest local run is red". Deliberately absent
+        // rather than faked — a warning nobody computed is worse than no warning.
+        ci_warning: None,
+        next: vec![
+            format!("{} scan {id}", ctx.invoked_as),
+            format!("{} done {id}", ctx.invoked_as),
+        ],
+        id,
+    })
 }
 
 /// PURE. The `head:` value can only come from a `HeadSha`, which only `git.rs` mints —
 /// DESIGN.md's second gear, enforced by the type.
-pub fn plan_ship(s: &Snapshot, f: &ShipFacts, a: &ShipArgs, m: &Minter) -> Result<Plan> {
-    todo!("S5: require(Ship); Op::Transition with also = [Head, Pr]")
+pub fn plan_ship(s: &Snapshot, f: &ShipFacts, a: &ShipArgs, _m: &Minter) -> Result<Plan> {
+    let id = TicketId::parse(&a.id)?;
+    let t = s.ticket(&id)?;
+    transitions::require(&id, t.fm.state, Verb::Ship)?;
+
+    let sha = f.head.sha().as_str().to_string();
+    let mut also = vec![(TicketKey::Head, Yv::s(sha.clone()))];
+    // A `--pr` that is absent leaves whatever `ship` recorded last time: re-shipping to fix
+    // a SHA must not silently forget the PR number rung 2 needs.
+    if let Some(n) = a.pr {
+        also.push((TicketKey::Pr, Yv::Int(n as i64)));
+    }
+
+    let detail = match a.pr.or(t.fm.pr) {
+        Some(n) => format!("head {} · PR #{n}", &sha[..7.min(sha.len())]),
+        None => format!("head {}", &sha[..7.min(sha.len())]),
+    };
+    Ok(Plan::of(vec![Op::Transition {
+        id,
+        verb: Verb::Ship,
+        actor: f.base.actor.clone(),
+        at: f.base.at,
+        detail,
+        also,
+    }]))
 }
 
 impl Render for ShipReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S5: `shipped t-9c41` with the recorded head and PR, then the `→ kanspec done` next step")
+        Line::state(self.state, &self.title)
+            .id(&self.id)
+            .dim(format!(
+                "· head {}{}",
+                &self.head[..7.min(self.head.len())],
+                self.pr.map(|n| format!(" · PR #{n}")).unwrap_or_default()
+            ))
+            .fix(self.next.last().cloned().unwrap_or_default())
+            .write(w, st)?;
+        if let Some(warn) = &self.ci_warning {
+            writeln!(w, "   ⚠ {warn}")?;
+        }
+        writeln!(
+            w,
+            "   {}",
+            crate::out::paint(
+                "the head SHA was read from git, never typed",
+                Color::Dim,
+                st.color
+            )
+        )
     }
 }
 
@@ -137,17 +754,54 @@ pub struct ParkReport {
 }
 
 pub fn park(ctx: &Ctx, a: &ParkArgs) -> Result<ParkReport> {
-    todo!("S5: transact(Verb::Park, .., plan_park)")
+    ctx.require_initialized()?;
+    let id = TicketId::parse(&a.id)?;
+    let f = Facts {
+        actor: ctx.actor.clone(),
+        at: ctx.now,
+        invocation: ctx.invocation(),
+    };
+    let committed =
+        Store::open(ctx).transact(Verb::Park, &ctx.invocation(), |s, m| plan_park(s, &f, a, m))?;
+    let t = committed.snapshot.ticket(&id)?;
+    Ok(ParkReport {
+        title: t.fm.title.clone(),
+        state: t.fm.state,
+        why: a.why.trim().to_string(),
+        next: vec![
+            format!("{} ready", ctx.invoked_as),
+            format!("{} start {id}", ctx.invoked_as),
+        ],
+        id,
+    })
 }
 
 /// PURE.
-pub fn plan_park(s: &Snapshot, f: &Facts, a: &ParkArgs, m: &Minter) -> Result<Plan> {
-    todo!("S5: require(Park); Op::Transition clearing ClaimedBy, with `why` as the log note")
+pub fn plan_park(s: &Snapshot, f: &Facts, a: &ParkArgs, _m: &Minter) -> Result<Plan> {
+    let id = TicketId::parse(&a.id)?;
+    let t = s.ticket(&id)?;
+    transitions::require(&id, t.fm.state, Verb::Park)?;
+    let why = require_why(&id, &a.why, "park")?;
+
+    Ok(Plan::of(vec![Op::Transition {
+        id,
+        verb: Verb::Park,
+        actor: f.actor.clone(),
+        at: f.at,
+        detail: why,
+        // The claim is released; the branch and worktree stay, so a later `start` picks the
+        // work back up where it was rather than forking a second branch for one ticket.
+        also: vec![(TicketKey::ClaimedBy, Yv::Null)],
+    }]))
 }
 
 impl Render for ParkReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S5: `parked t-9c41 — <why>` plus the `→ kanspec ready` next step")
+        Line::state(self.state, format!("{} — {}", self.title, self.why))
+            .id(&self.id)
+            .dim("unclaimed")
+            .fix(self.next.first().cloned().unwrap_or_default())
+            .write(w, st)
     }
 }
 
@@ -166,16 +820,485 @@ pub struct DropReport {
 
 /// `drop_ticket`, not `drop`: shadowing `std::mem::drop` at the call site reads badly.
 pub fn drop_ticket(ctx: &Ctx, a: &DropArgs) -> Result<DropReport> {
-    todo!("S5: transact(Verb::Drop, .., plan_drop)")
+    ctx.require_initialized()?;
+    let id = TicketId::parse(&a.id)?;
+    let f = Facts {
+        actor: ctx.actor.clone(),
+        at: ctx.now,
+        invocation: ctx.invocation(),
+    };
+    let committed =
+        Store::open(ctx).transact(Verb::Drop, &ctx.invocation(), |s, m| plan_drop(s, &f, a, m))?;
+
+    let snap = &committed.snapshot;
+    let t = snap.ticket(&id)?;
+    // Dropped counts as satisfied (D-17): blocking forever on a dropped dep is worse. Say
+    // which tickets that just freed, because `doctor` will also warn about every one of
+    // them and the human should see it here first.
+    let unblocked: Vec<TicketId> = snap
+        .tickets
+        .values()
+        .filter(|o| o.fm.deps.contains(&id) && derive::is_ready(snap, o))
+        .map(|o| o.fm.id.clone())
+        .collect();
+    let mut next = vec![format!("{} ready", ctx.invoked_as)];
+    if !unblocked.is_empty() {
+        next.insert(0, format!("{} start {}", ctx.invoked_as, unblocked[0]));
+    }
+    Ok(DropReport {
+        title: t.fm.title.clone(),
+        state: t.fm.state,
+        why: a.why.trim().to_string(),
+        unblocked,
+        next,
+        id,
+    })
 }
 
 /// PURE.
-pub fn plan_drop(s: &Snapshot, f: &Facts, a: &DropArgs, m: &Minter) -> Result<Plan> {
-    todo!("S5: require(Drop); Op::Transition with `why` as the log note")
+pub fn plan_drop(s: &Snapshot, f: &Facts, a: &DropArgs, _m: &Minter) -> Result<Plan> {
+    let id = TicketId::parse(&a.id)?;
+    let t = s.ticket(&id)?;
+    transitions::require(&id, t.fm.state, Verb::Drop)?;
+    let why = require_why(&id, &a.why, "drop")?;
+
+    Ok(Plan::of(vec![Op::Transition {
+        id,
+        verb: Verb::Drop,
+        actor: f.actor.clone(),
+        at: f.at,
+        detail: why,
+        also: vec![(TicketKey::ClaimedBy, Yv::Null)],
+    }]))
 }
 
 impl Render for DropReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S5: `dropped t-9c41 — <why>`, then anything it unblocked")
+        Line::state(self.state, format!("{} — {}", self.title, self.why))
+            .id(&self.id)
+            .fix(self.next.first().cloned().unwrap_or_default())
+            .write(w, st)?;
+        if !self.unblocked.is_empty() {
+            writeln!(
+                w,
+                "   unblocked {} (a dropped dep counts as satisfied)",
+                ids(&self.unblocked)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// clap makes `--why` mandatory; this catches the whitespace-only version, which is the one
+/// an agent actually produces.
+fn require_why(id: &TicketId, why: &str, verb: &'static str) -> Result<String> {
+    let why = why.trim();
+    if why.is_empty() {
+        return Err(KsError::gate(
+            "why_is_required",
+            format!("`{verb} {id}` records a reason, so nothing rots silently"),
+            fixes![
+                fix!("kanspec {verb} {id} --why \"what actually happened\""),
+                fix!("kanspec show {id}"),
+            ],
+        ));
+    }
+    Ok(why.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::ctx::Actor;
+    use crate::model::{Decision, DecisionFm, Quirk, QuirkFm, Spec, SpecFm, Ticket, TicketFm};
+    use chrono::{DateTime, TimeZone, Utc};
+
+    fn at(h: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 30, h, 0, 0).unwrap()
+    }
+
+    fn facts() -> Facts {
+        Facts {
+            actor: Actor::Human {
+                name: "trevor".into(),
+            },
+            at: at(14),
+            invocation: "kanspec start t-9c41".into(),
+        }
+    }
+
+    fn snap_with(state: State) -> Snapshot {
+        let mut s = Snapshot::empty(Config::default(), at(15));
+        let fm: TicketFm = serde_yaml_ng::from_str(&format!(
+            "id: t-9c41\ntitle: Rate-limit login endpoint\nstate: {state}\nspec: auth\n\
+             created: 2026-08-30T09:00:00Z\n"
+        ))
+        .unwrap();
+        s.tickets.insert(
+            fm.id.clone(),
+            Ticket {
+                fm,
+                path: PathBuf::from(".kanspec/tickets/t-9c41.md"),
+                body: String::new(),
+                steps: Vec::new(),
+                log: Vec::new(),
+                mtime: std::time::SystemTime::UNIX_EPOCH,
+            },
+        );
+        s
+    }
+
+    fn with_knowledge(s: &mut Snapshot) {
+        let name = SpecName::parse("auth").unwrap();
+        let fm: SpecFm = serde_yaml_ng::from_str("feature: Login\ncode: [src/auth/**]\n").unwrap();
+        s.specs.insert(
+            name.clone(),
+            Spec {
+                name,
+                fm,
+                path: PathBuf::from(".kanspec/specs/auth.md"),
+                body: String::new(),
+                rules: vec![
+                    rule("auth.jwt"),
+                    rule("auth.lockout"),
+                    rule("auth.lockout-event"),
+                ],
+            },
+        );
+        for (id, status, scope) in [
+            ("D-8c1a", "accepted", "src/auth/**"),
+            ("D-2c77", "accepted", "src/billing/**"),
+            // A PROPOSED decision is not a standing rule and must not steer a claim.
+            ("D-9999", "proposed", "src/auth/**"),
+        ] {
+            let fm: DecisionFm = serde_yaml_ng::from_str(&format!(
+                "id: {id}\ntitle: t\nstatus: {status}\ndate: 2026-09-02\nscope: [{scope}]\n"
+            ))
+            .unwrap();
+            let scope = fm.scope.clone();
+            s.decisions.insert(
+                fm.id.clone(),
+                Decision {
+                    fm,
+                    path: PathBuf::from("d.md"),
+                    body: String::new(),
+                    scope,
+                },
+            );
+        }
+        for (id, status, paths) in [
+            ("q-11ba", "active", "src/auth/**"),
+            ("q-83d0", "active", "src/auth/session.ts"),
+            ("q-0000", "fixed", "src/auth/**"),
+            ("q-1111", "active", "src/billing/**"),
+        ] {
+            let fm: QuirkFm = serde_yaml_ng::from_str(&format!(
+                "id: {id}\ntitle: t\npaths: [{paths}]\nseverity: landmine\nstatus: {status}\n"
+            ))
+            .unwrap();
+            s.quirks.insert(
+                fm.id.clone(),
+                Quirk {
+                    fm,
+                    path: PathBuf::from("q.md"),
+                    body: String::new(),
+                },
+            );
+        }
+    }
+
+    fn rule(anchor: &str) -> crate::model::Rule {
+        crate::model::Rule {
+            anchor: anchor.to_string(),
+            text: "t".into(),
+            provenance: Vec::new(),
+            line: 1,
+        }
+    }
+
+    fn start_args(worktree: bool) -> StartArgs {
+        StartArgs {
+            id: "t-9c41".into(),
+            worktree,
+        }
+    }
+
+    fn start_facts(worktree: Option<&str>) -> StartFacts {
+        // `HeadSha` has no public constructor, so a planner test builds one the only way
+        // anything can: out of real git output, from this very repository.
+        let git = crate::git::Git::bind(Path::new(env!("CARGO_MANIFEST_DIR")));
+        StartFacts {
+            base: facts(),
+            branch: "ks/t-9c41-rate-limit-login-endpoint".into(),
+            worktree: worktree.map(PathBuf::from),
+            head: git.head_sha("HEAD").expect("this crate is a git repo"),
+        }
+    }
+
+    #[track_caller]
+    fn plan(s: &Snapshot, f: &StartFacts, a: &StartArgs) -> Result<Plan> {
+        let taken = s.taken_ids();
+        let m = Minter::new(&taken, 7, 4);
+        plan_start(s, f, a, &m)
+    }
+
+    #[track_caller]
+    fn refusal<T>(r: Result<T>) -> &'static str {
+        match r {
+            Ok(_) => panic!("expected a refusal"),
+            Err(e) => e.code().unwrap_or(e.kind()),
+        }
+    }
+
+    /// §2.16's ⚠, as a test. `head:` at claim time makes every freshly-started ticket read
+    /// back as MERGED by ancestry — a VERIFIED false positive for work that never happened,
+    /// which is the single worst answer this tool can give.
+    #[test]
+    fn start_never_writes_head() {
+        let p = plan(
+            &snap_with(State::Todo),
+            &start_facts(None),
+            &start_args(false),
+        )
+        .unwrap();
+        let Some(Op::Transition { also, verb, .. }) = p.ops.first() else {
+            panic!("start is one transition");
+        };
+        assert_eq!(*verb, Verb::Start);
+        assert!(
+            !also.iter().any(|(k, _)| *k == TicketKey::Head),
+            "plan_start must not write `head:` — see ARCHITECTURE §2.16"
+        );
+        let keys: Vec<&str> = also
+            .iter()
+            .map(|(k, _)| crate::keys::FmKey::as_str(*k))
+            .collect();
+        assert_eq!(keys, ["branch", "claimed_by", "worktree"]);
+    }
+
+    #[test]
+    fn the_claim_is_atomic_because_the_second_one_is_refused() {
+        // The first claim moved it to `doing`; the second sees the fresh in-lock snapshot.
+        assert_eq!(
+            refusal(plan(
+                &snap_with(State::Doing),
+                &start_facts(None),
+                &start_args(false)
+            )),
+            "illegal_transition"
+        );
+        // Rework is legal, and is the other edge of the same table.
+        assert!(plan(
+            &snap_with(State::Review),
+            &start_facts(None),
+            &start_args(false)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_todo_ticket_someone_else_still_holds_is_not_silently_stolen() {
+        let mut s = snap_with(State::Todo);
+        let id = TicketId::parse("t-9c41").unwrap();
+        s.tickets.get_mut(&id).unwrap().fm.claimed_by = Some("claude/sess-a91".into());
+        assert_eq!(
+            refusal(plan(&s, &start_facts(None), &start_args(false))),
+            "conflict"
+        );
+    }
+
+    #[test]
+    fn the_worktree_is_recorded_as_the_relative_path_design_md_shows() {
+        let p = plan(
+            &snap_with(State::Todo),
+            &start_facts(Some("../kanspec-wt/t-9c41")),
+            &start_args(true),
+        )
+        .unwrap();
+        let Some(Op::Transition { also, detail, .. }) = p.ops.first() else {
+            panic!()
+        };
+        assert_eq!(detail, "branch + worktree created");
+        let wt = also
+            .iter()
+            .find(|(k, _)| *k == TicketKey::Worktree)
+            .map(|(_, v)| v.clone());
+        assert_eq!(wt, Some(Yv::s("../kanspec-wt/t-9c41")));
+    }
+
+    /// The context line every prior plan stubbed. It reads the REAL knowledge entities, and
+    /// it filters on status: a proposed decision and a fixed quirk steer nobody.
+    #[test]
+    fn the_claim_context_is_computed_from_the_real_knowledge_entities() {
+        let mut s = snap_with(State::Todo);
+        with_knowledge(&mut s);
+        let t = s.ticket(&TicketId::parse("t-9c41").unwrap()).unwrap();
+        let cx = claim_context(&s, t);
+        assert_eq!(cx.spec_rules, 3);
+        assert_eq!(cx.decisions, ["D-8c1a"], "accepted + in scope only");
+        assert_eq!(
+            cx.quirks.iter().map(|q| q.to_string()).collect::<Vec<_>>(),
+            ["q-11ba", "q-83d0"],
+            "active + path-matching only"
+        );
+
+        let report = StartReport {
+            id: TicketId::parse("t-9c41").unwrap(),
+            title: "Rate-limit login endpoint".into(),
+            state: State::Doing,
+            branch: "ks/t-9c41-rate-limit-login".into(),
+            worktree: Some("../kanspec-wt/t-9c41".into()),
+            claimed_by: "claude/sess-a91".into(),
+            spec: Some(SpecName::parse("auth").unwrap()),
+            spec_rules: cx.spec_rules,
+            decisions_in_scope: cx.decisions,
+            quirks_matching: cx.quirks,
+            url: None,
+            next: Vec::new(),
+            checked_out: false,
+        };
+        // DESIGN.md's transcript, verbatim.
+        assert_eq!(
+            report.context_line(),
+            "spec auth (3 rules) · 1 decision in scope (D-8c1a) · 2 quirks match paths (q-11ba, q-83d0)"
+        );
+    }
+
+    #[test]
+    fn a_ticket_with_no_spec_still_gets_an_honest_context_line() {
+        let mut s = snap_with(State::Todo);
+        with_knowledge(&mut s);
+        let id = TicketId::parse("t-9c41").unwrap();
+        s.tickets.get_mut(&id).unwrap().fm.spec = None;
+        let t = s.ticket(&id).unwrap();
+        let cx = claim_context(&s, t);
+        assert_eq!(cx.spec_rules, 0);
+        assert!(cx.decisions.is_empty() && cx.quirks.is_empty());
+    }
+
+    #[test]
+    fn ship_records_the_sha_git_printed_and_the_pr_number() {
+        let s = snap_with(State::Doing);
+        let git = crate::git::Git::bind(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let head = git.head_sha("HEAD").unwrap();
+        let sha = head.sha().as_str().to_string();
+        let f = ShipFacts {
+            base: facts(),
+            head,
+        };
+        let a = ShipArgs {
+            id: "t-9c41".into(),
+            pr: Some(142),
+        };
+        let taken = s.taken_ids();
+        let p = plan_ship(&s, &f, &a, &Minter::new(&taken, 7, 4)).unwrap();
+        let Some(Op::Transition { also, detail, .. }) = p.ops.first() else {
+            panic!()
+        };
+        assert!(also.contains(&(TicketKey::Head, Yv::s(sha.clone()))));
+        assert!(also.contains(&(TicketKey::Pr, Yv::Int(142))));
+        assert_eq!(detail, &format!("head {} · PR #142", &sha[..7]));
+    }
+
+    #[test]
+    fn re_shipping_without_pr_keeps_the_recorded_one() {
+        let mut s = snap_with(State::Doing);
+        let id = TicketId::parse("t-9c41").unwrap();
+        s.tickets.get_mut(&id).unwrap().fm.pr = Some(142);
+        let git = crate::git::Git::bind(Path::new(env!("CARGO_MANIFEST_DIR")));
+        let f = ShipFacts {
+            base: facts(),
+            head: git.head_sha("HEAD").unwrap(),
+        };
+        let a = ShipArgs {
+            id: "t-9c41".into(),
+            pr: None,
+        };
+        let taken = s.taken_ids();
+        let p = plan_ship(&s, &f, &a, &Minter::new(&taken, 7, 4)).unwrap();
+        let Some(Op::Transition { also, detail, .. }) = p.ops.first() else {
+            panic!()
+        };
+        assert!(
+            !also.iter().any(|(k, _)| *k == TicketKey::Pr),
+            "an absent --pr must not erase the number rung 2 needs"
+        );
+        assert!(detail.contains("PR #142"), "{detail}");
+    }
+
+    #[test]
+    fn park_and_drop_release_the_claim_and_demand_a_reason() {
+        let s = snap_with(State::Doing);
+        let taken = s.taken_ids();
+        let m = Minter::new(&taken, 7, 4);
+
+        let p = plan_park(
+            &s,
+            &facts(),
+            &ParkArgs {
+                id: "t-9c41".into(),
+                why: "waiting on the redis cluster".into(),
+            },
+            &m,
+        )
+        .unwrap();
+        let Some(Op::Transition { also, detail, .. }) = p.ops.first() else {
+            panic!()
+        };
+        assert_eq!(also, &[(TicketKey::ClaimedBy, Yv::Null)]);
+        assert_eq!(detail, "waiting on the redis cluster");
+
+        assert_eq!(
+            refusal(plan_park(
+                &s,
+                &facts(),
+                &ParkArgs {
+                    id: "t-9c41".into(),
+                    why: "   ".into()
+                },
+                &m
+            )),
+            "why_is_required"
+        );
+        assert_eq!(
+            refusal(plan_drop(
+                &s,
+                &facts(),
+                &DropArgs {
+                    id: "t-9c41".into(),
+                    why: "\t".into()
+                },
+                &m
+            )),
+            "why_is_required"
+        );
+    }
+
+    #[test]
+    fn parking_a_ticket_that_was_never_claimed_is_the_typed_refusal() {
+        assert_eq!(
+            refusal(plan_park(
+                &snap_with(State::Todo),
+                &facts(),
+                &ParkArgs {
+                    id: "t-9c41".into(),
+                    why: "x".into()
+                },
+                &Minter::new(&Default::default(), 7, 4),
+            )),
+            "illegal_transition"
+        );
+    }
+
+    #[test]
+    fn glob_overlap_answers_both_directions_and_neither_when_empty() {
+        let auth = vec!["src/auth/**".to_string()];
+        assert!(overlaps(&auth, &["src/auth/login.ts".to_string()]));
+        assert!(overlaps(&["src/auth/login.ts".to_string()], &auth));
+        assert!(overlaps(&auth, &auth));
+        assert!(!overlaps(&auth, &["src/billing/**".to_string()]));
+        assert!(!overlaps(&auth, &[]));
+        assert!(!overlaps(&[], &auth));
     }
 }
