@@ -146,11 +146,16 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
 
     // D-20, wired by S6 (the one line S6 writes in this file). The committed
     // `KANSPEC-FEATURES.md` / `KANSPEC-ARCHITECTURE.md` projections are rewritten from the
-    // state this scan just produced — a *second* transaction, deliberately, because the
-    // `Fresh?` column is computed from the very `GitState` the plan above wrote and a
-    // planner only ever sees the snapshot as it was BEFORE its own plan. Regenerating
-    // inside that closure would publish a feature map exactly one scan out of date, for
-    // ever. See `project::regenerate`.
+    // state this scan just produced — a *second* transaction, deliberately, because a
+    // planner only ever sees the snapshot as it was BEFORE its own plan (D-34), so a
+    // spec created or edited by this very transaction would be missing from a map
+    // regenerated inside that closure — one scan out of date, for ever.
+    //
+    // (This comment used to justify the second transaction by the `Fresh?` column being
+    // "computed from the very `GitState` the plan above wrote". That column is GONE: it
+    // was computed from the gitignored cache, so the same commit rendered different bytes
+    // on different machines. The D-34 reason above is the one that still holds.)
+    // See `project::regenerate`.
     crate::project::regenerate(ctx)?;
     Ok(report)
 }

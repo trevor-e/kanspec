@@ -379,7 +379,19 @@ impl std::fmt::Display for State { /* as_str */ }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Verb { New, Start, Ship, Done, Park, Drop, Confirm, Repair }
-impl Verb { pub const fn as_str(self) -> &'static str; }
+impl Verb {
+    pub const fn as_str(self) -> &'static str;  // the `## Log` spelling — NOT a command
+
+    /// The verb's REAL invocation, mandatory flags included. `as_str` is the LOG
+    /// spelling and five of the eight verbs are not invoked that way: `confirm` is
+    /// an option on `scan`, `park`/`drop`/`repair`/`scan --confirm` all require
+    /// `--why`, and `new` takes a title rather than an id. Round-E fix: `require`
+    /// built its second fix by lowercasing the verb and emitted `kanspec confirm
+    /// <id>`, which exits 64. Exhaustive match, no wildcard — a ninth `Verb` cannot
+    /// compile until someone writes down how it is actually run.
+    pub fn command(self, id: &TicketId) -> String;          // uses cli::invoked_as()
+    pub fn command_as(self, ks: &str, id: &TicketId) -> String;  // test seam
+}
 impl std::fmt::Display for Verb { /* as_str */ }
 
 pub const ALL_STATES: &[State] = &[State::Todo, State::Doing, State::Review,
@@ -1073,6 +1085,19 @@ impl Table {
 }
 pub fn rel_time(then: DateTime<Utc>, now: DateTime<Utc>) -> String;   // "14m ago", "3h", "2d"
 pub fn paint(s: &str, c: Color, st: &Style) -> String;
+
+/// THE ONE PADDING PRIMITIVE. `paint` returns a string that already carries ANSI
+/// escapes, so `format!("{:<9}", painted)` counts 14 chars where the terminal
+/// shows 6, decides the field is full, and pads NOTHING. That was the round-E
+/// #1 defect: every id-bearing command jammed the id into its title and shifted
+/// the right-aligned `→ fix` three columns whenever colour was on. Nothing
+/// painted may reach a `{:<N}`; it goes through here.
+///
+/// `visible_len` is `pub` for the same reason — `tests/render_color.rs` is an
+/// integration test and reaches both only through the crate's public API.
+/// Widening this frozen file by two functions is deliberate and blessed.
+pub fn pad_visible(s: &str, width: usize) -> String;   // pads to VISIBLE columns
+pub fn visible_len(s: &str) -> usize;                  // SGR-aware; ASCII-width
 pub enum Color { Red, Green, Yellow, Blue, Cyan, Dim, Bold }
 /// Set ONCE in `run()` from `--color`, never from the env dance: recon proved
 /// CLICOLOR_FORCE beats NO_COLOR in owo-colors' supports-color.
@@ -1720,10 +1745,47 @@ pub fn settling(s: &Snapshot, p: &Proposal) -> bool;               // every link
 pub fn unresolved(s: &Snapshot, p: &ProposalId) -> usize;          // v0.2
 pub fn double_claims(s: &Snapshot) -> Vec<(TicketId, Vec<String>)>;
 
-/// Spec staleness, RECOMPUTED at read time from per-ticket cached `changed_paths`
-/// matched against the spec's `code:` globs since its last-edit anchor. NEVER an
-/// accumulated counter: a counter in a disposable cache silently resets to zero
-/// on `rm -rf cache/` and UNDER-fires the tripwire — the dangerous direction. ✅
+/// The attestation seam (D-12), both PURE and both read out of the `## Log` —
+/// so they survive `rm -rf cache/`, travel through git, and never become a
+/// frontmatter field (invariant 1).
+///
+/// `attested` is the standing attestation: the LAST `repair` entry, when the
+/// state it attested is still the ticket's state — so an ordinary verb that
+/// moves the ticket on SPENDS it. `badge` consults it first for a terminal
+/// state and returns `Unknown { why: "attested done by …" }` rather than a
+/// cache-derived merge badge, which is what stops a vouched-for close from
+/// rendering like a proven one on ls / show / board / flow.
+///
+/// `logged_close` is the evidence `plan_repair` demands before it will attest a
+/// `done`: a `done` entry (written only against a sealed `MergedProof` or a
+/// recorded `--no-code` waiver) or a `confirm` entry (D-11, itself refused
+/// without a SHA and a reason). Round-E fix: without it, a `sed` to
+/// `state: done` plus `kanspec repair --why "trust me"` closed an unmerged
+/// ticket and left `doctor` clean — a two-command laundering route strictly
+/// MORE permissive than the `done --no-code` gate it bypassed.
+pub fn attested(t: &Ticket) -> Option<&LogEntry>;
+pub fn logged_close(t: &Ticket) -> bool;
+
+/// Spec staleness, RECOMPUTED at read time from the git observations `scan`
+/// recorded: `SpecAnchor::merges_since` — EVERY merge on main touching the spec's
+/// `code:` globs since its last-edit anchor — widened by the per-ticket cached
+/// `changed_paths`, which name examples. The two counts OVERLAP (a kanspec
+/// ticket's merge is one of the merges git counted), so they combine with `max`,
+/// NEVER a sum. NEVER an accumulated counter either: both are fresh answers to
+/// git questions, so `rm -rf cache/` erases the answer (→ `NeverScanned`) rather
+/// than resetting a tally to a confident zero, which would UNDER-fire the
+/// tripwire — the dangerous direction. ✅
+///
+/// Round-E correction: this comment previously said "from per-ticket cached
+/// `changed_paths`" and the code implemented exactly that, so the tripwire
+/// counted only kanspec's OWN merged tickets and was silent on a teammate's PR,
+/// a hotfix, a dependabot bump — anything predating adoption. `merges_since` was
+/// written by `scan` and read by no production code at all.
+///
+/// A `stale_ack` that POSTDATES `last_edit_at` supersedes the recorded count
+/// (the count is measured from the last edit and answers a question that ack has
+/// closed); it is never subtracted, because a decrement is the counter D-10
+/// forbids. An anchor with no point to count FROM is `NeverScanned`, never `Ok`.
 pub fn staleness(s: &Snapshot, spec: &Spec) -> Staleness;
 #[derive(Serialize)] pub enum Staleness {
     Ok,
@@ -2215,6 +2277,22 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-39 | `Op::WriteGenerated` was documented `KANSPEC-*.md ONLY`, but `board --export board.md` now uses it — it is the only typed op that writes arbitrary bytes to an arbitrary path, and the wave-0 stub for `cmd/board.rs` explicitly routed `--export` through `Store::transact`. | **Granted; the comment was under-describing the op, and the comment is what changed.** Nothing behaves wrongly: `Plan::validate` already permits it, and `writes_tracked_file()` correctly excludes it (a repo-root file is outside `commit_kanspec`'s `:(glob,top).kanspec/**` pathspec, D-33). The op is safe for exports for the same structural reason it is safe for projections — it cannot name a `Key`, so no seal is bypassed by using it. §2.10 and `plan.rs` now say "generated bytes at a path the tracker does not own", and say plainly that it is not a general file writer: an *entity* is written with `CreateEntity`/`SetFields`, which are the ops the seals apply to. |
 | D-40 | D-22 gives `up` one `Arc<Ctx>` plus a `rev`-stamped memoized snapshot. S8 built the `Arc<Ctx>` as an anchor only, constructs a fresh `Ctx` per request, and did not build the memo. | **Deviation ACCEPTED; D-22 amended. This is a correctness fix, not a dropped optimisation, and the reasoning was verified against the code.** `Ctx.now` is stamped **once**, by `detect_now()` in `Ctx::open` (`ctx.rs`), and `load_snapshot` copies it into `Snapshot::now` (`store.rs`) while `transact` stamps it into `LockOwner` and every `## Log` line. A server holding one `Ctx` for a working day would therefore (a) compute every dwell, every STALLED window and every `checked Nm ago` against its own start time, and (b) **write that start time into the Log of every ticket a POST moved** — so the moment a CLI verb in another terminal had logged a later time, `replay`'s monotonicity check would make that ticket permanently unwritable until `kanspec repair`. Cost of the fix is two `git rev-parse`s and a config read per request (~10ms on loopback). Building the memo later requires a `Ctx` whose clock is *not* frozen at construction, which is an **F** change to `ctx.rs`; nobody should attempt it before profiling says the reload hurts (R-6). |
 | D-41 | Every hidden v0.2 arm (`propose`/`review`/`approve`/`close`/`abandon`, `comments`/`comment`/`promote`/`expire`, `landcheck`) was `todo!()`, so running one exited **101** with a panic backtrace, no `--json` envelope, and no fix. | **Closed at integration.** 101 is outside §2.1's `code` set entirely, and to a wrapper script it is indistinguishable from a crashed tool — the opposite of invariant 9. Each handler now returns `KsError::gate(…)` naming what is missing and what to run instead, following `ci::not_yet_v02`'s round-A precedent (exit 1, full envelope, fix list). `landcheck` gets this treatment most urgently: it is the only route to exit **2**, and an unwritten Stop hook that blocked every agent session from ending would be far worse than one that says it is unwritten. The `Render` impls for those reports lost their `todo!()`s too — they are unreachable while the handlers refuse, but a latent panic in dead code is still a latent panic. Pinned by `json_matrix.rs::every_v02_arm_refuses_in_the_documented_exit_range` and `::the_unimplemented_landcheck_never_blocks_a_session`. **This is the shape any future unimplemented verb must take**; a `todo!()` in a dispatchable handler is now a test failure. |
+
+### Round-E resolutions (integration of the five adversarial-audit fixes)
+
+| # | Question | Decision |
+|---|---|---|
+| D-42 | `src/out.rs` is "frozen after wave 0", but the `--color always` fix promoted `visible_len` to `pub` and added `pub fn pad_visible`. Blessed? | **Granted, and §2.12 now records both.** The fix's whole point is that `pad_visible` becomes the ONE padding primitive — a private helper cannot serve a call site outside `out.rs`, and `tests/render_color.rs` is an integration test that can only reach it through the public API. Widening a frozen file by two pure, total functions that add no state and no variant is the cheapest possible way to close a bug *class* rather than an instance. Note the guarantee is narrower than the doc comment implies: `pad_visible`'s "any future column in this file" is scoped to `out.rs`, while `paint` is `pub` and called from ~35 sites across 15 files, so a future `format!("{:<10}", paint(…))` **elsewhere** would reproduce the bug uncaught. No such site exists today (audited: the only files where a painted string and a width specifier coexist are `error.rs` and `cmd/init.rs`, and both feed the specifier unpainted). A crate-wide guard is v0.2. |
+| D-43 | `impl Verb` gains `command`/`command_as`, and `Verb::command()` reads the process-wide `crate::cli::invoked_as()` rather than `ctx.invoked_as`. | **Granted; §2.4 now records both.** `require`'s signature is frozen and carries no `&Ctx`, and it is called from the write path, the board's drag-to-verb and `doctor`; threading a `&str` through all of them to spell one fix line is a contract change out of proportion to the fix. The two values are identical by construction (`ctx.rs` sets `invoked_as: cli.invoked_as()`), and `instructions.rs` already reads the `OnceLock` inside a `fix!`. `command_as` is the seam tests pin both spellings through without racing set-once state. |
+| D-44 | Should `board.rs` and `derive.rs`'s hand-built `format!("kanspec start {id}")` be routed through `Verb::Start.command(id)` too? | **Rejected at integration, as scope.** They are correct today (`start` needs no flag) and wrong only in hardcoding `kanspec` for a `ks` user — which is one instance of **224** hardcoded `"kanspec "` strings in `src/`. Fixing 2 of 224 buys nothing and makes the remaining 222 look deliberate. This is a single mechanical sweep (route every user-facing command string through `invoked_as()`), and it wants its own change with its own test, not a rider on a transitions fix. |
+| D-45 | `repair` into a terminal state now demands log-borne evidence, so an imported repo full of `done` tickets with no `## Log` and no SHAs cannot be attested into `done` at all. | **Accepted as correct, and it is the one behaviour change most likely to be argued with.** `done` is the single state this product computes from git rather than accepting on anyone's word; an escape hatch strictly more permissive than the gate it bypasses is not an escape hatch, it is the gate's absence. The importer's route is to emit the close as a `done` line in the imported `## Log`, which the guard accepts by design. Note the residual: this is **detection, not prevention** — a human with an editor can still hand-write a `repair` line, and `doctor::check_attested_state`'s Error grade is what catches that. Same bargain as R-2. |
+| D-46 | The attested-close badge reuses `Badge::Unknown { why: "attested done by …" }` instead of a new `Badge::Attested`. | **Correct as built; do not add the variant in v0.1.** A new variant changes the `--json` shape of `ls`/`show`/`board`, which agents branch on. `Unknown` is not a euphemism here, it is the literal truth: git proved nothing, a person said so, and the `why` says which person and when. If v0.2 wants a first-class variant it is a one-arm change to `Badge::text` plus the existing precedence block. |
+| D-47 | The committed `KANSPEC-FEATURES.md` lost its `Fresh?` column. Product decision, taken by a fix agent. | **Upheld.** The column was computed from `.kanspec/cache/gitstate.json`, which `init` gitignores — so a git-tracked file was a function of a per-machine disposable artifact and two clones of one commit regenerated different bytes. It could not be made deterministic while remaining freshness, because freshness *is* cache-derived; the only git-tracked freshness signal is `stale_ack`. DESIGN.md's mock-up is corrected rather than the code. Cost: a one-time column removal in the next diff for anyone who committed the file. |
+| D-48 | `doctor::Finding` carries one `fix: String`, but a broken log trail has two or three ranked remedies; and `RunCheck = fn(&Snapshot)` has no repo root, so a fix naming a file prints an absolute path. | **Both real, both DEFERRED to v0.2, neither blocking.** `Finding.fix: Fixes` is the right shape (it is what `KsError` already carries) but `Finding` is a JSON contract agents branch on, so it is a v0.2 cut, not an integration rider. The absolute path is cosmetic and pre-existing (`check_reserved_keys` already had it); the clean fix is to post-process `Finding.fix` in `cmd/doctor.rs`, where a `Ctx` is in hand — deliberately NOT by giving checks a root, which would weaken the `fn(&Snapshot)` purity `purity.rs` enforces. `cmd/repair.rs`'s gate fix line has the same cosmetic issue for the same reason (`plan_repair` is pure). |
+| D-49 | `Staleness::NeverScanned` now has two causes — no anchor at all (wiped/never scanned) vs. a spec never committed to the main ref — and `stale_fix` names `kanspec scan` for both, which is a no-op for the second. | **Accepted for v0.1; the honest answer is still `never scanned`.** Distinguishing them needs a field on the variant or a new one, both forbidden this round. Consequence to know on rollout: a spec created under `sync = "batch"` shows in `features --stale` until its tracker commit lands. `status` stays quiet either way (`attention` ignores both `Ok` and `NeverScanned`). |
+| D-50 | `out::visible_len` counts `char`s, so a CJK or emoji grapheme measures 1 where a terminal draws 2, and it ends an escape at the first `m` (right for SGR, wrong for OSC-8). | **Left alone deliberately; unreachable today.** kanspec emits only SGR, and ids are ASCII by construction (`ids.rs`). Fixing it properly needs a `unicode-width` dependency and a real CSI parser — a dependency decision, and one to take only if titles are ever allowed to carry CJK or the board grows clickable links. Recorded so the next person does not discover it in a terminal. |
+| D-51 | Two agents wrote outside their assigned file lists: the `repair` fix touched `derive.rs` and `tests/doctor_replay.rs`; the projections fix touched `instructions.rs` and `cmd/done.rs`. `derive.rs` was edited by **two** branches in the same wave. | **All four accepted; no conflict occurred.** The two `derive.rs` edits are textually disjoint (the attestation seam near the top and `badge`; `staleness` and the test module ~300 lines down) and semantically independent — different functions, no shared state — so `git merge` auto-resolved and both are verified live. Each excursion was forced and correctly reported rather than hidden: `derive::badge` is the single seam `ls`/`show`/`board`/`flow` all read, so editing it beat editing four call sites; the agent snippet const cannot move to `setup.rs` without breaking `single_write_path.rs`; and `done.rs`'s one added `regenerate` line was demanded by a new failing guard test. **The lesson for the next wave is that ownership lists should be derived from the fix, not assigned ahead of it** — three of five findings could not be fixed inside their nominal list. |
+| D-52 | Three existing tests asserted the defects being fixed and had to be changed. | **All three changes upheld after reading them; none was a weakening, and none was deleted** (verified by diffing the full test-name set before and after: 465 → 508, zero removals). `doctor_replay.rs`'s `an_attested_repair_line_makes_a_diverged_ticket_replay_clean_again` asserted that an unmerged ticket attested into `done` produced *zero* findings — i.e. it asserted the laundering route was fine; its fixture moved to a non-terminal attestation, preserving its stated purpose, and the terminal case it used to bless is now covered by a new test that asserts the opposite. `a_hand_edited_state_is_caught_by_the_very_next_run` asserted the fix line *should* be `kanspec repair …`, the prescription being removed; it was inverted. `cmd/repair.rs`'s `a_hand_edited_state_is_recoverable_by_attestation` built frontmatter `done` over a log stopping at `review` and asserted `plan` **succeeded** — the exact two-command route, blessed by a unit test; its fixture moved to a non-terminal state. **That a defect is asserted by three passing tests is the finding, not a footnote:** the suite encoded the bug, so the bug was invisible to it by construction. |
 
 ### Known limits carried forward, stated out loud
 

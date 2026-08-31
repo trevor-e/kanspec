@@ -7,7 +7,13 @@
 //!
 //! `derive::staleness` then counts merges from `max(last_edit_at, stale_ack.at)`, so the
 //! tripwire resets **because the attestation is newer**, with nobody incrementing or
-//! decrementing anything.
+//! decrementing anything. Sharper still, and the rule the reset actually depends on: an ack
+//! that POSTDATES `last_edit_at` **supersedes** the recorded `SpecAnchor::merges_since`
+//! outright rather than being subtracted from it — `scan` measures that count from the last
+//! edit and from nowhere else, so once the ack is newer the count answers a question the
+//! human has already closed. Subtracting instead would leave `--confirm` unable to clear a
+//! spec until the ack commit itself reached main and was re-scanned, and a decrement is
+//! precisely the counter D-10 forbids.
 //!
 //! Plain `features` is a **read**: it renders the map live and writes nothing. Keeping the
 //! committed `KANSPEC-FEATURES.md` current is the job of the verbs that change a spec, a
