@@ -9,6 +9,12 @@
 //! tripwire resets **because the attestation is newer**, with nobody incrementing or
 //! decrementing anything.
 //!
+//! Plain `features` is a **read**: it renders the map live and writes nothing. Keeping the
+//! committed `KANSPEC-FEATURES.md` current is the job of the verbs that change a spec, a
+//! decision or a quirk — each of which calls `project::regenerate` — and of `scan`, which
+//! catches the hand-edits DESIGN.md's workflow makes on an implementation branch. Reading
+//! the map must never be the only way to refresh the file a teammate sees on GitHub.
+//!
 //! Owner: **S6**.
 
 use serde::Serialize;
@@ -29,7 +35,7 @@ use crate::{fix, fixes};
 #[derive(Debug, Serialize)]
 pub struct FeaturesReport {
     pub rows: Vec<FeatureRow>,
-    /// the path the projection was regenerated to
+    /// the path the projection was regenerated to, `None` when no byte moved
     pub written: Option<String>,
     pub confirmed: Option<SpecName>,
     pub next: Vec<String>,
@@ -111,7 +117,11 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
             sets: vec![(Key::Spec(SpecKey::StaleAck), ack.clone())],
         }]))
     })?;
-    project::regenerate(ctx)?;
+    // Reported only when a byte actually moved. An attestation lands in the spec's
+    // frontmatter, and the committed feature map is a function of `feature:`/`code:`/
+    // provenance — so it usually does NOT move, and claiming "regenerated" every time
+    // would put a line in front of the human that `git status` then contradicts.
+    let written = project::regenerate(ctx)?.then(|| rel(ctx, ctx.layout.features_md()));
 
     let snap = ctx.snapshot()?;
     Ok(FeaturesReport {
@@ -119,7 +129,7 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
             .into_iter()
             .filter(|r| r.spec == name)
             .collect(),
-        written: Some(rel(ctx, ctx.layout.features_md())),
+        written,
         confirmed: Some(name),
         next: vec![format!("{} features --stale", ctx.invoked_as)],
     })
@@ -133,7 +143,8 @@ fn rel(ctx: &Ctx, p: &std::path::Path) -> String {
 }
 
 /// One glyph per verdict, so the terminal table, the board's feature strip and the
-/// projection's `Fresh?` column can be read the same way at a glance.
+/// `spec show` footer can be read the same way at a glance. All three are LIVE reads; the
+/// committed projection carries no freshness at all (see `project`'s module header).
 fn dot(s: &Staleness) -> char {
     match s {
         Staleness::Ok => glyph::OK,

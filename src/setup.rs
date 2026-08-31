@@ -471,6 +471,43 @@ fn bad(what: &str) -> KsError {
 mod tests {
     use super::*;
 
+    /// Every `<bin> …` command the snippet prescribes, as a subcommand path
+    /// (`["quirk", "add"]`).
+    ///
+    /// Backticked spans only. The snippet also names `.kanspec/proposals/closed/`, which is a
+    /// store path rather than a verb — and it sits *outside* backticks for exactly that
+    /// reason, which is the property `instructions.rs` already pins.
+    ///
+    /// A span ends at its first token that is not a bare word — `<id>`, `"…"`, `--json` — so
+    /// `ship <id> --pr <n>` yields `["ship"]` while `quirk add "…" --paths <glob>` yields
+    /// `["quirk", "add"]`. A trailing bare word that turns out to be a positional rather than
+    /// a subcommand (`instructions start`) is dropped by the caller, which is the half that
+    /// can see the tree.
+    fn commands_named_in(snippet: &str, bin: &str) -> Vec<Vec<String>> {
+        fn is_verb_word(t: &str) -> bool {
+            !t.is_empty()
+                && !t.starts_with('-')
+                && t.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        }
+        let mut out: Vec<Vec<String>> = Vec::new();
+        // Odd spans are the insides of the backtick pairs.
+        for span in snippet.split('`').skip(1).step_by(2) {
+            let mut words = span.split_whitespace();
+            if words.next() != Some(bin) {
+                continue;
+            }
+            let path: Vec<String> = words
+                .take_while(|w| is_verb_word(w))
+                .map(str::to_string)
+                .collect();
+            if !path.is_empty() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     fn entries() -> Vec<(&'static str, String, String)> {
         vec![
             ("SessionStart", String::new(), "kanspec prime".into()),
@@ -607,6 +644,83 @@ mod tests {
         assert!(!is_kanspec_command("echo mine"));
         assert!(!is_kanspec_command("works prime"), "word boundaries matter");
         assert!(!is_kanspec_command("kanspec status"));
+    }
+
+    /// The agent contract may not prescribe a command the binary refuses.
+    ///
+    /// This snippet is the ONLY thing most agent sessions ever read about kanspec, and it
+    /// is permanent context — so a line in it that exits 1 is not a small bug. Through
+    /// v0.1 it prescribed `kanspec comments --unresolved --json` and `kanspec comment
+    /// resolve <cm-id> --note "…"`: both are v0.2, both `#[command(hide = true)]`, both
+    /// exit 1. Every session that followed the contract literally hit a refusal, and an
+    /// agent that has been refused once stops trusting the block that refused it.
+    ///
+    /// Walked off the finished clap tree rather than off a hand-kept list, because a list
+    /// is the thing that drifted. `hide` is the project's own marker for "v0.2, body not
+    /// shipped" (see `cli.rs`), so hidden is disqualifying, not merely undocumented.
+    #[test]
+    fn the_snippet_only_prescribes_commands_the_binary_actually_has() {
+        use clap::CommandFactory;
+        let root = crate::cli::Cli::command();
+
+        // Both spellings: `agent_snippet` rewrites the binary name inside backticks, and a
+        // rewrite that mangled a command path would be invisible under the default name.
+        for bin in ["kanspec", "ks"] {
+            let text = snippet(bin);
+            let named = commands_named_in(&text, bin);
+            assert!(
+                named.len() >= 8,
+                "only {} commands found in the snippet — the extractor stopped seeing them:\n{text}",
+                named.len()
+            );
+            for path in &named {
+                let mut node = &root;
+                for name in path {
+                    // A bare word under a leaf is a positional (`instructions start`),
+                    // not a subcommand. Nothing left to check on this span.
+                    if node.get_subcommands().next().is_none() {
+                        break;
+                    }
+                    let sub = node
+                        .get_subcommands()
+                        .find(|s| s.get_name() == name)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the agent contract prescribes `{bin} {}`, which this \
+                                 binary has no command for",
+                                path.join(" ")
+                            )
+                        });
+                    assert!(
+                        !sub.is_hide_set(),
+                        "the agent contract prescribes `{bin} {}`, but `{name}` is hidden \
+                         — hidden means v0.2, and v0.2 verbs exit 1",
+                        path.join(" ")
+                    );
+                    node = sub;
+                }
+            }
+        }
+    }
+
+    /// The extractor is doing real work, so it gets its own proof: a store path is not a
+    /// verb, and a placeholder is not a subcommand.
+    #[test]
+    fn only_backticked_verbs_count_as_prescribed_commands() {
+        let found = commands_named_in(
+            "prose `kanspec quirk add \"x\" --paths <g>` and `kanspec ship <id> --pr <n>` \
+             and `kanspec ready --json`, never read .kanspec/proposals/closed/ and \
+             `git status` is not ours",
+            "kanspec",
+        );
+        assert_eq!(
+            found,
+            vec![
+                vec!["quirk".to_string(), "add".to_string()],
+                vec!["ship".to_string()],
+                vec!["ready".to_string()],
+            ]
+        );
     }
 
     #[test]

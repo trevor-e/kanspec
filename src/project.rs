@@ -2,16 +2,35 @@
 //! written to the **repo root** where a teammate browsing GitHub will find them.
 //!
 //! Projections cannot rot independently of their sources — which is exactly why they are
-//! safe to put in plain sight. Regenerated on `scan`, and on any `transact` that touched a
-//! spec or a decision (D-20), through `Op::WriteGenerated` inside the same lock.
+//! safe to put in plain sight. Regenerated on `scan`, and by **every verb that changes a
+//! spec, a decision or a quirk** (D-20), through `Op::WriteGenerated` in a short
+//! transaction of its own immediately after the write (D-34, see [`regenerate`]).
 //!
-//! **Nothing rendered here reads a clock.** DESIGN.md's mock-up carries a "regenerated
-//! <date>" line; it is deliberately absent, because these two files are *committed*. A
-//! timestamp would make every `scan` — which the `post-merge` and `post-checkout` hooks run
-//! on every checkout — produce a one-line git diff, and a projection that dirties the tree
-//! on every checkout is one a human deletes from their repo within a week. Rendered purely
-//! from the snapshot, an unchanged corpus rewrites byte-identical bytes and `git status`
-//! stays silent.
+//! # A committed file is a pure function of the committed corpus
+//!
+//! These two files are **git-tracked**, which fixes what may appear in them: every byte
+//! must be derivable from the git-tracked sources of the same commit, and from nothing
+//! else. Two clones of one commit must regenerate identical bytes, or the projection stops
+//! being a projection and becomes a per-machine artifact that conflicts on merge and lies
+//! in a PR diff.
+//!
+//! Two things are therefore excluded, for the same reason:
+//!
+//! * **The clock.** DESIGN.md's mock-up carries a "regenerated <date>" line; it is
+//!   deliberately absent. A timestamp would make every `scan` — which the `post-merge` and
+//!   `post-checkout` hooks run on every checkout — produce a one-line git diff, and a
+//!   projection that dirties the tree on every checkout is one a human deletes from their
+//!   repo within a week.
+//! * **`cache/gitstate.json`.** DESIGN.md's mock-up also carries a `Fresh?` column, and it
+//!   is absent for a sharper reason: [`Staleness`] is computed from the *disposable* cache,
+//!   so the same commit renders `never scanned` on a fresh clone and `ok` — or
+//!   `dead globs: …` — once someone has run `scan`. Freshness is live board furniture, not
+//!   a committed fact; it stays on the `features` table, the `spec show` footer and the
+//!   board's feature strip, all of which are read at the moment they are printed.
+//!
+//! What is left is `feature:` + `code:` + the `{p-xxxx}` provenance tokens, all of which
+//! live in the spec files themselves. Rendered purely from those, an unchanged corpus
+//! rewrites byte-identical bytes and `git status` stays silent.
 //!
 //! Owner: **S6**.
 
@@ -59,6 +78,16 @@ pub fn feature_rows(s: &Snapshot) -> Vec<FeatureRow> {
         .collect()
 }
 
+/// The footer that replaces the `Fresh?` column, so a teammate reading the committed page
+/// is told where freshness actually lives instead of quietly not being told at all.
+///
+/// It names `kanspec` literally rather than `cli::invoked_as()`: the binary a *particular*
+/// process was invoked as is exactly the kind of ambient state a committed file may not
+/// depend on — `ks` and `kanspec` must write the same bytes. `GENERATED_HEADER` hardcodes
+/// the name for the same reason.
+const FRESHNESS_FOOTER: &str =
+    "\nStaleness is computed from git at read time, not stored here: `kanspec features --stale`.\n";
+
 pub fn render_features(rows: &[FeatureRow]) -> String {
     let mut o = String::new();
     o.push_str(GENERATED_HEADER);
@@ -67,11 +96,13 @@ pub fn render_features(rows: &[FeatureRow]) -> String {
         o.push_str("No specs yet — `kanspec spec new <name> --code \"src/**\"`.\n");
         return o;
     }
-    o.push_str("| Feature | Spec | Code | Last shipped change | Fresh? |\n");
-    o.push_str("|---|---|---|---|---|\n");
+    // Four columns, every one of them read out of the spec FILES. `FeatureRow::staleness`
+    // is deliberately not among them — see the module header.
+    o.push_str("| Feature | Spec | Code | Last shipped change |\n");
+    o.push_str("|---|---|---|---|\n");
     for r in rows {
         o.push_str(&format!(
-            "| {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} |\n",
             cell(&r.feature),
             r.spec,
             if r.code.is_empty() {
@@ -80,14 +111,16 @@ pub fn render_features(rows: &[FeatureRow]) -> String {
                 cell(&r.code.join(", "))
             },
             r.last_shipped.as_deref().unwrap_or("—"),
-            fresh_cell(&r.staleness),
         ));
     }
+    o.push_str(FRESHNESS_FOOTER);
     o
 }
 
-/// The one wording for a staleness verdict, shared by the projection, `features` and the
-/// `spec show` footer — so the table, the terminal and the board cannot disagree.
+/// The one wording for a staleness verdict, shared by `features`, the `spec show` footer
+/// and the board's feature strip — every one of them a LIVE read, so the terminal and the
+/// board cannot disagree. The committed projection is not among them: see the module
+/// header for why a disposable cache may not reach a git-tracked file.
 pub fn fresh_cell(s: &Staleness) -> String {
     match s {
         Staleness::Ok => "ok".to_string(),
@@ -191,16 +224,26 @@ pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
     ])
 }
 
-/// Rewrite both projections from whatever is on disk **now**.
+/// Rewrite both projections from whatever is on disk **now**. `Ok(false)` means they
+/// already said the right thing and no byte moved.
+///
+/// **Every verb that mutates a spec, a decision or a quirk calls this**, not just `scan`.
+/// DESIGN.md's sanctioned workflow edits specs directly on the implementation branch and
+/// reviews them as an ordinary diff; if the committed feature map only caught up on the
+/// next `scan`, the reviewer of that very PR would read the old prose — the exact silent
+/// rot the projections exist to prevent. The verb that touched the source is the one that
+/// republishes it, so the two land in the same `git status`. Rendering the map with
+/// `features` is a READ and refreshes nothing; it must never be the only way to get a
+/// current file.
 ///
 /// D-20 asks for regeneration "inside the same lock" as the write that changed a spec or a
 /// decision. This deliberately runs as its own short transaction immediately after that
 /// write, for a reason the D-20 wording did not anticipate: a planner receives the
 /// snapshot as it was **before** its own plan applies. Regenerating from that snapshot
 /// would leave `KANSPEC-FEATURES.md` permanently one write behind — a brand-new spec would
-/// be missing from the table until some *later* verb happened to run — which is precisely
-/// the silent rot the projections exist to prevent. `Store::transact` reloads a fresh
-/// snapshot inside the lock, so a second transaction sees the write that just landed.
+/// be missing from the table until some *later* verb happened to run. `Store::transact`
+/// reloads a fresh snapshot inside the lock, so a second transaction sees the write that
+/// just landed.
 ///
 /// The cost is R-1's window, one lock cycle wide: a crash between the two leaves the
 /// projections one write stale, and the next verb or `scan` heals it. Being briefly stale
@@ -209,10 +252,10 @@ pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
 /// `post-checkout` hooks, i.e. on every checkout: rewriting two identical files each time
 /// would take the advisory lock, bump `Snapshot::rev` and push an SSE frame at every open
 /// browser tab, for no change anyone can see.
-pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<()> {
+pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<bool> {
     let want = plan_regenerate(&ctx.snapshot()?, &ctx.layout)?;
     if want.iter().all(unchanged) {
-        return Ok(());
+        return Ok(false);
     }
     crate::store::Store::open(ctx).transact(
         // A projection rewrite transitions no ticket, which `transact` now says in the type
@@ -226,7 +269,7 @@ pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<()> {
         // `Store::transact` reloads to avoid.
         |s, _m| Ok(crate::plan::Plan::of(plan_regenerate(s, &ctx.layout)?)),
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn unchanged(op: &Op) -> bool {
@@ -327,7 +370,9 @@ mod tests {
             .lines()
             .find(|l| l.contains("auth"))
             .expect("the auth row");
-        assert_eq!(row.matches('|').count() - row.matches("\\|").count(), 6);
+        // Four columns, so five delimiters — and the escaped pipe from the one-liner is
+        // not one of them.
+        assert_eq!(row.matches('|').count() - row.matches("\\|").count(), 5);
     }
 
     #[test]
@@ -342,6 +387,66 @@ mod tests {
             render_features(&feature_rows(&s))
         );
         assert_eq!(render_architecture(&s), render_architecture(&s));
+    }
+
+    /// The committed projection may not depend on `cache/gitstate.json`.
+    ///
+    /// Holding the cache fixed and rendering twice only proves the renderer is a function;
+    /// it says nothing about the input the cache contributes. This VARIES the cache across
+    /// the whole range one can be in — absent (a fresh clone), scanned-and-clean, and
+    /// scanned-with-rotted-globs — and demands identical bytes, because two clones of one
+    /// commit differ in exactly this and in nothing else.
+    #[test]
+    fn the_committed_feature_map_ignores_the_disposable_cache_entirely() {
+        let mut s = snap();
+        let sp = spec("auth");
+        let name = sp.name.clone();
+        s.specs.insert(name.clone(), sp);
+
+        // A fresh clone: nobody has run `scan` here.
+        assert!(s.git.specs.is_empty());
+        let cold = render_features(&feature_rows(&s));
+        assert!(matches!(
+            derive::staleness(&s, &s.specs[&name]),
+            Staleness::NeverScanned
+        ));
+
+        // Scanned, globs alive.
+        s.git.specs.insert(
+            name.clone(),
+            crate::cache::SpecAnchor {
+                last_edit_sha: Some("a1b9c3d5f00".into()),
+                last_edit_at: Some(Utc.with_ymd_and_hms(2026, 8, 20, 9, 0, 0).unwrap()),
+                merges_since: 0,
+                dead_globs: Vec::new(),
+            },
+        );
+        let scanned = render_features(&feature_rows(&s));
+
+        // Scanned, and every glob has rotted — the loudest verdict there is.
+        s.git.specs.get_mut(&name).unwrap().dead_globs = vec!["src/auth/**".into()];
+        let rotted = render_features(&feature_rows(&s));
+        assert!(matches!(
+            derive::staleness(&s, &s.specs[&name]),
+            Staleness::DeadGlobs { .. }
+        ));
+
+        assert_eq!(
+            cold, scanned,
+            "a clone that has never scanned must commit the same bytes as one that has"
+        );
+        assert_eq!(
+            scanned, rotted,
+            "glob rot is a live finding, not a fact to commit"
+        );
+        for verdict in ["never scanned", "dead globs", "STALE:"] {
+            assert!(
+                !cold.contains(verdict),
+                "`{verdict}` is cache state and must not reach a git-tracked file:\n{cold}"
+            );
+        }
+        // …and the page still tells the reader where freshness DOES live.
+        assert!(cold.contains("features --stale"), "{cold}");
     }
 
     #[test]
