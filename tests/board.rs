@@ -74,7 +74,11 @@ fn json(repo: &TestRepo, args: &[&str]) -> Value {
         r.stderr
     );
     serde_json::from_str(&r.stdout).unwrap_or_else(|e| {
-        panic!("`kanspec {}` did not print JSON ({e}):\n{}", all.join(" "), r.stdout)
+        panic!(
+            "`kanspec {}` did not print JSON ({e}):\n{}",
+            all.join(" "),
+            r.stdout
+        )
     })
 }
 
@@ -329,7 +333,14 @@ fn the_columns_are_design_mds_columns_and_the_cards_are_where_git_says() {
     let titles: Vec<&str> = cols.iter().map(|c| c["title"].as_str().unwrap()).collect();
     assert_eq!(
         titles,
-        vec!["BACKLOG", "READY", "DOING", "REVIEW", "IN MAIN ⇂", "DONE (7d)"]
+        vec![
+            "BACKLOG",
+            "READY",
+            "DOING",
+            "REVIEW",
+            "IN MAIN ⇂",
+            "DONE (7d)"
+        ]
     );
 
     let find = |id: &str| -> String {
@@ -365,7 +376,13 @@ fn the_columns_are_design_mds_columns_and_the_cards_are_where_git_says() {
 fn a_discovered_ticket_keeps_its_link_and_lands_in_the_unspecced_lane() {
     let f = fixture();
     let board = model(&f.repo);
-    let doing = f.aliases.iter().find(|(_, a)| *a == "t-dong").unwrap().0.clone();
+    let doing = f
+        .aliases
+        .iter()
+        .find(|(_, a)| *a == "t-dong")
+        .unwrap()
+        .0
+        .clone();
 
     let mut found = false;
     let mut unspecced = 0;
@@ -383,8 +400,14 @@ fn a_discovered_ticket_keeps_its_link_and_lands_in_the_unspecced_lane() {
             }
         }
     }
-    assert!(found, "the ◇ chip's source field never reached a card:\n{board}");
-    assert_eq!(unspecced, 1, "the shame lane holds exactly the unspecced card");
+    assert!(
+        found,
+        "the ◇ chip's source field never reached a card:\n{board}"
+    );
+    assert_eq!(
+        unspecced, 1,
+        "the shame lane holds exactly the unspecced card"
+    );
 
     // Both surfaces name it, so neither can quietly drop it.
     let md = {
@@ -392,7 +415,10 @@ fn a_discovered_ticket_keeps_its_link_and_lands_in_the_unspecced_lane() {
         f.repo.read("board.md")
     };
     assert!(md.contains("## Unspecced (1)"), "{md}");
-    assert!(ks(&f.repo, &["board"]).ok().stdout.contains("◇ discovered in"));
+    assert!(ks(&f.repo, &["board"])
+        .ok()
+        .stdout
+        .contains("◇ discovered in"));
 }
 
 /// DESIGN.md's Worktrees tab: one row per checkout with the ahead/behind-main figure from
@@ -402,7 +428,10 @@ fn the_worktrees_tab_carries_ahead_behind_main_for_every_row() {
     let f = fixture();
     let board = model(&f.repo);
     let rows = board["worktrees"].as_array().expect("worktrees");
-    assert!(rows.len() >= 2, "the fixture has a linked worktree: {rows:?}");
+    assert!(
+        rows.len() >= 2,
+        "the fixture has a linked worktree: {rows:?}"
+    );
 
     let claimed = rows
         .iter()
@@ -425,7 +454,11 @@ fn a_wiped_cache_makes_the_board_say_so_instead_of_guessing() {
     std::fs::remove_dir_all(f.repo.root.join(".kanspec/cache")).expect("the cache is wipeable");
 
     let r = ks(&f.repo, &["board"]);
-    assert_eq!(r.code, 0, "the board must survive a cache wipe:\n{}", r.stderr);
+    assert_eq!(
+        r.code, 0,
+        "the board must survive a cache wipe:\n{}",
+        r.stderr
+    );
     assert!(
         r.stdout.contains("merge state never scanned"),
         "a board with no facts must say so:\n{}",
@@ -658,7 +691,11 @@ fn a_post_and_the_equivalent_cli_verb_write_byte_identical_files() {
     );
     // And it really did transition — a test that compares two unchanged files proves
     // nothing.
-    assert!(through_http.1.contains("state: doing"), "{}", through_http.1);
+    assert!(
+        through_http.1.contains("state: doing"),
+        "{}",
+        through_http.1
+    );
     assert!(through_http.1.contains(" start"), "{}", through_http.1);
 }
 

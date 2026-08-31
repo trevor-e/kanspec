@@ -10,16 +10,17 @@
 //!
 //! Owner: **V2**, v0.2.
 
-// Wave-0 skeleton. The bodies below are `todo!("V2: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
+// Wave-0 skeleton. The bodies below are unwritten; these two allows exist ONLY so the
+// skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
 #![allow(unused_variables, dead_code)]
 
 use serde::Serialize;
 
 use crate::cli::LandcheckArgs;
 use crate::ctx::Ctx;
-use crate::error::Result;
+use crate::error::{KsError, Result};
 use crate::out::{Render, Style};
+use crate::{fix, fixes};
 
 /// Private field: only this file can mint one, so `grep -r 'BlockToken'` is a complete
 /// audit of every route to exit 2.
@@ -65,12 +66,40 @@ impl LandcheckReport {
     }
 }
 
+/// V2 lands here: block when a committed diff exists but the claimed ticket had no update
+/// this session, when unresolved comments target a proposal this session edited, or when
+/// `done` skipped the knowledge check; `--dry-run` reports without minting a `BlockToken`;
+/// honour `[hooks] landcheck`.
+///
+/// **Until then it REFUSES rather than panics** (round-D hardening). A `todo!()` here
+/// exited 101 with a backtrace and no `--json` envelope — outside §2.1's documented code
+/// set entirely, and read by a wrapper script as a crashed tool rather than a tool that
+/// declined. It must never accidentally exit 2 either: 2 is the sealed Stop-hook block,
+/// and an unimplemented check that blocks every agent session from ending is strictly
+/// worse than one that says so. `KsError::Gate` exits 1.
 pub fn landcheck(ctx: &Ctx, a: &LandcheckArgs) -> Result<LandcheckReport> {
-    todo!("V2: block when a committed diff exists but the claimed ticket had no update this session, when unresolved comments target a proposal this session edited, or when `done` skipped the knowledge check; --dry-run reports without minting a BlockToken; honour [hooks] landcheck")
+    Err(KsError::gate(
+        "landcheck_v02",
+        "`landcheck` lands in v0.2 — kanspec will not report a session clean by declining \
+         to look at it",
+        fixes![
+            fix!("set [hooks] landcheck = false in .kanspec/config.toml"),
+            fix!("{} status", ctx.invoked_as),
+            fix!("{} doctor", ctx.invoked_as),
+        ],
+    ))
 }
 
 impl Render for LandcheckReport {
+    /// V2 prints nothing when clean; else one line per reason, each with its verb.
+    ///
+    /// Unreachable while `landcheck` above refuses — the handler is this type's only
+    /// constructor — but written as a real body rather than a `todo!()` so that reaching it
+    /// is a wrong answer instead of a panic.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("V2: print nothing when clean; else one line per reason, each with its verb")
+        for r in &self.reasons {
+            crate::out::Line::new(crate::out::glyph::FIX, r.as_str()).write(w, st)?;
+        }
+        Ok(())
     }
 }

@@ -79,8 +79,15 @@ enum Needs {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Run {
     Yes,
-    /// v0.2: the handler is `todo!()` and would panic, not print JSON
+    /// v0.2: the handler is unwritten, so it cannot be asserted to *succeed* — but it is
+    /// still run, by `every_v02_arm_refuses_in_the_documented_exit_range` below. Round D
+    /// converted these from `todo!()` (exit **101**, no envelope) to a typed `Gate`.
     V02,
+    /// Hidden, but genuinely answerable in v0.1: bare `ci` reports the detected provider
+    /// and an empty row set, which is the true answer for a repo whose per-ticket CI
+    /// *reader* lands in v0.2 (`ci why` DOES refuse, and is `V02` above). It exits 0, so it
+    /// is held to the success matrix's shape rather than the refusal matrix's.
+    V02Read,
     /// blocks in the foreground until Ctrl-C
     Server,
 }
@@ -119,7 +126,11 @@ fn cases() -> Vec<Case> {
         c("instructions", &["instructions"], Needs::Bare),
         c("completions", &["completions", "bash"], Needs::Bare),
         // ── TICKETS ──────────────────────────────────────────────────────────
-        c("new", &["new", "A fresh ticket", "--spec", "auth"], Needs::Bare),
+        c(
+            "new",
+            &["new", "A fresh ticket", "--spec", "auth"],
+            Needs::Bare,
+        ),
         c("ready", &["ready"], Needs::Todo),
         c("start", &["start", "{id}"], Needs::Todo),
         c("ship", &["ship", "{id}"], Needs::Doing),
@@ -132,43 +143,87 @@ fn cases() -> Vec<Case> {
         c("log", &["log", "{id}"], Needs::Todo),
         c("where", &["where"], Needs::Doing),
         c("ls", &["ls", "--all"], Needs::Todo),
-        c("repair", &["repair", "{id}", "--why", "matrix"], Needs::Todo),
+        c(
+            "repair",
+            &["repair", "{id}", "--why", "matrix"],
+            Needs::Todo,
+        ),
         // ── STATUS & GIT TRUTH ───────────────────────────────────────────────
         c("status", &["status"], Needs::Todo),
         c("scan", &["scan", "--no-fetch"], Needs::Review),
         c("board", &["board"], Needs::Todo),
         skip("up", &["up"], Run::Server),
         c("open", &["open"], Needs::Bare),
-        skip("ci", &["ci"], Run::V02),
+        skip("ci", &["ci"], Run::V02Read),
         skip("ci why", &["ci", "why", "t-9c41"], Run::V02),
         // ── PROVENANCE & DECISIONS ───────────────────────────────────────────
         c("rules", &["rules"], Needs::Bare),
         c("why", &["why", "auth#jwt"], Needs::Bare),
         c("decide", &["decide", "A matrix decision"], Needs::Bare),
         c("accept", &["accept", "D-8c1a"], Needs::Bare),
-        c("supersede", &["supersede", "D-8c1a", "--with", "a newer call"], Needs::Bare),
-        c("revoke", &["revoke", "D-8c1a", "--why", "matrix"], Needs::Bare),
+        c(
+            "supersede",
+            &["supersede", "D-8c1a", "--with", "a newer call"],
+            Needs::Bare,
+        ),
+        c(
+            "revoke",
+            &["revoke", "D-8c1a", "--why", "matrix"],
+            Needs::Bare,
+        ),
         // ── KNOWLEDGE ────────────────────────────────────────────────────────
         c("features", &["features"], Needs::Bare),
-        c("spec new", &["spec", "new", "billing", "--code", "src/billing/**"], Needs::Bare),
+        c(
+            "spec new",
+            &["spec", "new", "billing", "--code", "src/billing/**"],
+            Needs::Bare,
+        ),
         c("spec show", &["spec", "show", "auth"], Needs::Bare),
         c("spec grep", &["spec", "grep", "token"], Needs::Bare),
-        c("quirk add", &["quirk", "add", "A matrix quirk", "--paths", "src/auth/**"], Needs::Bare),
-        c("quirk fix", &["quirk", "fix", "q-11ba", "--by", "{id}"], Needs::Todo),
+        c(
+            "quirk add",
+            &["quirk", "add", "A matrix quirk", "--paths", "src/auth/**"],
+            Needs::Bare,
+        ),
+        c(
+            "quirk fix",
+            &["quirk", "fix", "q-11ba", "--by", "{id}"],
+            Needs::Todo,
+        ),
         c("quirks", &["quirks"], Needs::Bare),
         c("prime", &["prime"], Needs::Todo),
         // ── PROPOSALS & REVIEW (v0.2) ────────────────────────────────────────
         skip("propose", &["propose", "A proposal"], Run::V02),
         skip("review", &["review", "p-7de2"], Run::V02),
         skip("comments", &["comments"], Run::V02),
-        skip("comment add", &["comment", "add", "p-7de2#c1", "--body", "x"], Run::V02),
-        skip("comment reply", &["comment", "reply", "cm-1111", "--body", "x"], Run::V02),
-        skip("comment resolve", &["comment", "resolve", "cm-1111", "--note", "x"], Run::V02),
+        skip(
+            "comment add",
+            &["comment", "add", "p-7de2#c1", "--body", "x"],
+            Run::V02,
+        ),
+        skip(
+            "comment reply",
+            &["comment", "reply", "cm-1111", "--body", "x"],
+            Run::V02,
+        ),
+        skip(
+            "comment resolve",
+            &["comment", "resolve", "cm-1111", "--note", "x"],
+            Run::V02,
+        ),
         skip("approve", &["approve", "p-7de2"], Run::V02),
         skip("close", &["close", "p-7de2"], Run::V02),
         skip("abandon", &["abandon", "p-7de2", "--why", "x"], Run::V02),
-        skip("promote", &["promote", "p-7de2#p1", "--as", "decision"], Run::V02),
-        skip("expire", &["expire", "p-7de2#p2", "--reason", "x"], Run::V02),
+        skip(
+            "promote",
+            &["promote", "p-7de2#p1", "--as", "decision"],
+            Run::V02,
+        ),
+        skip(
+            "expire",
+            &["expire", "p-7de2#p2", "--reason", "x"],
+            Run::V02,
+        ),
         skip("landcheck", &["landcheck"], Run::V02),
     ]
 }
@@ -207,8 +262,8 @@ fn the_matrix_covers_every_command_in_the_clap_tree() {
     assert!(tree.len() > 40, "the command tree shrank: {}", tree.len());
 }
 
-/// The only commands excluded from the RUN matrix are the v0.2 arms (whose handlers are
-/// `todo!()`) and `up` (which blocks until Ctrl-C). Asserting the list's shape is what
+/// The only commands excluded from the SUCCESS matrix are the v0.2 arms (whose handlers
+/// are unwritten) and `up` (which blocks until Ctrl-C). Asserting the list's shape is what
 /// stops a v0.1 command being parked here to make a failure go away.
 #[test]
 fn nothing_is_excluded_from_the_run_matrix_without_a_reason() {
@@ -227,7 +282,7 @@ fn nothing_is_excluded_from_the_run_matrix_without_a_reason() {
                 "{} is a hidden v0.2 arm but the matrix tries to run it",
                 case.path
             ),
-            Run::V02 => assert!(
+            Run::V02 | Run::V02Read => assert!(
                 hidden.contains(top),
                 "{} is excluded as v0.2 but the CLI ships it as v0.1",
                 case.path
@@ -257,6 +312,118 @@ fn every_command_accepts_the_json_flag() {
             .unwrap_or_else(|e| panic!("`{}` does not parse with --json:\n{e}", argv.join(" ")));
         assert!(cli.json, "--json did not reach Cli::json for {}", case.path);
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1b. THE EXIT-CODE CONTRACT — an unimplemented verb refuses, it does not crash
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Added in round D, and the reason it exists is a bug this file previously excused.
+///
+/// Every hidden v0.2 arm was `todo!()`, so `kanspec landcheck` (and eight others) exited
+/// **101** — Rust's panic code, outside §2.1's documented set entirely — after printing a
+/// backtrace to stderr and *nothing* to stdout. Under `--json` that is the worst shape
+/// available: an agent gets an empty stdout, an undocumented code, and no fix.
+///
+/// A verb kanspec has not built yet must REFUSE like any other gate. This runs all ten
+/// hidden arms for real — `V02Read` included, which is held to the weaker half (no panic,
+/// documented code, JSON on stdout) because bare `ci` answers honestly with exit 0.
+#[test]
+fn every_v02_arm_refuses_in_the_documented_exit_range() {
+    let repo = TestRepo::new();
+    seed(&repo);
+
+    for case in cases() {
+        if !matches!(case.run, Run::V02 | Run::V02Read) {
+            continue;
+        }
+        let argv: Vec<String> = case
+            .argv
+            .iter()
+            .map(|a| a.to_string())
+            .chain(std::iter::once("--json".to_string()))
+            .collect();
+        let r = repo.ks(&argv);
+
+        // 101 is the panic code. It is the one value this test exists to forbid.
+        assert_ne!(
+            r.code,
+            101,
+            "`kanspec {}` panicked instead of refusing:\n{}",
+            argv.join(" "),
+            r.stderr
+        );
+        // §2.1 `error::code` — the complete set a kanspec process may exit with.
+        assert!(
+            [0, 1, 2, 64, 69, 70].contains(&r.code),
+            "`kanspec {}` exited {} , which is not one of 0/1/2/64/69/70",
+            argv.join(" "),
+            r.code
+        );
+        // Whatever it does, it says so in JSON on stdout — a panic said nothing at all.
+        let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`kanspec {}` printed no JSON envelope ({e})\nexit {}\nstdout:\n{}\nstderr:\n{}",
+                argv.join(" "),
+                r.code,
+                r.stdout,
+                r.stderr
+            )
+        });
+
+        if case.run == Run::V02Read {
+            // The honest-answer half: it succeeded, so it must not carry a refusal shape.
+            assert_eq!(r.code, 0, "`kanspec {}` -> {v}", argv.join(" "));
+            assert!(v.is_object(), "`kanspec {}` -> {v}", argv.join(" "));
+            continue;
+        }
+
+        // An unwritten verb must not report SUCCESS — an exit 0 that did nothing is how a
+        // human comes to believe the verb worked (D-37's reasoning, applied to the set).
+        assert_eq!(
+            r.code,
+            1,
+            "`kanspec {}` should be a gate refusal (1), not {}",
+            argv.join(" "),
+            r.code
+        );
+        // …and it refuses through the same `--json` envelope as every other refusal,
+        // carrying the fix list invariant 9 demands.
+        assert_eq!(
+            v.get("ok"),
+            Some(&serde_json::Value::Bool(false)),
+            "`kanspec {}` -> {v}",
+            argv.join(" ")
+        );
+        let fixes = v["error"]["fix"].as_array().unwrap_or_else(|| {
+            panic!("`kanspec {}` refused with no fix list: {v}", argv.join(" "))
+        });
+        assert!(
+            !fixes.is_empty(),
+            "`kanspec {}` refused with an empty fix list",
+            argv.join(" ")
+        );
+        // The message must say WHAT is missing, not merely that something is.
+        let msg = v["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("v0.2"),
+            "`kanspec {}` does not say it is unimplemented: {msg}",
+            argv.join(" ")
+        );
+    }
+}
+
+/// `landcheck` is the Stop hook, and exit **2** is its sealed "block this session" answer.
+/// An unimplemented check that blocks every agent session from ending is strictly worse
+/// than one that says so, so the refusal must be a 1 — asserted separately from the loop
+/// above because this is the one arm where the wrong code has teeth.
+#[test]
+fn the_unimplemented_landcheck_never_blocks_a_session() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let r = repo.ks(["landcheck", "--json"]);
+    assert_ne!(r.code, 2, "an unwritten landcheck must never mint a block");
+    assert_eq!(r.code, 1, "stderr:\n{}", r.stderr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -307,7 +474,10 @@ fn every_v01_command_prints_json_on_stdout() {
         // Invariant 9, on the JSON surface: a refusal carries its one-command fix.
         if v.get("ok") == Some(&serde_json::Value::Bool(false)) {
             let fixes = v["error"]["fix"].as_array().unwrap_or_else(|| {
-                panic!("`kanspec {}` refused without a fix list: {v}", argv.join(" "))
+                panic!(
+                    "`kanspec {}` refused without a fix list: {v}",
+                    argv.join(" ")
+                )
             });
             assert!(
                 !fixes.is_empty(),
@@ -422,7 +592,10 @@ fn prepare(repo: &TestRepo, needs: Needs) -> String {
         return "t-0000".to_string();
     }
     let created = repo.json::<serde_json::Value>(&["new", "Rate-limit login", "--spec", "auth"]);
-    let id = created["id"].as_str().expect("`new` reports its id").to_string();
+    let id = created["id"]
+        .as_str()
+        .expect("`new` reports its id")
+        .to_string();
     if needs == Needs::Todo {
         return id;
     }

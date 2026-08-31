@@ -527,7 +527,9 @@ pub fn render_terminal(m: &BoardModel, st: &Style) -> String {
             crate::out::paint("WORKTREES", Color::Bold, st.color)
         );
         let mut t = crate::out::Table::new(
-            &["path", "branch", "ticket", "agent", "commit", "±main", "merge"],
+            &[
+                "path", "branch", "ticket", "agent", "commit", "±main", "merge",
+            ],
             st,
         );
         for row in &m.worktrees {
@@ -756,7 +758,14 @@ mod tests {
         let titles: Vec<&str> = COLUMNS.iter().map(|(_, t)| *t).collect();
         assert_eq!(
             titles,
-            vec!["BACKLOG", "READY", "DOING", "REVIEW", "IN MAIN ⇂", "DONE (7d)"]
+            vec![
+                "BACKLOG",
+                "READY",
+                "DOING",
+                "REVIEW",
+                "IN MAIN ⇂",
+                "DONE (7d)"
+            ]
         );
         // `Dropped` must have no slot — a dropped ticket is not board state.
         assert!(!COLUMNS.iter().any(|(c, _)| *c == Column::Dropped));

@@ -7,8 +7,8 @@
 //!
 //! Owner: **V2**, v0.2.
 
-// Wave-0 skeleton. The bodies below are `todo!("V2: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
+// Wave-0 skeleton. The bodies below are unwritten; these two allows exist ONLY so the
+// skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
 #![allow(unused_variables, dead_code)]
 
 use chrono::{DateTime, Utc};
@@ -16,9 +16,40 @@ use serde::Serialize;
 
 use crate::cli::{CommentArgs, CommentsArgs, ExpireArgs, PromoteArgs};
 use crate::ctx::Ctx;
-use crate::error::Result;
+use crate::error::{KsError, Result};
 use crate::ids::{CommentId, ItemRef};
 use crate::out::{Render, Style};
+use crate::{fix, fixes};
+
+/// One wording for "this verb is v0.2", mirroring `ci::not_yet_v02` (S7's precedent).
+///
+/// **Round-D hardening.** These handlers were `todo!()`, so every hidden v0.2 arm exited
+/// **101** with a backtrace and no `--json` envelope — outside §2.1's documented code set
+/// (0/1/2/64/69/70). A `Gate` exits 1 and carries its fix list.
+fn not_yet_v02(ctx: &Ctx, verb: &str, what: &str) -> KsError {
+    KsError::gate(
+        "comment_v02",
+        format!("`{verb}` lands in v0.2 — {what}"),
+        fixes![
+            fix!("{} board", ctx.invoked_as),
+            fix!("{} decide \"...\" --scope \"src/**\"", ctx.invoked_as),
+            fix!("{} quirk add \"...\" --paths \"src/**\"", ctx.invoked_as),
+        ],
+    )
+}
+
+/// The shared placeholder rendering for the reports below. Every one of them is
+/// unreachable while its handler refuses — the handler is the type's only constructor — but
+/// a real body means reaching one is a wrong answer rather than a panic, and each keeps its
+/// intended transcript in the doc comment above it for V2 to write.
+fn next_lines(next: &[String], w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+    for n in next {
+        crate::out::Line::new(crate::out::glyph::FIX, "next")
+            .fix(n.as_str())
+            .write(w, st)?;
+    }
+    Ok(())
+}
 
 #[derive(Debug, Serialize)]
 pub struct CommentsReport {
@@ -51,13 +82,24 @@ pub struct Reply {
     pub at: DateTime<Utc>,
 }
 
+/// V2: read comments.jsonl, dedupe by `(id, op, at)` (D-19), fold ops into threads, filter
+/// by `--unresolved`.
+///
+/// It refuses rather than printing an empty thread list: "no comments" and "kanspec cannot
+/// read comments yet" are different facts, and an agent told the first would stop looking.
 pub fn comments(ctx: &Ctx, a: &CommentsArgs) -> Result<CommentsReport> {
-    todo!("V2: read comments.jsonl, dedupe by (id, op, at) (D-19), fold ops into threads, filter by --unresolved")
+    Err(not_yet_v02(
+        ctx,
+        "comments",
+        "the comment store lands in v0.2 — an empty thread list here would read as \
+         `no open threads`, which is a different fact",
+    ))
 }
 
 impl Render for CommentsReport {
+    /// V2: one block per thread — target, quote, body, replies — then the orphan tray.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("V2: one block per thread — target, quote, body, replies — then the orphan tray")
+        next_lines(&self.next, w, st)
     }
 }
 
@@ -69,13 +111,19 @@ pub struct CommentReport {
     pub next: Vec<String>,
 }
 
+/// V2: `Op::AppendJsonl` one row; `resolve` requires `--note`, which is what changed.
 pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
-    todo!("V2: Op::AppendJsonl one row; `resolve` requires --note, which is what changed")
+    Err(not_yet_v02(
+        ctx,
+        "comment",
+        "there is nothing to comment on until `propose` and the review page land in v0.2",
+    ))
 }
 
 impl Render for CommentReport {
+    /// V2: `▸ cm-88f1 resolved` plus the remaining open-thread count.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("V2: `▸ cm-88f1 resolved` plus the remaining open-thread count")
+        next_lines(&self.next, w, st)
     }
 }
 
@@ -89,13 +137,21 @@ pub struct PromoteReport {
     pub next: Vec<String>,
 }
 
+/// V2: mint the standing record with `source:` pre-filled from the item anchor; a decision
+/// lands PROPOSED (invariant 8 — agents never self-accept).
 pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
-    todo!("V2: mint the standing record with `source:` pre-filled from the item anchor; a decision lands PROPOSED")
+    Err(not_yet_v02(
+        ctx,
+        "promote",
+        "promotion reads its `source:` from a proposal item anchor, which lands in v0.2 — \
+         `decide` mints the same standing record by hand today",
+    ))
 }
 
 impl Render for PromoteReport {
+    /// V2: `▸ D-8c1a created (proposed) · source p-7de2#p1 · accept: <url>`.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("V2: `▸ D-8c1a created (proposed) · source p-7de2#p1 · accept: <url>`")
+        next_lines(&self.next, w, st)
     }
 }
 
@@ -106,12 +162,19 @@ pub struct ExpireReport {
     pub next: Vec<String>,
 }
 
+/// V2: record the expiry disposition; auto-suggested the moment a `(temp until t-x)` guard
+/// ticket lands.
 pub fn expire(ctx: &Ctx, a: &ExpireArgs) -> Result<ExpireReport> {
-    todo!("V2: record the expiry disposition; auto-suggested the moment a `(temp until t-x)` guard ticket lands")
+    Err(not_yet_v02(
+        ctx,
+        "expire",
+        "an expiry is a disposition on a proposal item, and items land in v0.2",
+    ))
 }
 
 impl Render for ExpireReport {
+    /// V2: `✕ p-7de2#p2 expired — <reason>`.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("V2: `✕ p-7de2#p2 expired — <reason>`")
+        next_lines(&self.next, w, st)
     }
 }

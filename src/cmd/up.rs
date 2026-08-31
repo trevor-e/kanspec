@@ -99,7 +99,10 @@ pub struct OpenReport {
 pub fn open(ctx: &Ctx, a: &OpenArgs) -> Result<OpenReport> {
     ctx.require_initialized()?;
     let port = ctx.cfg.port;
-    let url = format!("http://127.0.0.1:{port}{}", route_for(ctx, a.id.as_deref())?);
+    let url = format!(
+        "http://127.0.0.1:{port}{}",
+        route_for(ctx, a.id.as_deref())?
+    );
 
     let up_is_running = listening_at(port);
     let launched = up_is_running && launch_browser(&url);
@@ -179,7 +182,11 @@ impl Render for OpenReport {
                 .write(w, st);
         }
         // Nothing is listening: say the URL, and say the one command that makes it live.
-        writeln!(w, " {}", crate::out::paint(&self.url, Color::Cyan, st.color))?;
+        writeln!(
+            w,
+            " {}",
+            crate::out::paint(&self.url, Color::Cyan, st.color)
+        )?;
         for n in &self.next {
             Line::new(glyph::FIX, "nothing is listening yet")
                 .fix(n.as_str())

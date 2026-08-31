@@ -352,6 +352,18 @@ main { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 18px; }
   padding: 3px 7px;
   border: 1px solid transparent;
   white-space: nowrap;
+  /* Round-D fix, found by opening the page: the badge is a flex item in `.card-foot`,
+     and a flex item's default `min-width: auto` refuses to shrink below its content —
+     so a long badge ran past the card's right edge and into the NEXT COLUMN. The two
+     longest shapes are the two that matter most (`unknown (…)`, which R-4 says will fire
+     often, and `in main (method · checked …)`, the one people act on), so it was visible
+     on nearly every card. `.chip` already carried this recipe; the badge was missed
+     because `min-width: 0` is additionally required inside a flex row. The full text
+     stays reachable: `app.js` sets it as the badge's `title`. */
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .badge.in_main      { color: var(--green); background: var(--green-bg); }
 .badge.pr_open      { color: var(--blue);  background: var(--blue-bg); }

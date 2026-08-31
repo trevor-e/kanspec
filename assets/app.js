@@ -306,7 +306,13 @@ function renderCard(card) {
   const foot = el('div', 'card-foot');
   // The merge badge is never a guess: it is exactly one of the six shapes the tool
   // computed, with its own freshness stamp baked in.
-  foot.appendChild(el('span', 'badge ' + card.badge.badge, card.badge_text));
+  //
+  // The badge is ellipsised at the card's width (see `.badge` in style.css), so the
+  // reason — the whole point of an `unknown (…)` — carries a title too: a truncated
+  // badge that cannot be read is a badge that says nothing.
+  const badge = el('span', 'badge ' + card.badge.badge, card.badge_text);
+  badge.title = card.badge_text;
+  foot.appendChild(badge);
   if (card.stalled_secs !== null && card.stalled_secs !== undefined) {
     foot.appendChild(el('span', 'flag', 'STALLED ' + age(card.stalled_secs)));
   }

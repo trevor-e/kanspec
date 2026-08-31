@@ -258,7 +258,9 @@ where
 
 /// An empty body is the default body. The board POSTs `{}` for `start` and a reason for
 /// `park`; refusing a zero-length body would make `curl -X POST` fail for no reason.
-fn body_of<T: serde::de::DeserializeOwned + Default>(raw: &str) -> std::result::Result<T, ApiError> {
+fn body_of<T: serde::de::DeserializeOwned + Default>(
+    raw: &str,
+) -> std::result::Result<T, ApiError> {
     if raw.trim().is_empty() {
         return Ok(T::default());
     }
@@ -552,16 +554,17 @@ async fn watch_loop(state: AppState) {
         return;
     };
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(256);
-    let mut watcher = match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            // `try_send`: a full channel means a batch is already settling, and blocking
-            // the watcher thread to say so again would only make the next batch later.
-            let _ = tx.try_send(());
-        }
-    }) {
-        Ok(w) => w,
-        Err(_) => return,
-    };
+    let mut watcher =
+        match notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+            if res.is_ok() {
+                // `try_send`: a full channel means a batch is already settling, and blocking
+                // the watcher thread to say so again would only make the next batch later.
+                let _ = tx.try_send(());
+            }
+        }) {
+            Ok(w) => w,
+            Err(_) => return,
+        };
     if watcher.watch(&dir, RecursiveMode::Recursive).is_err() {
         return;
     }
@@ -669,7 +672,9 @@ mod tests {
         assert!(!body.is_empty());
 
         // A deep link the SPA owns must serve the shell, not a 404.
-        let (_, deep) = asset("/t/t-9c41").await.expect("SPA routes serve the shell");
+        let (_, deep) = asset("/t/t-9c41")
+            .await
+            .expect("SPA routes serve the shell");
         assert_eq!(deep, body);
 
         // …but a mistyped API path must NOT hand an agent HTML to parse as JSON.

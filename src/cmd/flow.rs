@@ -410,10 +410,15 @@ fn listed(v: &[String]) -> String {
 /// What is already known about the ground this ticket is about to touch.
 ///
 /// Read from the REAL knowledge entities in the snapshot — `specs/`, `decisions/`,
-/// `quirks/` — which `store::load_snapshot` has parsed since wave 1. It deliberately does
-/// NOT go through `rulesdoc::build`: that is S6's generator and is still `todo!()`, so
-/// calling it would panic every `start`. When S6 lands, the *scoping* here can move to
-/// `rulesdoc::Scope`; the counts come from the same three maps either way.
+/// `quirks/` — which `store::load_snapshot` has parsed since wave 1.
+///
+/// It deliberately does NOT go through `rulesdoc::build`. That was originally because S6's
+/// generator was `todo!()` and calling it would have panicked every `start`; **S6 landed in
+/// round C, so the reason is now a different one** (comment corrected in round D): `build`
+/// assembles the full rendered rules document, and this needs three counts. Moving the
+/// *scoping* onto `rulesdoc::Scope` remains the right cleanup — invariant 3 wants one
+/// definition of "in scope" — but it is a refactor with a behavioural risk (the claim
+/// transcript is snapshot-pinned), not the removal of a stub.
 struct ClaimContext {
     spec_rules: usize,
     decisions: Vec<String>,
