@@ -1,0 +1,72 @@
+---
+source: tests/board.rs
+expression: "f.repo.read(\"board.md\")"
+---
+# kanspec board
+
+_generated [ts] · merge state checked [age] ago_
+
+## Attention
+
+- ⇂ **t-88fe** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-88fe`
+- ⇂ **t-9c41** in main [age] (ancestry · checked [age] ago), not closed — `kanspec done t-9c41`
+- ⇂ **t-bbbb** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-bbbb`
+- ⇂ **t-eeee** in main [age] (patch-id · checked [age] ago), not closed — `kanspec done t-eeee`
+- ○ **t-disc** ready — `kanspec start t-disc`
+- ○ **t-rdyy** ready · auth — `kanspec start t-rdyy`
+- ◈ **t-cccc** in review [age], no movement — `kanspec show t-cccc`
+- ◈ **t-dddd** in review [age], no movement — `kanspec show t-dddd`
+
+## BACKLOG (1)
+
+| ticket | title | spec | branch | agent | age | merge |
+|---|---|---|---|---|---|---|
+| ○ `t-blkd` | Session rotation | auth | — | — | [age] | unknown (no branch or head SHA recorded · checked [age] ago) |
+
+## READY (2)
+
+| ticket | title | spec | branch | agent | age | merge |
+|---|---|---|---|---|---|---|
+| ◇ `t-disc` | Retry the webhook | — | — | — | [age] | unknown (no branch or head SHA recorded · checked [age] ago) |
+| ○ `t-rdyy` | Rotate the signing key | auth | — | — | [age] | unknown (no branch or head SHA recorded · checked [age] ago) |
+
+## DOING (1)
+
+| ticket | title | spec | branch | agent | age | merge |
+|---|---|---|---|---|---|---|
+| ◐ `t-dong` | Alert wiring | auth | ks/t-dong-alert-wiring | trevor | [age] | unknown (branch has no commits of its own · checked [age] ago) |
+
+## REVIEW (2)
+
+| ticket | title | spec | branch | agent | age | merge |
+|---|---|---|---|---|---|---|
+| ◈ `t-cccc` | fixture Never | auth | ks/t-cccc-never | trevor | [age] | unknown (squash suspected, no gh · checked [age] ago) |
+| ◈ `t-dddd` | fixture SquashGhTitleOnly | auth | ks/t-dddd-squash-title-only | trevor | [age] | unknown (squash suspected, no gh · checked [age] ago) |
+
+## IN MAIN ⇂ (4)
+
+| ticket | title | spec | branch | agent | age | merge |
+|---|---|---|---|---|---|---|
+| ⇂ `t-88fe` | fixture SquashGitNative | auth | ks/t-88fe-squash-native | trevor | [age] | in main (trailer · checked [age] ago) |
+| ⇂ `t-9c41` | fixture TrueMerge | auth | ks/t-9c41-true-merge | trevor | [age] | in main (ancestry · checked [age] ago) |
+| ⇂ `t-bbbb` | fixture Rebase | auth | ks/t-bbbb-rebase | trevor | [age] | in main (trailer · checked [age] ago) |
+| ⇂ `t-eeee` | fixture SquashOneCommit | auth | ks/t-eeee-squash-one | trevor | [age] | in main (patch-id · checked [age] ago) |
+
+## DONE (7d) (0)
+
+_empty_
+
+## Unspecced (1)
+
+- `t-disc` Retry the webhook
+
+## Worktrees
+
+| path | branch | ticket | agent | last commit | ahead/behind | merge |
+|---|---|---|---|---|---|---|
+| [repo]/repo | main | — | — | [age] | +0/-0 | never scanned |
+| [repo]/kanspec-wt/t-dong | ks/t-dong-alert-wiring | t-dong | trevor | [age] | +0/-0 | unknown (branch has no commits of its own · checked [age] ago) |
+
+## Feature map
+
+- ● **auth** — Login sessions, lockout after five failures _(fresh)_

@@ -1,0 +1,392 @@
+---
+source: tests/board.rs
+expression: board
+---
+{
+  "attention": [
+    {
+      "fix": "kanspec done t-88fe",
+      "glyph": "⇂",
+      "line": "in main [age] (trailer · checked [age] ago), not closed",
+      "owner": "you",
+      "subject": "t-88fe",
+      "url": null
+    },
+    {
+      "fix": "kanspec done t-9c41",
+      "glyph": "⇂",
+      "line": "in main [age] (ancestry · checked [age] ago), not closed",
+      "owner": "you",
+      "subject": "t-9c41",
+      "url": null
+    },
+    {
+      "fix": "kanspec done t-bbbb",
+      "glyph": "⇂",
+      "line": "in main [age] (trailer · checked [age] ago), not closed",
+      "owner": "you",
+      "subject": "t-bbbb",
+      "url": null
+    },
+    {
+      "fix": "kanspec done t-eeee",
+      "glyph": "⇂",
+      "line": "in main [age] (patch-id · checked [age] ago), not closed",
+      "owner": "you",
+      "subject": "t-eeee",
+      "url": null
+    },
+    {
+      "fix": "kanspec start t-disc",
+      "glyph": "○",
+      "line": "ready",
+      "owner": "agent",
+      "subject": "t-disc",
+      "url": null
+    },
+    {
+      "fix": "kanspec start t-rdyy",
+      "glyph": "○",
+      "line": "ready · auth",
+      "owner": "agent",
+      "subject": "t-rdyy",
+      "url": null
+    },
+    {
+      "fix": "kanspec show t-cccc",
+      "glyph": "◈",
+      "line": "in review [age], no movement",
+      "owner": "watching",
+      "subject": "t-cccc",
+      "url": null
+    },
+    {
+      "fix": "kanspec show t-dddd",
+      "glyph": "◈",
+      "line": "in review [age], no movement",
+      "owner": "watching",
+      "subject": "t-dddd",
+      "url": null
+    }
+  ],
+  "cache_age_secs": "[age]",
+  "columns": [
+    {
+      "cards": [
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "no branch or head SHA recorded"
+          },
+          "badge_text": "unknown (no branch or head SHA recorded · checked [age] ago)",
+          "blocked_by": [
+            "t-dong"
+          ],
+          "branch": null,
+          "claimed_by": null,
+          "deps": [
+            "t-dong"
+          ],
+          "discovered_in": null,
+          "fix": null,
+          "id": "t-blkd",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "todo",
+          "title": "Session rotation",
+          "unresolved": 0,
+          "updated_secs": "[age]",
+          "worktree": null
+        }
+      ],
+      "column": "backlog",
+      "title": "BACKLOG"
+    },
+    {
+      "cards": [
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "no branch or head SHA recorded"
+          },
+          "badge_text": "unknown (no branch or head SHA recorded · checked [age] ago)",
+          "blocked_by": [],
+          "branch": null,
+          "claimed_by": null,
+          "deps": [],
+          "discovered_in": "t-dong",
+          "fix": "kanspec start t-disc",
+          "id": "t-disc",
+          "proposal": null,
+          "spec": null,
+          "stalled_secs": null,
+          "state": "todo",
+          "title": "Retry the webhook",
+          "unresolved": 0,
+          "updated_secs": "[age]",
+          "worktree": null
+        },
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "no branch or head SHA recorded"
+          },
+          "badge_text": "unknown (no branch or head SHA recorded · checked [age] ago)",
+          "blocked_by": [],
+          "branch": null,
+          "claimed_by": null,
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec start t-rdyy",
+          "id": "t-rdyy",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "todo",
+          "title": "Rotate the signing key",
+          "unresolved": 0,
+          "updated_secs": "[age]",
+          "worktree": null
+        }
+      ],
+      "column": "ready",
+      "title": "READY"
+    },
+    {
+      "cards": [
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "branch has no commits of its own"
+          },
+          "badge_text": "unknown (branch has no commits of its own · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-dong-alert-wiring",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec ship t-dong",
+          "id": "t-dong",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "doing",
+          "title": "Alert wiring",
+          "unresolved": 0,
+          "updated_secs": "[age]",
+          "worktree": "../kanspec-wt/t-dong"
+        }
+      ],
+      "column": "doing",
+      "title": "DOING"
+    },
+    {
+      "cards": [
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "squash suspected, no gh"
+          },
+          "badge_text": "unknown (squash suspected, no gh · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-cccc-never",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec scan t-cccc",
+          "id": "t-cccc",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture Never",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        },
+        {
+          "badge": {
+            "badge": "unknown",
+            "checked_at": "[ts]",
+            "why": "squash suspected, no gh"
+          },
+          "badge_text": "unknown (squash suspected, no gh · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-dddd-squash-title-only",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec scan t-dddd",
+          "id": "t-dddd",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture SquashGhTitleOnly",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        }
+      ],
+      "column": "review",
+      "title": "REVIEW"
+    },
+    {
+      "cards": [
+        {
+          "badge": {
+            "badge": "in_main",
+            "checked_at": "[ts]",
+            "method": "trailer",
+            "sha": "[sha]"
+          },
+          "badge_text": "in main (trailer · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-88fe-squash-native",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec done t-88fe",
+          "id": "t-88fe",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture SquashGitNative",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        },
+        {
+          "badge": {
+            "badge": "in_main",
+            "checked_at": "[ts]",
+            "method": "ancestry",
+            "sha": "[sha]"
+          },
+          "badge_text": "in main (ancestry · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-9c41-true-merge",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec done t-9c41",
+          "id": "t-9c41",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture TrueMerge",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        },
+        {
+          "badge": {
+            "badge": "in_main",
+            "checked_at": "[ts]",
+            "method": "trailer",
+            "sha": "[sha]"
+          },
+          "badge_text": "in main (trailer · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-bbbb-rebase",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec done t-bbbb",
+          "id": "t-bbbb",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture Rebase",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        },
+        {
+          "badge": {
+            "badge": "in_main",
+            "checked_at": "[ts]",
+            "method": "patch_id",
+            "sha": "[sha]"
+          },
+          "badge_text": "in main (patch-id · checked [age] ago)",
+          "blocked_by": [],
+          "branch": "ks/t-eeee-squash-one",
+          "claimed_by": "trevor",
+          "deps": [],
+          "discovered_in": null,
+          "fix": "kanspec done t-eeee",
+          "id": "t-eeee",
+          "proposal": null,
+          "spec": "auth",
+          "stalled_secs": null,
+          "state": "review",
+          "title": "fixture SquashOneCommit",
+          "unresolved": 0,
+          "updated_secs": [sha],
+          "worktree": null
+        }
+      ],
+      "column": "in_main",
+      "title": "IN MAIN ⇂"
+    },
+    {
+      "cards": [],
+      "column": "done",
+      "title": "DONE (7d)"
+    }
+  ],
+  "features": [
+    {
+      "feature": "Login sessions, lockout after five failures",
+      "note": "fresh",
+      "spec": "auth",
+      "staleness": {
+        "staleness": "ok"
+      }
+    }
+  ],
+  "generated_at": "[ts]",
+  "rev": 0,
+  "worktrees": [
+    {
+      "ahead": 0,
+      "badge": {
+        "badge": "never_scanned"
+      },
+      "badge_text": "never scanned",
+      "behind": 0,
+      "branch": "main",
+      "claimed_by": null,
+      "last_commit_secs": [sha],
+      "path": "[repo]/repo",
+      "primary": true,
+      "ticket": null
+    },
+    {
+      "ahead": 0,
+      "badge": {
+        "badge": "unknown",
+        "checked_at": "[ts]",
+        "why": "branch has no commits of its own"
+      },
+      "badge_text": "unknown (branch has no commits of its own · checked [age] ago)",
+      "behind": 0,
+      "branch": "ks/t-dong-alert-wiring",
+      "claimed_by": "trevor",
+      "last_commit_secs": [sha],
+      "path": "[repo]/kanspec-wt/t-dong",
+      "primary": false,
+      "ticket": "t-dong"
+    }
+  ]
+}
