@@ -116,16 +116,29 @@ pub enum Op {
 }
 
 impl Op {
-    /// Does this step change a file git tracks?
+    /// Does this step change a file the `sync = "commit"` auto-commit would actually
+    /// commit — i.e. a tracked file **under `.kanspec/`**?
     ///
-    /// Only `WriteGitState` does not: `cache/` is gitignored, disposable, and rebuilt from
+    /// `WriteGitState` does not: `cache/` is gitignored, disposable, and rebuilt from
     /// nothing by the next `scan`. `Store::transact` reads this to decide whether
     /// `sync = "commit"` has anything to commit — without it, a `scan` (whose entire plan is
     /// one cache write) runs `git add -A -- .kanspec/**` and sweeps whatever tracker edits
     /// happened to be pending into a commit labelled after the scan, and the `post-merge`
     /// hook's `kanspec scan --quiet` reaches for git's index in the middle of a merge.
+    ///
+    /// ROUND-4 CORRECTION (S6, reported as a request to F). `WriteGenerated` does not
+    /// either, for the same reason arrived at from the other side: it writes
+    /// `KANSPEC-FEATURES.md` / `KANSPEC-ARCHITECTURE.md` at the **repo root**, and
+    /// `Git::commit_kanspec` scopes every one of its three git calls to
+    /// `:(glob,top).kanspec/**`. A projection rewrite therefore can never be part of that
+    /// commit — so counting it here does not commit the projection, it only makes `scan`
+    /// (which regenerates them, D-20) sweep a human's pending tracker edit into a commit
+    /// labelled `kanspec: confirm`. That is precisely the harm the paragraph above exists
+    /// to prevent, reached by a second route; `scan_ladder.rs::a_scan_commits_nothing_…`
+    /// fails on the nose without this arm. If the projections should ever be auto-committed
+    /// too, the fix is to widen `commit_kanspec`'s pathspec, not to re-arm this predicate.
     pub fn writes_tracked_file(&self) -> bool {
-        !matches!(self, Op::WriteGitState { .. })
+        !matches!(self, Op::WriteGitState { .. } | Op::WriteGenerated { .. })
     }
 
     /// The entity a plan step is about, when it has one. `MoveDir`, `AppendJsonl`,

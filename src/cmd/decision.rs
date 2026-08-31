@@ -4,23 +4,34 @@
 //! `plan_accept` and `plan_revoke` take a `&HumanActor`, whose only constructor refuses an
 //! `Actor::Agent`, so an agent session literally cannot call them.
 //!
+//! `supersede` takes one too, and that is a deliberate reading of the same invariant
+//! rather than an over-application of it. Superseding *flips the old decision out of
+//! `accepted`* in the same plan that mints the replacement — `doctor::check_immutable_
+//! decisions` makes an `accepted` record carrying `superseded_by:` a hard Error, so the
+//! back-link and the status flip cannot be separated — and an agent that could retire a
+//! standing rule unilaterally has the kill switch invariant 8 exists to keep out of its
+//! hands. What the agent CAN do is what DESIGN.md's third update trigger describes: the
+//! replacement is minted `proposed`, and a human still has to accept it before it binds.
+//!
 //! Accepted bodies are immutable; the only legal mutations are status flips and back-links.
 //!
 //! Owner: **S6**.
-
-// Wave-0 skeleton. The bodies below are `todo!("S6: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by S6 when the bodies land.
-#![allow(unused_variables, dead_code)]
 
 use serde::Serialize;
 
 use crate::cli::{AcceptArgs, DecideArgs, RevokeArgs, SupersedeArgs, WhyArgs};
 use crate::ctx::{Ctx, HumanActor};
-use crate::error::Result;
-use crate::ids::{DecisionId, Minter, ProposalId, TicketId};
+use crate::error::{KsError, Result};
+use crate::fm::{self, Yv};
+use crate::ids::{DecisionId, ItemRef, Minter, ProposalId, QuirkId, RuleRef, TicketId};
+use crate::keys::{DecisionKey, Key};
 use crate::model::{DecisionStatus, Snapshot};
-use crate::out::{Render, Style};
-use crate::plan::{Facts, Plan};
+use crate::out::{glyph, Color, Line, Render, Style};
+use crate::plan::{EntityRef, Facts, Op, Plan};
+use crate::project;
+use crate::store::{Committed, Store};
+use crate::transitions::Verb;
+use crate::{fix, fixes};
 
 // ── decide ───────────────────────────────────────────────────────────────────
 
@@ -38,18 +49,100 @@ pub struct DecideReport {
 }
 
 pub fn decide(ctx: &Ctx, a: &DecideArgs) -> Result<DecideReport> {
-    todo!("S6: transact minting a PROPOSED decision with source pre-filled from --from")
+    ctx.require_initialized()?;
+    // Every glob is compiled before the lock: a decision whose `scope:` cannot compile
+    // steers nobody, and `prime` would silently never inject it.
+    crate::rulesdoc::Scope::of(&a.scope)?;
+    let f = facts(ctx);
+    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, m| {
+        plan_decide(s, &f, a, m)
+    })?;
+    let id = minted(&done)?;
+    project::regenerate(ctx)?;
+
+    Ok(DecideReport {
+        title: a.title.trim().to_string(),
+        status: DecisionStatus::Proposed,
+        source: a.from.clone(),
+        scope: a.scope.clone(),
+        path: rel(ctx, &ctx.layout.decision(&id)),
+        url: Some(format!("http://127.0.0.1:{}/d/{id}", ctx.cfg.port)),
+        next: vec![
+            format!("{} accept {id}", ctx.invoked_as),
+            format!("{} rules", ctx.invoked_as),
+        ],
+        id,
+    })
 }
 
 /// PURE. Mints `status: proposed` and nothing else — a proposed decision is not injected
 /// as a standing rule, it sits in the YOU section of `status` until a human acts.
 pub fn plan_decide(s: &Snapshot, f: &Facts, a: &DecideArgs, m: &Minter) -> Result<Plan> {
-    todo!("S6: mint the D- id, Op::CreateEntity with the MADR-minimal scaffold")
+    let title = a.title.trim();
+    if title.is_empty() {
+        return Err(KsError::invalid(
+            "a decision needs a title stated as a claim",
+            fixes![fix!(
+                "kanspec decide \"Rate-limit state lives in Redis only\""
+            )],
+        ));
+    }
+    // Provenance must point at something that exists, or `kanspec why` walks off a cliff
+    // the moment anyone audits the rule.
+    if let Some(src) = a.from.as_deref() {
+        check_source(s, src)?;
+    }
+    let id = m.decision(title)?;
+    let mut plan = Plan::of(vec![Op::CreateEntity {
+        entity: EntityRef::Decision(id.clone()),
+        contents: scaffold(&id, title, f, a.from.as_deref(), &a.scope),
+    }]);
+    plan.mint(EntityRef::Decision(id));
+    Ok(plan)
+}
+
+/// MADR-minimal: Context / Decision / Consequences, one page max.
+fn scaffold(
+    id: &DecisionId,
+    title: &str,
+    f: &Facts,
+    source: Option<&str>,
+    scope: &[String],
+) -> String {
+    format!(
+        "---\nid: {id}\ntitle: {}\nstatus: proposed\ndate: {}\nsource: {}\nscope: {}\n\
+         supersedes: null\nsuperseded_by: null\n---\n\
+         ## Context\n\n## Decision\n{title}\n\n## Consequences\n",
+        fm::emit(&Yv::s(title), false),
+        f.at.date_naive(),
+        fm::emit(&Yv::opt_s(source), false),
+        fm::emit(&Yv::list(scope.to_vec()), false),
+    )
 }
 
 impl Render for DecideReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S6: `▸ D-8c1a created (proposed) · source p-7de2#p1 · accept: <url>`")
+        let mut dim = format!("· proposed · {}", self.path);
+        if let Some(src) = &self.source {
+            dim = format!("· proposed · source {src} · {}", self.path);
+        }
+        let mut line = Line::new('▸', format!("{} created", self.title))
+            .id(&self.id)
+            .dim(dim);
+        if let Some(u) = &self.url {
+            line = line.url(format!("accept: {u}"));
+        }
+        line.write(w, st)?;
+        writeln!(
+            w,
+            "  {} {}",
+            glyph::FIX,
+            crate::out::paint(
+                self.next.first().map(String::as_str).unwrap_or(""),
+                Color::Cyan,
+                st.color
+            )
+        )
     }
 }
 
@@ -68,21 +161,161 @@ pub struct DecisionReport {
 }
 
 pub fn accept(ctx: &Ctx, a: &AcceptArgs) -> Result<DecisionReport> {
-    todo!("S6: HumanActor::require(&ctx.actor, \"accept\")? BEFORE the lock, then transact(plan_accept)")
+    ctx.require_initialized()?;
+    // BEFORE the lock: refusing an agent must not cost a transaction, and the message is
+    // the same either way.
+    let who = HumanActor::require(&ctx.actor, "accept")?;
+    let id = DecisionId::parse(&a.id)?;
+    let f = facts(ctx);
+    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+        plan_accept(s, &f, &who, &id)
+    })?;
+    project::regenerate(ctx)?;
+
+    let snap = ctx.snapshot()?;
+    Ok(DecisionReport {
+        title: snap.decision(&id)?.fm.title.clone(),
+        status: DecisionStatus::Accepted,
+        by: ctx.actor.label(),
+        replacement: None,
+        why: None,
+        next: vec![format!("{} rules", ctx.invoked_as)],
+        id,
+    })
 }
 
 /// Takes `&HumanActor`, so invariant 8 is a type fact rather than a runtime check anyone
 /// could forget to write.
 pub fn plan_accept(s: &Snapshot, f: &Facts, who: &HumanActor, id: &DecisionId) -> Result<Plan> {
-    todo!("S6: refuse unless status == proposed; Op::SetFields{{status: accepted}} — the body freezes here")
+    let _ = (f, who);
+    let d = s.decision(id)?;
+    if d.fm.status != DecisionStatus::Proposed {
+        return Err(KsError::gate(
+            "decision_not_proposed",
+            format!(
+                "{id} is `{}`, not `proposed` — nothing to accept",
+                status_word(d.fm.status)
+            ),
+            fixes![fix!("kanspec rules"), fix!("kanspec why {id}")],
+        ));
+    }
+    // The BODY freezes here: from this point the only legal mutations are status flips and
+    // back-links, and `doctor::check_immutable_decisions` proves the record half of it.
+    Ok(Plan::of(vec![Op::SetFields {
+        entity: EntityRef::Decision(id.clone()),
+        sets: vec![(Key::Decision(DecisionKey::Status), Yv::s("accepted"))],
+    }]))
 }
 
 pub fn supersede(ctx: &Ctx, a: &SupersedeArgs) -> Result<DecisionReport> {
-    todo!("S6: mint the replacement as PROPOSED, then flip the old one with bidirectional links")
+    ctx.require_initialized()?;
+    let who = HumanActor::require(&ctx.actor, "supersede")?;
+    let id = DecisionId::parse(&a.id)?;
+    let f = facts(ctx);
+    let done = Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, m| {
+        plan_supersede(s, &f, &who, &id, &a.with, m)
+    })?;
+    let replacement = minted(&done)?;
+    project::regenerate(ctx)?;
+
+    let snap = ctx.snapshot()?;
+    Ok(DecisionReport {
+        title: snap.decision(&id)?.fm.title.clone(),
+        status: DecisionStatus::Superseded,
+        by: ctx.actor.label(),
+        why: None,
+        next: vec![
+            format!("{} accept {replacement}", ctx.invoked_as),
+            format!("{} rules", ctx.invoked_as),
+        ],
+        replacement: Some(replacement),
+        id,
+    })
+}
+
+/// Mints the replacement as PROPOSED and flips the old one, with bidirectional links, in
+/// ONE plan.
+///
+/// The two halves cannot be split across transactions: an `accepted` record carrying
+/// `superseded_by:` is a `doctor` Error, so a plan that wrote only the back-link would
+/// leave the repo failing CI until the second half landed. Two files in one plan is R-1's
+/// window, and the authoritative file — the old decision, the one agents are still being
+/// steered by — is ordered LAST.
+pub fn plan_supersede(
+    s: &Snapshot,
+    f: &Facts,
+    who: &HumanActor,
+    id: &DecisionId,
+    with: &str,
+    m: &Minter,
+) -> Result<Plan> {
+    let _ = who;
+    let old = s.decision(id)?;
+    if old.fm.status != DecisionStatus::Accepted {
+        return Err(KsError::gate(
+            "decision_not_accepted",
+            format!(
+                "{id} is `{}` — only an accepted decision can be superseded",
+                status_word(old.fm.status)
+            ),
+            fixes![
+                fix!("kanspec accept {id}"),
+                fix!("kanspec decide \"{}\"", with.trim()),
+            ],
+        ));
+    }
+    let title = with.trim();
+    if title.is_empty() {
+        return Err(KsError::invalid(
+            "the replacement decision needs a title",
+            fixes![fix!("kanspec supersede {id} --with \"...\"")],
+        ));
+    }
+    let new = m.decision(title)?;
+
+    let mut plan = Plan::empty();
+    // The replacement inherits the scope it replaces, so the successor steers exactly the
+    // paths the predecessor did until a human narrows it.
+    let mut contents = scaffold(&new, title, f, old.fm.source.as_deref(), &old.scope);
+    contents = contents.replace("\nsupersedes: null\n", &format!("\nsupersedes: {id}\n"));
+    plan.push(Op::CreateEntity {
+        entity: EntityRef::Decision(new.clone()),
+        contents,
+    });
+    plan.push(Op::SetFields {
+        entity: EntityRef::Decision(id.clone()),
+        sets: vec![
+            (Key::Decision(DecisionKey::Status), Yv::s("superseded")),
+            (
+                Key::Decision(DecisionKey::SupersededBy),
+                Yv::s(new.to_string()),
+            ),
+        ],
+    });
+    plan.mint(EntityRef::Decision(new));
+    Ok(plan)
 }
 
 pub fn revoke(ctx: &Ctx, a: &RevokeArgs) -> Result<DecisionReport> {
-    todo!("S6: HumanActor::require(&ctx.actor, \"revoke\")?, then transact(plan_revoke)")
+    ctx.require_initialized()?;
+    let who = HumanActor::require(&ctx.actor, "revoke")?;
+    let id = DecisionId::parse(&a.id)?;
+    let f = facts(ctx);
+    Store::open(ctx).transact(Verb::Confirm, &ctx.invocation(), |s, _m| {
+        plan_revoke(s, &f, &who, &id, &a.why)
+    })?;
+    project::regenerate(ctx)?;
+
+    let snap = ctx.snapshot()?;
+    Ok(DecisionReport {
+        title: snap.decision(&id)?.fm.title.clone(),
+        status: DecisionStatus::Revoked,
+        by: ctx.actor.label(),
+        replacement: None,
+        why: Some(a.why.clone()),
+        next: vec![format!("{} rules", ctx.invoked_as)],
+        id,
+    })
 }
 
 /// The human's kill switch — also `&HumanActor`.
@@ -93,12 +326,92 @@ pub fn plan_revoke(
     id: &DecisionId,
     why: &str,
 ) -> Result<Plan> {
-    todo!("S6: Op::SetFields{{status: revoked}} plus the why appended to the body's Consequences")
+    let _ = who;
+    let d = s.decision(id)?;
+    let why = why.trim();
+    if why.is_empty() {
+        return Err(KsError::invalid(
+            "revoking a standing rule is an asserted act — it needs a reason",
+            fixes![fix!("kanspec revoke {id} --why \"...\"")],
+        ));
+    }
+    if matches!(
+        d.fm.status,
+        DecisionStatus::Revoked | DecisionStatus::Superseded
+    ) {
+        return Err(KsError::gate(
+            "decision_not_standing",
+            format!(
+                "{id} is already `{}` — it steers nobody",
+                status_word(d.fm.status)
+            ),
+            fixes![fix!("kanspec rules")],
+        ));
+    }
+    Ok(Plan::of(vec![
+        Op::SetFields {
+            entity: EntityRef::Decision(id.clone()),
+            sets: vec![(Key::Decision(DecisionKey::Status), Yv::s("revoked"))],
+        },
+        // The reason lands in the record itself, where the next reader of the decision
+        // meets it — a status flip with the story kept somewhere else is how a registry
+        // becomes unreadable.
+        Op::AppendSection {
+            entity: EntityRef::Decision(id.clone()),
+            heading: "## Consequences",
+            line: format!(
+                "- REVOKED {} by {}: {why}",
+                f.at.date_naive(),
+                f.actor.label()
+            ),
+        },
+    ]))
 }
 
 impl Render for DecisionReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S6: `● D-8c1a accepted by trevor` plus the `→ kanspec rules` next step")
+        let glyph = match self.status {
+            DecisionStatus::Accepted => glyph::OK,
+            DecisionStatus::Revoked => glyph::FAIL,
+            _ => '▸',
+        };
+        let mut line = Line::new(
+            glyph,
+            format!(
+                "{} — {} by {}",
+                self.title,
+                status_word(self.status),
+                self.by
+            ),
+        )
+        .id(&self.id);
+        if let Some(r) = &self.replacement {
+            line = line.dim(format!("· replaced by {r}"));
+        }
+        if let Some(why) = &self.why {
+            line = line.dim(format!("· why: {why}"));
+        }
+        line.write(w, st)?;
+        for n in &self.next {
+            writeln!(
+                w,
+                "  {} {}",
+                glyph::FIX,
+                crate::out::paint(n, Color::Cyan, st.color)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// The ONE spelling of a decision's status in human output, so `decide`, `accept`,
+/// `supersede`, `revoke` and every refusal message agree on the word.
+fn status_word(s: DecisionStatus) -> &'static str {
+    match s {
+        DecisionStatus::Proposed => "proposed",
+        DecisionStatus::Accepted => "accepted",
+        DecisionStatus::Superseded => "superseded",
+        DecisionStatus::Revoked => "revoked",
     }
 }
 
@@ -116,12 +429,419 @@ pub struct WhyReport {
     pub next: Vec<String>,
 }
 
+/// Walks rule → `{p-xxxx}` token → proposal item → tickets → PR, from whichever end the
+/// caller has: a rule anchor, an item anchor, a ticket, a decision or a quirk.
+///
+/// The chain deliberately stops at a CLOSED proposal's id: `Snapshot` holds closed
+/// proposal ids and no closed bodies, so `why` can say *which* proposal shipped a rule
+/// without any code path through which closed prose could reach a session (invariant 4).
 pub fn why(ctx: &Ctx, a: &WhyArgs) -> Result<WhyReport> {
-    todo!("S6: walk rule -> {{p-xxxx}} token -> proposal item -> tickets -> PR, for a RuleRef, an ItemRef or a ticket id")
+    ctx.require_initialized()?;
+    let snap = ctx.snapshot()?;
+    let raw = a.anchor.trim();
+
+    let mut r = WhyReport {
+        anchor: raw.to_string(),
+        rule: None,
+        proposal: None,
+        item: None,
+        tickets: Vec::new(),
+        prs: Vec::new(),
+        decisions: Vec::new(),
+        next: Vec::new(),
+    };
+
+    if let Ok(item) = ItemRef::parse(raw) {
+        r.proposal = Some(item.proposal.clone());
+        r.item = Some(format!("{}{}", item.kind.letter(), item.n));
+        r.decisions = sourced_by(&snap, &item.to_string());
+    } else if let Ok(id) = DecisionId::parse(raw).filter_known(|i| snap.decisions.contains_key(i)) {
+        let d = snap.decision(&id)?;
+        r.rule = Some(d.fm.title.clone());
+        r.decisions = std::iter::once(id)
+            .chain(d.fm.supersedes.clone())
+            .chain(d.fm.superseded_by.clone())
+            .collect();
+        if let Some(src) = &d.fm.source {
+            r.item = Some(src.clone());
+            r.proposal = ProposalId::parse(src.split('#').next().unwrap_or(src)).ok();
+        }
+    } else if let Ok(id) = TicketId::parse(raw).filter_known(|i| snap.tickets.contains_key(i)) {
+        let t = snap.ticket(&id)?;
+        r.rule = Some(t.fm.title.clone());
+        r.proposal = t.fm.proposal.clone();
+        r.item = t.fm.item.clone();
+        r.tickets = vec![id.clone()];
+        r.prs = t.fm.pr.into_iter().collect();
+        r.decisions = sourced_by(&snap, id.as_str());
+    } else if let Ok(id) = QuirkId::parse(raw).filter_known(|i| snap.quirks.contains_key(i)) {
+        let q = snap.quirk(&id)?;
+        r.rule = Some(q.fm.title.clone());
+        r.tickets = q.fm.source.clone().into_iter().collect();
+    } else {
+        let rr = RuleRef::parse(raw)?;
+        let spec = snap.spec(&rr.spec)?;
+        let anchor = rr.anchor();
+        let rule = spec
+            .rules
+            .iter()
+            .find(|x| x.anchor == anchor || x.anchor == rr.rule)
+            .ok_or_else(|| {
+                KsError::not_found(
+                    "rule",
+                    anchor.clone(),
+                    fixes![
+                        fix!("kanspec spec show {}", rr.spec),
+                        fix!("kanspec spec grep \"{}\"", rr.rule),
+                    ],
+                )
+            })?;
+        r.rule = Some(rule.text.clone());
+        r.proposal = rule.provenance.first().cloned();
+        if let Some(p) = &r.proposal {
+            r.decisions = snap
+                .decisions
+                .values()
+                .filter(|d| {
+                    d.fm.source
+                        .as_deref()
+                        .is_some_and(|s| s.starts_with(p.as_str()))
+                })
+                .map(|d| d.fm.id.clone())
+                .collect();
+        }
+    }
+
+    // Whatever the entry point, the tickets are the ones that carried the work, and their
+    // PRs are where the diff was actually reviewed.
+    if r.tickets.is_empty() {
+        if let Some(p) = &r.proposal {
+            for t in snap.tickets.values() {
+                if t.fm.proposal.as_ref() == Some(p)
+                    && r.item
+                        .as_deref()
+                        .is_none_or(|i| t.fm.item.as_deref() == Some(i) || t.fm.item.is_none())
+                {
+                    r.tickets.push(t.fm.id.clone());
+                }
+            }
+        }
+    }
+    if r.prs.is_empty() {
+        r.prs = r
+            .tickets
+            .iter()
+            .filter_map(|id| snap.tickets.get(id).and_then(|t| t.fm.pr))
+            .collect();
+    }
+
+    // Never hand back the anchor the caller already typed: a fix that re-runs the command
+    // you just ran is not a next step.
+    let onward = r.decisions.iter().find(|d| d.as_str() != raw);
+    r.next = match (&r.proposal, onward) {
+        (_, Some(d)) => vec![format!("{} why {d}", ctx.invoked_as)],
+        (Some(_), None) => vec![format!("{} rules", ctx.invoked_as)],
+        _ => vec![format!("{} rules --audit", ctx.invoked_as)],
+    };
+    Ok(r)
+}
+
+fn sourced_by(s: &Snapshot, src: &str) -> Vec<DecisionId> {
+    s.decisions
+        .values()
+        .filter(|d| d.fm.source.as_deref() == Some(src))
+        .map(|d| d.fm.id.clone())
+        .collect()
+}
+
+/// `DecisionId::parse("t-9c41")` fails on the prefix, but `TicketId::parse("D-8c1a")`
+/// would too — what neither can see is whether the id names anything that EXISTS. `why`
+/// must not report an empty chain for a typo'd id, so each candidate kind is required to
+/// resolve before it is accepted.
+trait FilterKnown<T> {
+    fn filter_known(self, f: impl Fn(&T) -> bool) -> Result<T>;
+}
+impl<T> FilterKnown<T> for Result<T> {
+    fn filter_known(self, f: impl Fn(&T) -> bool) -> Result<T> {
+        match self {
+            Ok(v) if f(&v) => Ok(v),
+            Ok(_) => Err(KsError::not_found(
+                "record",
+                "unknown",
+                fixes![fix!("kanspec rules")],
+            )),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl Render for WhyReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        todo!("S6: the chain as indented steps, each naming the record it came from")
+        writeln!(
+            w,
+            " {}",
+            crate::out::paint(&self.anchor, Color::Bold, st.color)
+        )?;
+        if let Some(rule) = &self.rule {
+            // `record`, not `rule`: the same field carries a spec rule's text, a decision's
+            // title, a ticket's title or a quirk's title, depending on where the walk
+            // started. The JSON key stays `rule` — it is the contract's name for it.
+            writeln!(w, "   record     {rule}")?;
+        }
+        match (&self.proposal, &self.item) {
+            (Some(p), Some(i)) => writeln!(w, "   proposal   {p} · item {i}")?,
+            (Some(p), None) => writeln!(w, "   proposal   {p}")?,
+            (None, Some(i)) => writeln!(w, "   source     {i}")?,
+            (None, None) => writeln!(w, "   proposal   (none recorded)")?,
+        }
+        if !self.tickets.is_empty() {
+            writeln!(
+                w,
+                "   tickets    {}",
+                self.tickets
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )?;
+        }
+        if !self.prs.is_empty() {
+            writeln!(
+                w,
+                "   prs        {}",
+                self.prs
+                    .iter()
+                    .map(|p| format!("#{p}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )?;
+        }
+        if !self.decisions.is_empty() {
+            writeln!(
+                w,
+                "   decisions  {}",
+                self.decisions
+                    .iter()
+                    .map(|d| d.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )?;
+        }
+        for n in &self.next {
+            writeln!(
+                w,
+                "  {} {}",
+                glyph::FIX,
+                crate::out::paint(n, Color::Cyan, st.color)
+            )?;
+        }
+        Ok(())
+    }
+}
+
+// ── shared ───────────────────────────────────────────────────────────────────
+
+fn facts(ctx: &Ctx) -> Facts {
+    Facts {
+        actor: ctx.actor.clone(),
+        at: ctx.now,
+        invocation: ctx.invocation(),
+    }
+}
+
+fn minted(done: &Committed) -> Result<DecisionId> {
+    done.minted
+        .iter()
+        .find_map(|e| match e {
+            EntityRef::Decision(id) => Some(id.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| KsError::internal(anyhow::anyhow!("the plan minted no decision id")))
+}
+
+/// `--from p-7de2#p1` or `--from t-9c41`: both must resolve, and a closed proposal counts
+/// as resolved — its id is remembered even though its body is never loaded.
+fn check_source(s: &Snapshot, src: &str) -> Result<()> {
+    if let Ok(item) = ItemRef::parse(src) {
+        let p = &item.proposal;
+        if s.proposals.contains_key(p) || s.closed_ids.contains(p.as_str()) {
+            return Ok(());
+        }
+        return Err(KsError::not_found(
+            "proposal",
+            p.to_string(),
+            fixes![fix!("kanspec status")],
+        ));
+    }
+    if let Ok(t) = TicketId::parse(src) {
+        s.ticket(&t)?;
+        return Ok(());
+    }
+    Err(KsError::invalid(
+        format!("`{src}` is neither a proposal item (`p-7de2#p1`) nor a ticket id"),
+        fixes![fix!("kanspec ls --all"), fix!("kanspec status")],
+    ))
+}
+
+fn rel(ctx: &Ctx, p: &std::path::Path) -> String {
+    p.strip_prefix(ctx.repo.primary_root())
+        .unwrap_or(p)
+        .display()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::ctx::Actor;
+    use crate::model::{Decision, DecisionFm};
+    use chrono::{NaiveDate, TimeZone, Utc};
+    use std::collections::{BTreeMap, HashSet};
+
+    fn now() -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap()
+    }
+
+    fn facts_lit() -> Facts {
+        Facts {
+            actor: Actor::Human {
+                name: "trevor".into(),
+            },
+            at: now(),
+            invocation: "kanspec decide".into(),
+        }
+    }
+
+    fn human() -> HumanActor {
+        HumanActor::require(
+            &Actor::Human {
+                name: "trevor".into(),
+            },
+            "accept",
+        )
+        .unwrap()
+    }
+
+    fn snap_with(status: DecisionStatus) -> (Snapshot, DecisionId) {
+        let mut s = Snapshot::empty(Config::default(), now());
+        let id = DecisionId::parse("D-8c1a").unwrap();
+        s.decisions.insert(
+            id.clone(),
+            Decision {
+                fm: DecisionFm {
+                    id: id.clone(),
+                    title: "Redis only".into(),
+                    status,
+                    date: NaiveDate::from_ymd_opt(2026, 9, 2).unwrap(),
+                    source: None,
+                    scope: vec!["src/auth/**".into()],
+                    supersedes: None,
+                    superseded_by: None,
+                    extra: BTreeMap::new(),
+                },
+                path: "x".into(),
+                body: "## Decision\nRedis.\n".into(),
+                scope: vec!["src/auth/**".into()],
+            },
+        );
+        (s, id)
+    }
+
+    fn minter(s: &Snapshot) -> (HashSet<String>, u64, usize) {
+        (s.taken_ids(), 7, 4)
+    }
+
+    #[test]
+    fn decide_mints_a_proposed_decision_and_never_an_accepted_one() {
+        let s = Snapshot::empty(Config::default(), now());
+        let (taken, seed, w) = minter(&s);
+        let m = Minter::new(&taken, seed, w);
+        let a = DecideArgs {
+            title: "Rate-limit state lives in Redis only".into(),
+            from: None,
+            scope: vec!["src/auth/**".into()],
+        };
+        let p = plan_decide(&s, &facts_lit(), &a, &m).unwrap();
+        let Op::CreateEntity { contents, .. } = &p.ops[0] else {
+            panic!("expected a CreateEntity, got {:?}", p.ops[0]);
+        };
+        assert!(contents.contains("status: proposed"), "{contents}");
+        assert!(!contents.contains("status: accepted"));
+        assert_eq!(p.minted.len(), 1);
+    }
+
+    #[test]
+    fn accepting_something_already_accepted_is_a_typed_refusal() {
+        let (s, id) = snap_with(DecisionStatus::Accepted);
+        let e = plan_accept(&s, &facts_lit(), &human(), &id)
+            .err()
+            .expect("an accepted decision cannot be accepted again");
+        assert_eq!(e.code(), Some("decision_not_proposed"));
+    }
+
+    #[test]
+    fn accept_flips_only_the_status_so_the_body_freezes() {
+        let (s, id) = snap_with(DecisionStatus::Proposed);
+        let p = plan_accept(&s, &facts_lit(), &human(), &id).unwrap();
+        assert_eq!(p.ops.len(), 1);
+        let Op::SetFields { sets, .. } = &p.ops[0] else {
+            panic!("expected SetFields");
+        };
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0].0.as_str(), "status");
+    }
+
+    #[test]
+    fn supersede_writes_the_status_flip_and_the_back_link_in_one_plan() {
+        let (s, id) = snap_with(DecisionStatus::Accepted);
+        let (taken, seed, w) = minter(&s);
+        let m = Minter::new(&taken, seed, w);
+        let p = plan_supersede(&s, &facts_lit(), &human(), &id, "Redis and Postgres", &m).unwrap();
+        // An `accepted` record carrying `superseded_by:` is a doctor Error, so the two
+        // halves must land together or not at all.
+        let sets = p.ops.iter().find_map(|o| match o {
+            Op::SetFields { sets, .. } => Some(sets),
+            _ => None,
+        });
+        let sets = sets.expect("the old decision is flipped");
+        let keys: Vec<&str> = sets.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, ["status", "superseded_by"]);
+        let Op::CreateEntity { contents, .. } = &p.ops[0] else {
+            panic!("the replacement is minted first");
+        };
+        assert!(contents.contains("status: proposed"), "{contents}");
+        assert!(
+            contents.contains(&format!("supersedes: {id}")),
+            "{contents}"
+        );
+    }
+
+    #[test]
+    fn superseding_something_that_never_bound_anyone_is_refused() {
+        let (s, id) = snap_with(DecisionStatus::Proposed);
+        let (taken, seed, w) = minter(&s);
+        let m = Minter::new(&taken, seed, w);
+        let e = plan_supersede(&s, &facts_lit(), &human(), &id, "x", &m)
+            .err()
+            .expect("a proposed decision cannot be superseded");
+        assert_eq!(e.code(), Some("decision_not_accepted"));
+    }
+
+    #[test]
+    fn revoke_records_the_reason_in_the_record_itself() {
+        let (s, id) = snap_with(DecisionStatus::Accepted);
+        let p = plan_revoke(&s, &facts_lit(), &human(), &id, "Redis is gone").unwrap();
+        assert!(p.ops.iter().any(|o| matches!(
+            o,
+            Op::AppendSection { heading, line, .. }
+                if *heading == "## Consequences" && line.contains("Redis is gone")
+        )));
+    }
+
+    #[test]
+    fn revoking_with_an_empty_reason_is_refused() {
+        let (s, id) = snap_with(DecisionStatus::Accepted);
+        assert!(plan_revoke(&s, &facts_lit(), &human(), &id, "   ").is_err());
     }
 }
