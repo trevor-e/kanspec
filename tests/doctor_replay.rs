@@ -119,10 +119,29 @@ fn a_hand_edited_state_is_caught_by_the_very_next_run() {
         "the message must say what disagrees with what: {}",
         f[0].message
     );
+    // Invariant 9 — and the prescription is the HONEST one. `doctor` used to print
+    // `kanspec repair t-9c41 --why "..."` here, which meant the two commands it takes to
+    // launder an unmerged ticket into `done` were `sed` and *the command doctor itself
+    // handed you*. The lossless remedy leads instead: the `## Log` already says which state
+    // this ticket legally reached, so putting the field back loses nothing.
     assert!(
-        f[0].fix.starts_with("kanspec repair t-9c41"),
-        "invariant 9: {}",
+        f[0].fix.starts_with("edit ")
+            && f[0].fix.contains("t-9c41.md")
+            && f[0].fix.ends_with("and set `state: review`"),
+        "the first fix must restore the truth, not overwrite the question: {}",
         f[0].fix
+    );
+    assert!(
+        !f[0].fix.contains("repair"),
+        "the attestation is the last resort, never the prescription: {}",
+        f[0].fix
+    );
+    // It stays discoverable — described as what it is, with its consequence attached.
+    assert!(
+        f[0].message.contains("kanspec repair t-9c41 --why")
+            && f[0].message.contains("badged attested"),
+        "{}",
+        f[0].message
     );
     assert!(
         !f[0].fixable,
@@ -227,17 +246,20 @@ fn a_backdated_entry_is_caught_because_a_merge_can_interleave_two_machines() {
 #[test]
 fn an_attested_repair_line_makes_a_diverged_ticket_replay_clean_again() {
     let repo = TestRepo::new();
-    write_ticket(&repo, "t-9c41", "done", LEGAL);
+    // The rescue D-12 exists for: the frontmatter says `review`, the `## Log` only ever
+    // reached `doing`, and nothing else can write this ticket until a human answers for it.
+    let broken: Vec<&str> = LEGAL[..2].to_vec();
+    write_ticket(&repo, "t-9c41", "review", &broken);
     assert_eq!(repo.ks(["doctor"]).code, 1, "diverged");
 
     // What `kanspec repair t-9c41 --why "..."` records: an attributed, timestamped,
     // human-signed `repair` line whose state is authoritative (D-12). The VERB is S3's
     // (`cmd/repair.rs`); what is proved here is the semantics the verb has to produce.
-    let mut log: Vec<&str> = LEGAL.to_vec();
+    let mut log = broken.clone();
     log.push(
-        "- 2026-08-30T17:10Z  done     trevor                repair (imported from the old tracker)",
+        "- 2026-08-30T17:10Z  review   trevor                repair (imported from the old tracker)",
     );
-    write_ticket(&repo, "t-9c41", "done", &log);
+    write_ticket(&repo, "t-9c41", "review", &log);
 
     let run = repo.ks(["doctor"]);
     assert_eq!(
@@ -246,6 +268,51 @@ fn an_attested_repair_line_makes_a_diverged_ticket_replay_clean_again() {
         run.stdout, run.stderr
     );
     assert!(doctor(&repo).findings.is_empty());
+}
+
+/// The same line, attesting a TERMINAL state, is a different animal — and it used to be
+/// invisible. The reset replays perfectly, so `log_trail` is silent, and before
+/// `attested_state` existed this repo answered `12 checks passed` with an unmerged ticket
+/// closed inside it. The trail is genuinely repaired; the CLAIM is not evidence, and
+/// `doctor` now says which is which.
+#[test]
+fn an_attested_close_replays_clean_and_is_reported_anyway() {
+    let repo = TestRepo::new();
+    let mut log: Vec<&str> = LEGAL.to_vec();
+    log.push(
+        "- 2026-08-30T17:10Z  done     trevor                repair (attested done — trust me)",
+    );
+    write_ticket(&repo, "t-9c41", "done", &log);
+
+    let j = doctor(&repo);
+    assert!(
+        j.of("log_trail").is_empty(),
+        "the attested reset DOES repair the trail: {:#?}",
+        j.findings
+    );
+    let f = j.of("attested_state");
+    assert_eq!(f.len(), 1, "{:#?}", j.findings);
+    assert_eq!(f[0].severity, "error", "an unproven close fails CI");
+    assert_eq!(f[0].subject, "t-9c41");
+    assert!(
+        f[0].message.contains("vouched for, never proven"),
+        "{}",
+        f[0].message
+    );
+    assert!(
+        f[0].fix.starts_with("kanspec scan --confirm t-9c41"),
+        "invariant 9: {}",
+        f[0].fix
+    );
+    assert_eq!(repo.ks(["doctor"]).code, 1);
+
+    // …and `status` names it, because the anti-stuck query promotes doctor's errors to YOU
+    // lines rather than hiding them behind a second command.
+    let out = repo.ks(["status"]).stdout;
+    assert!(
+        out.contains("t-9c41") && out.contains("never proven"),
+        "{out}"
+    );
 }
 
 #[test]

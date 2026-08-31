@@ -9,12 +9,22 @@
 //! where the human answers for a Log that no longer adds up — it never lets anyone *choose*
 //! a state, it records that a person vouched for the one already in the file.
 //!
+//! # What an attestation may not buy
+//!
+//! Vouching is not evidence. `done` is reachable only through the merge gate or the
+//! recorded `--no-code` waiver, so [`plan_repair`] refuses to attest a `done` whose `## Log`
+//! carries neither (`repair_cannot_close`) — the mirror of `done --no-code`'s refusal on a
+//! ticket that has a branch. And what it DOES attest is badged: [`crate::derive::attested`]
+//! reads the reset back out of the log, so `ls`, `board`, `show` and `doctor` all show a
+//! human's word as a human's word instead of letting it pass for a proven close.
+//!
 //! Owner: **S3**.
 
 use serde::Serialize;
 
 use crate::cli::RepairArgs;
 use crate::ctx::Ctx;
+use crate::derive;
 use crate::error::{KsError, Result};
 use crate::ids::{Minter, TicketId};
 use crate::logentry::LogEntry;
@@ -99,6 +109,40 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
         ));
     }
 
+    // THE GUARD. `repair` records that a human vouched for the state already in the file —
+    // and for `done` that word must not stand in for the evidence the gate demands.
+    //
+    // Without this, `repair` was strictly MORE permissive than the escape that was
+    // carefully guarded: `done --no-code` refuses on a ticket that was shipped for review
+    // ("cannot close work that has a branch"), while a `sed` to `state: done` followed by
+    // `repair --why "trust me"` closed the same ticket and left `doctor` clean. Worse, a
+    // brand-new `todo` ticket with no branch, no commit and no PR could be hand-edited to
+    // `done` and attested — a transition the table forbids for every real verb.
+    //
+    // `dropped` is deliberately NOT guarded: a drop is an act, not a merge, and `--why` is
+    // already the whole of its evidence. Nor is any non-terminal state — rescuing a broken
+    // trail is what D-12 exists for, and none of those states claims work shipped.
+    if t.fm.state == State::Done && !derive::logged_close(t) {
+        return Err(KsError::gate(
+            "repair_cannot_close",
+            format!(
+                "{id}: nothing in the ## Log says this work landed — repair cannot attest a \
+                 `done` the gate never granted"
+            ),
+            fixes![
+                fix!("kanspec scan --explain {id}"),
+                fix!("kanspec scan --confirm {id} --why \"squash merged by hand, verified\""),
+                fix!(
+                    "open {} and set `state:` back to {}",
+                    t.path.display(),
+                    transitions::replay(&t.log)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "the state its ## Log actually reached".to_string()),
+                ),
+            ],
+        ));
+    }
+
     // Simulate the exact line `Store::transact` is about to write, and replay the whole log
     // with it. `replay` folds legality from the LAST repair entry, so an empty log, a
     // hand-edited `state:` and an illegal step or doctored line anywhere before the reset
@@ -167,6 +211,18 @@ impl Render for RepairReport {
             None => writeln!(w, "   was: the log did not replay at all")?,
         }
         writeln!(w, "   attested by {}: {}", self.by, self.why)?;
+        // A terminal state a human vouched for must not read like a proven one anywhere it
+        // is shown afterwards, and the transcript says so at the moment it is minted rather
+        // than leaving the badge to be discovered on a board later.
+        if self.state.terminal() {
+            writeln!(
+                w,
+                "   {} badged `attested {}` on ls, board, show and doctor — vouched for, \
+                 not proven",
+                glyph::FIX,
+                self.state
+            )?;
+        }
         for n in self.next.iter().skip(1) {
             writeln!(w, "   {} {n}", glyph::FIX)?;
         }
@@ -271,10 +327,36 @@ mod tests {
         assert_eq!(detail, "attested review — imported from the old tracker");
     }
 
-    /// A hand-edited `state:` — the R-2 case. The log replays legally to `review`, the
-    /// frontmatter claims `done`, and `prove` catches the divergence at the next verb.
+    /// A hand-edited `state:` — the R-2 case. The log replays legally to `doing`, the
+    /// frontmatter claims `review`, and `prove` catches the divergence at the next verb.
+    /// Attesting a NON-terminal state claims nothing about shipped work, so it is exactly
+    /// what D-12 is for.
     #[test]
     fn a_hand_edited_state_is_recoverable_by_attestation() {
+        let s = snap_with(
+            State::Review,
+            vec![
+                entry(9, State::Todo, Verb::New),
+                entry(10, State::Doing, Verb::Start),
+            ],
+        );
+        let p = plan(&s, &args("shipped by hand during the migration")).expect("repairable");
+        match p.ops.first() {
+            Some(Op::Transition { detail, .. }) => {
+                assert!(detail.starts_with("attested review"), "{detail}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// THE hole, in two documented commands: `done` refuses because nothing is on main, a
+    /// `sed` puts `done` in the frontmatter anyway, and `repair` used to bless it — leaving
+    /// an unmerged ticket closed and `doctor` reporting a clean bill of health.
+    ///
+    /// `repair` records that a human vouched for a state; it does not get to vouch for the
+    /// one thing this tool computes from git rather than accepting on anybody's word.
+    #[test]
+    fn a_sed_to_done_cannot_be_laundered_into_a_close() {
         let s = snap_with(
             State::Done,
             vec![
@@ -283,13 +365,117 @@ mod tests {
                 entry(11, State::Review, Verb::Ship),
             ],
         );
-        let p = plan(&s, &args("closed by hand during the migration")).expect("repairable");
+        assert_eq!(
+            refusal(plan(&s, &args("trust me"))),
+            "repair_cannot_close",
+            "a shipped-but-unmerged ticket must not be closeable by assertion"
+        );
+    }
+
+    /// The worse half: a ticket with no branch, no commit and no PR, hand-edited straight
+    /// from `todo` to `done` — a jump the table forbids for every real verb, and which
+    /// `repair` was the only route to.
+    #[test]
+    fn a_brand_new_ticket_hand_edited_to_done_cannot_be_attested_either() {
+        let s = snap_with(State::Done, vec![entry(9, State::Todo, Verb::New)]);
+        assert_eq!(refusal(plan(&s, &args("it's fine"))), "repair_cannot_close");
+    }
+
+    /// …and the refusal points somewhere real. `scan --confirm` is the recorded, signed
+    /// route for a genuine squash nothing can detect, and putting the frontmatter back is
+    /// the lossless one — the message names the state the log actually reached, so the
+    /// second fix can be typed without opening anything first.
+    #[test]
+    fn the_refusal_names_the_two_honest_ways_out() {
+        let s = snap_with(
+            State::Done,
+            vec![
+                entry(9, State::Todo, Verb::New),
+                entry(10, State::Doing, Verb::Start),
+                entry(11, State::Review, Verb::Ship),
+            ],
+        );
+        let e = plan(&s, &args("trust me")).err().expect("a refusal");
+        let fixes: Vec<String> = e.fixes().iter().map(|f| f.as_str().to_string()).collect();
+        assert!(
+            fixes.iter().any(|f| f == "kanspec scan --explain t-9c41"),
+            "{fixes:?}"
+        );
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.starts_with("kanspec scan --confirm t-9c41 --why")),
+            "{fixes:?}"
+        );
+        assert!(
+            fixes
+                .iter()
+                .any(|f| f.contains("set `state:` back to review")),
+            "the lossless remedy names the state the ## Log reached: {fixes:?}"
+        );
+    }
+
+    /// The rescue that must keep working: a `## Log` a union merge broke in the middle of a
+    /// ticket that WAS legitimately closed. The close is still in the record — every `done`
+    /// line was written by the gate against a sealed proof or a recorded `--no-code` waiver
+    /// — so re-attesting it asserts nothing new, and refusing would leave the ticket
+    /// permanently unwritable, which is the failure D-12 exists to prevent.
+    #[test]
+    fn a_close_the_log_already_carries_can_still_be_re_attested() {
+        let s = snap_with(
+            State::Done,
+            vec![
+                entry(6, State::Todo, Verb::New),
+                entry(7, State::Doing, Verb::Start),
+                // what a union-merged `## Log` actually produces
+                entry(8, State::Doing, Verb::Start),
+                entry(9, State::Review, Verb::Ship),
+                entry(10, State::Done, Verb::Done),
+            ],
+        );
+        let id = TicketId::parse("t-9c41").unwrap();
+        assert!(
+            transitions::prove(s.ticket(&id).unwrap()).is_err(),
+            "the fixture must actually be broken, or this test proves nothing"
+        );
+        let p = plan(&s, &args("union merge duplicated the claim line")).expect("repairable");
         match p.ops.first() {
             Some(Op::Transition { detail, .. }) => {
                 assert!(detail.starts_with("attested done"), "{detail}")
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `dropped` is terminal too, and deliberately unguarded: a drop is an act, not a merge,
+    /// and `--why` is already the whole of its evidence. An imported tracker full of
+    /// abandoned work must stay rescuable.
+    #[test]
+    fn an_imported_drop_is_terminal_but_needs_no_merge_evidence() {
+        let s = snap_with(State::Dropped, vec![]);
+        let p = plan(&s, &args("abandoned in the old tracker")).expect("repairable");
+        match p.ops.first() {
+            Some(Op::Transition { detail, .. }) => {
+                assert_eq!(detail, "attested dropped — abandoned in the old tracker")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A recorded `scan --confirm` is the OTHER evidence that counts: `plan_confirm` refuses
+    /// to write one without a commit SHA and a reason, so a log that carries it carries a
+    /// signed claim that this work is on main (D-11).
+    #[test]
+    fn a_recorded_confirmation_is_evidence_enough_to_re_attest_a_close() {
+        let s = snap_with(
+            State::Done,
+            vec![
+                entry(9, State::Review, Verb::Confirm),
+                entry(10, State::Todo, Verb::New),
+            ],
+        );
+        let p = plan(&s, &args("log arrived scrambled from the import")).expect("repairable");
+        assert_eq!(p.ops.len(), 1);
     }
 
     /// D-12's harder half, and the reason `replay` folds legality from the LAST repair: an

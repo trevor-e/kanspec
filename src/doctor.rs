@@ -69,7 +69,15 @@ pub static CHECKS: &[Check] = &[
         id: "log_trail",
         about: "every ticket's state was reached by a legal, in-order logged transition",
         run: check_log_trail,
-        fix: None, // recovery is `kanspec repair <id> --why` — a human attestation (D-12)
+        // No mechanical repair, and `kanspec repair` is deliberately NOT the prescription
+        // (see `check_log_trail`): it is the last resort, not the first.
+        fix: None,
+    },
+    Check {
+        id: "attested_state",
+        about: "no ticket rests in a terminal state a human only attested to",
+        run: check_attested_state,
+        fix: None, // there is nothing to rewrite — the remedy is evidence, or a truer state
     },
     Check {
         id: "reserved_keys",
@@ -192,18 +200,103 @@ pub fn check_ids() -> Vec<&'static str> {
 /// R-2, mechanically: the seals bind the tool, the `## Log` binds the human. A
 /// `sed -i 's/state: review/state: done/'` leaves no log entry, so the fold through the
 /// SAME oracle the write path uses cannot reach the state the file claims.
+///
+/// **The prescription is never `kanspec repair` first.** It used to be, and that made the
+/// warning its own laundry: `sed` the frontmatter to `done`, run the command `doctor` put
+/// under the finding, and the repo went green with an unmerged ticket closed inside it.
+/// `repair` still exists and still rescues (D-12) — but it is the LAST resort, so the fix
+/// line names the honest remedy for the violation actually found: put the frontmatter back
+/// to the state the log reached, or put the log's own lines right. Both restore the truth;
+/// an attestation only overwrites the question.
 fn check_log_trail(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
     for t in s.tickets.values() {
         let Err(v) = transitions::prove(t) else {
             continue;
         };
+        let id = &t.fm.id;
+        let path = t.path.display();
+        let fix = match &v {
+            // The divergence case IS the hand-edit, and undoing it is mechanical and
+            // lossless: the `## Log` already says which state this ticket legally reached.
+            transitions::LogViolation::Divergence { replayed, .. } => {
+                format!("edit {path} and set `state: {replayed}`")
+            }
+            transitions::LogViolation::OutOfOrder { .. } => {
+                format!("edit {path} and put the ## Log lines back in date order")
+            }
+            _ => format!("edit {path} and repair the ## Log lines above the break"),
+        };
         out.push(Finding {
             check: "log_trail",
             severity: Severity::Error,
-            subject: t.fm.id.to_string(),
-            message: format!("{v}"),
-            fix: format!("kanspec repair {} --why \"...\"", t.fm.id),
+            subject: id.to_string(),
+            // The escape stays discoverable, and stays described as what it is: a recorded
+            // human attestation, badged from then on, for history that is genuinely lost.
+            message: format!(
+                "{v} — if the history is genuinely unrecoverable, `kanspec repair {id} \
+                 --why \"...\"` attests it and the ticket is badged attested from then on"
+            ),
+            fix,
+            fixable: false,
+        });
+    }
+    out
+}
+
+/// The other half of D-12, and the reason `repair` cannot be a quiet exit. A ticket whose
+/// terminal state was *attested* rather than *replayed* is legitimate — that is the whole
+/// point of the verb — but it must never be indistinguishable from one the gate proved.
+///
+/// Two grades, because two very different things arrive here:
+///
+/// - **Error** — `done` with nothing in the `## Log` saying the work landed. `plan_repair`
+///   refuses to write this (`repair_cannot_close`), so what remains is a hand-written
+///   `repair` line or one an older binary minted: an unmerged ticket closed by assertion,
+///   which is precisely the claim this tool exists to refuse. It leads `status` too, since
+///   `cmd::status` promotes doctor's errors to YOU lines.
+/// - **Warning** — everything else: an attested `dropped`, or a `done` whose close the log
+///   still carries. Nothing is broken; the state simply rests on a person's word, and that
+///   stays on the record instead of ageing into a fact.
+fn check_attested_state(s: &Snapshot) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for t in s.tickets.values() {
+        if !t.fm.state.terminal() {
+            continue;
+        }
+        let Some(a) = derive::attested(t) else {
+            continue;
+        };
+        let id = &t.fm.id;
+        let when = a.at.format("%Y-%m-%d");
+        let (severity, message, fix) =
+            if t.fm.state == transitions::State::Done && !derive::logged_close(t) {
+                (
+                    Severity::Error,
+                    format!(
+                    "is `done` because {} attested it on {when}, and nothing in its ## Log says \
+                     the work ever landed — this close was vouched for, never proven",
+                    a.actor
+                ),
+                    format!("kanspec scan --confirm {id} --why \"...\""),
+                )
+            } else {
+                (
+                    Severity::Warning,
+                    format!(
+                    "reached `{}` by attestation ({} on {when}) — a human's word, not a replayed \
+                     trail",
+                    t.fm.state, a.actor
+                ),
+                    format!("kanspec log {id}"),
+                )
+            };
+        out.push(Finding {
+            check: "attested_state",
+            severity,
+            subject: id.to_string(),
+            message,
+            fix,
             fixable: false,
         });
     }
@@ -861,8 +954,92 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::Error);
         assert!(f[0].message.contains("replays to"), "{}", f[0].message);
-        assert!(f[0].fix.starts_with("kanspec repair t-0001"));
+        // The FIRST prescription is the honest one — put the frontmatter back to the state
+        // the log actually reached. Prescribing `repair` here made the warning its own
+        // laundry: the command doctor printed closed the ticket and cleared the finding.
+        assert_eq!(
+            f[0].fix,
+            "edit .kanspec/tickets/t-0001.md and set `state: review`"
+        );
+        assert!(
+            !f[0].fix.contains("repair"),
+            "the attestation is the last resort, never the prescription: {}",
+            f[0].fix
+        );
+        // …and it stays discoverable, described as what it is.
+        assert!(
+            f[0].message.contains("kanspec repair t-0001 --why")
+                && f[0].message.contains("badged attested"),
+            "{}",
+            f[0].message
+        );
         assert!(!f[0].fixable, "recovery is a human attestation (D-12)");
+    }
+
+    /// The hole this check closes: a `repair` line attesting `done` on a ticket whose
+    /// `## Log` never closed it replays perfectly, so `log_trail` is silent — and before
+    /// this check the repo reported a clean bill of health with an unmerged ticket shut
+    /// inside it.
+    #[test]
+    fn a_close_that_was_only_attested_is_an_error_not_a_clean_bill_of_health() {
+        let mut s = snap();
+        let mut t = legal("t-0001");
+        t.fm.state = State::Done;
+        t.log.push(entry(5, Verb::Repair, State::Done));
+        put(&mut s, t);
+
+        let all = run_all(&s);
+        assert!(
+            found(all.clone(), "log_trail").is_empty(),
+            "the attested reset replays clean — which is exactly why it needed its own check"
+        );
+        let f = found(all, "attested_state");
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Error, "this one fails CI");
+        assert!(
+            f[0].message.contains("vouched for, never proven"),
+            "{}",
+            f[0].message
+        );
+        assert_eq!(f[0].fix, "kanspec scan --confirm t-0001 --why \"...\"");
+    }
+
+    /// The legitimate half, and why the check is not simply an error: a rescued trail whose
+    /// close the log still carries, and an attested `dropped` (a drop is an act, not a
+    /// merge), are both fine — they are recorded, not condemned.
+    #[test]
+    fn an_attested_state_the_record_supports_is_a_warning_that_never_ages_into_a_fact() {
+        let mut s = snap();
+        let mut done = legal("t-0001");
+        done.fm.state = State::Done;
+        done.log.push(entry(9, Verb::Done, State::Done));
+        done.log.push(entry(5, Verb::Repair, State::Done));
+        put(&mut s, done);
+
+        let mut dropped = ticket("t-0002", State::Dropped);
+        dropped.log = vec![entry(20, Verb::Repair, State::Dropped)];
+        put(&mut s, dropped);
+
+        let f = found(run_all(&s), "attested_state");
+        assert_eq!(f.len(), 2, "{f:#?}");
+        assert!(f.iter().all(|f| f.severity == Severity::Warning), "{f:#?}");
+        assert!(f.iter().all(|f| f.message.contains("by attestation")));
+    }
+
+    /// The attestation is spent the moment an ordinary verb moves the ticket on: a rescue
+    /// back to `todo` that was then started, shipped and closed by the gate stands on its
+    /// own trail again and carries no badge.
+    #[test]
+    fn an_attestation_a_later_verb_moved_past_is_not_a_finding() {
+        let mut s = snap();
+        let mut t = ticket("t-0001", State::Review);
+        t.log = vec![
+            entry(50, Verb::Repair, State::Todo),
+            entry(40, Verb::Start, State::Doing),
+            entry(30, Verb::Ship, State::Review),
+        ];
+        put(&mut s, t);
+        assert!(found(run_all(&s), "attested_state").is_empty());
     }
 
     #[test]
@@ -1143,7 +1320,7 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate check id");
-        assert_eq!(n, 12);
+        assert_eq!(n, 13);
         // every check runs against an empty snapshot without panicking
         let s = snap();
         for c in CHECKS {

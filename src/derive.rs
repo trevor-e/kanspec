@@ -21,6 +21,7 @@ use serde::Serialize;
 use crate::cache::{MergeFact, MergeStatus};
 use crate::git::Method;
 use crate::ids::{CommentId, ItemRef, ProposalId, SpecName, TicketId};
+use crate::logentry::LogEntry;
 use crate::model::{
     CommentOpKind, DecisionStatus, Proposal, ProposalStatus, Snapshot, Spec, Ticket,
 };
@@ -173,10 +174,67 @@ fn bare_reason(why: &str) -> String {
         .to_string()
 }
 
+// ── attestation: the state a human vouched for (D-12) ────────────────────────
+
+/// The standing attestation on a ticket: the LAST `repair` entry, when the state it
+/// attested is still the ticket's state.
+///
+/// `repair` is the one verb whose logged state is authoritative (D-12), which makes it the
+/// one route to a state that was *vouched for* rather than *replayed*. That distinction is
+/// derived — it is read back out of the `## Log`, never written into frontmatter — so it
+/// survives `rm -rf cache/`, travels through git, and cannot be set by a field.
+///
+/// A later ordinary verb clears it by construction: once `start` moves a repaired-to-`todo`
+/// ticket on, the last repair entry no longer names the current state and the ticket is
+/// back to standing on its own trail.
+pub fn attested(t: &Ticket) -> Option<&LogEntry> {
+    t.log
+        .iter()
+        .rev()
+        .find(|e| e.verb == Verb::Repair)
+        .filter(|e| e.state == t.fm.state)
+}
+
+/// Whether the ticket's own `## Log` carries the close the gate writes — the evidence a
+/// `done` needs, read out of the record that travels through git rather than out of the
+/// disposable cache (J-8: a cached `merged` is a badge, never a gate).
+///
+/// Two lines count, and both were written by a gate that already demanded proof:
+/// - a `done` entry — `plan_done` writes one only against a sealed `MergedProof` or a
+///   recorded `--no-code` waiver, and neither can be minted without git or a signed reason;
+/// - a `confirm` entry — `scan --confirm`, the recorded human override (D-11), which
+///   `plan_confirm` refuses without both a commit SHA and a reason.
+///
+/// A `## Log` with neither says this ticket never landed.
+pub fn logged_close(t: &Ticket) -> bool {
+    t.log
+        .iter()
+        .any(|e| matches!(e.verb, Verb::Done | Verb::Confirm))
+}
+
 /// The badge every card carries — **never a guess**. Precedence is evidence-first: a
 /// recorded ladder verdict outranks the branch's push state, and "we have no fact" is
 /// `NeverScanned`, never `Unpushed`.
+///
+/// An attested CLOSE outranks all of it. A ticket that reached `done` or `dropped` because
+/// a human vouched for it (D-12) must never wear a badge that reads like proof, and the
+/// cache — which stops scanning a ticket the moment it goes terminal — is exactly where a
+/// stale `in main` would otherwise come from. `unknown` naming the attestation is the
+/// honest card: git proved nothing here, a person said so, and the card says which.
 pub fn badge(s: &Snapshot, t: &Ticket) -> Badge {
+    if t.fm.state.terminal() {
+        if let Some(a) = attested(t) {
+            return Badge::Unknown {
+                why: format!(
+                    "attested {} by {} on {}",
+                    a.state,
+                    a.actor,
+                    a.at.format("%Y-%m-%d")
+                ),
+                checked_at: None,
+            };
+        }
+    }
     let pushed = s.git.branches.get(&t.fm.id).map(|b| b.pushed);
     match merge_fact(s, t) {
         Some(f) => match f.status {
