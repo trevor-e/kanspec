@@ -14,6 +14,8 @@
 //! ARCHITECTURE.md §2.4 by hand. Nothing here calls `next()` to decide what `next()`
 //! should say.
 
+mod common;
+
 use kanspec::transitions::{
     allowed_from, allowed_slice, next, prove, replay, require, states_for, states_str, verbs_str,
     LogViolation, State, Verb, ALL_STATES, ALL_VERBS,
@@ -317,6 +319,13 @@ fn the_verbs_that_are_not_their_own_subcommand_are_spelled_out() {
 }
 
 /// The bug as the audit hit it, end to end: `kanspec start <a done ticket>`.
+///
+/// The same line was wrong TWICE, in two different ways, and this asserts both are gone.
+/// Round B: `kanspec confirm t-ea32` was not a command at all (`confirm` is a flag on
+/// `scan`), so the fix could not be run. Round D: the runnable spelling of it could be run
+/// and led nowhere — `scan --confirm` on a ticket that never had a branch answers `ship`,
+/// and `ship` on a terminal ticket answered `scan --confirm`. See
+/// `a_terminal_ticket_is_told_something_final_rather_than_sent_round_again`.
 #[test]
 fn starting_a_done_ticket_is_refused_with_a_command_that_exists() {
     let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
@@ -327,14 +336,425 @@ fn starting_a_done_ticket_is_refused_with_a_command_that_exists() {
             !fixes.contains(&"kanspec confirm t-ea32"),
             "`confirm` is a flag on `scan`, never a subcommand: {fixes:?}"
         );
+        assert!(
+            !fixes.contains(&"kanspec scan --confirm t-ea32 --why \"...\""),
+            "a closed ticket has nothing to attest, and `--confirm` bounces back: {fixes:?}"
+        );
         assert_eq!(
             fixes,
-            [
-                "kanspec show t-ea32",
-                "kanspec scan --confirm t-ea32 --why \"...\"",
-            ],
+            ["kanspec show t-ea32", "kanspec new \"...\""],
             "from {terminal}"
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ...and invariant 9 taken all the way: FOLLOWING the fixes has to TERMINATE
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// `every_illegal_pair_suggests_commands_the_real_cli_accepts` proves each suggestion is a
+// command clap accepts. That is a property of one arrow. It cannot see a CHAIN, and the
+// chains were not all finite:
+//
+//     $ ks done t-8e2b       ✗ t-8e2b is dropped, not doing or review — cannot done
+//                            → ks scan --confirm t-8e2b --why "..."
+//     $ ks scan --confirm …  ✗ t-8e2b records neither a `head:` SHA nor a resolvable branch
+//                            → kanspec ship t-8e2b
+//     $ kanspec ship t-8e2b  ✗ t-8e2b is dropped, not doing — cannot ship
+//                            → kanspec scan --confirm t-8e2b --why "..."   ← step 2 again
+//
+// Every arrow there parses. A human sees the ring on the third line and stops; an agent
+// whose whole contract is "run the suggested command" does not. So the property this file
+// asserts is the one that makes the contract safe to automate: from EVERY (state, verb)
+// the CLI can express, following the suggestions reaches a success, or a refusal with
+// nothing further to run, in a bounded number of steps and WITHOUT REVISITING A STATE.
+//
+// The walk runs the real binary against real tickets, because a refusal's fixes come from
+// the gates the command actually hits, and no table of expectations can know that
+// `scan --confirm` on a branchless ticket answers `ship`.
+
+/// The bounded part of "a small bounded number of steps". Nothing legitimate is more than
+/// three deep today; six leaves room without letting a runaway walk burn the suite.
+const MAX_STEPS: usize = 6;
+
+/// Fixed ids, one per state — so a failure names a state rather than a hash, and so a
+/// command string is stable while the fixture underneath it is rewritten.
+fn walk_id(state: State) -> &'static str {
+    match state {
+        Todo => "t-0a01",
+        Doing => "t-0d01",
+        Review => "t-0e01",
+        Done => "t-0f01",
+        Dropped => "t-0c01",
+    }
+}
+
+/// `## Log` lines, one legal trail per state — the same hand-written fixture shape
+/// `tests/common/merges.rs` uses, so the ticket `replay`s and `Store::transact` will accept
+/// a write to it.
+fn walk_log(state: State) -> &'static [&'static str] {
+    const NEW: &str = "- 2026-08-30T09:00Z  todo     trevor                new\n";
+    const START: &str = "- 2026-08-30T10:00Z  doing    trevor                start\n";
+    const SHIP: &str = "- 2026-08-30T11:00Z  review   trevor                ship\n";
+    const CLOSE: &str = "- 2026-08-30T12:00Z  done     trevor                done\n";
+    const DROP: &str = "- 2026-08-30T10:00Z  dropped  trevor                drop\n";
+    match state {
+        Todo => &[NEW],
+        Doing => &[NEW, START],
+        Review => &[NEW, START, SHIP],
+        Done => &[NEW, START, SHIP, CLOSE],
+        // `drop` straight off the backlog — the shape the transcript above was hit on, and
+        // the only one that reaches a terminal state with NO branch and NO `head:`.
+        Dropped => &[NEW, DROP],
+    }
+}
+
+/// What one command did.
+enum Said {
+    Ok,
+    /// a refusal: the message it printed, and the fix lines under it
+    No(String, Vec<String>),
+}
+
+/// A real repo with one real ticket per state.
+struct Bench {
+    repo: common::TestRepo,
+    /// the branch head each claimed state's fixture points at
+    heads: std::collections::BTreeMap<&'static str, String>,
+}
+
+impl Bench {
+    fn new() -> Bench {
+        let repo = common::TestRepo::new();
+        // Force the one mock seam ON. With `$KANSPEC_GH_FIXTURES` set, a fixture that is
+        // not there is `GhUnavailable` rather than a live `gh` call — the walk must not
+        // depend on whether this machine has `gh`, or reach the network.
+        repo.gh_fixture("the-walk-never-asks-gh", "{}");
+        let mut heads = std::collections::BTreeMap::new();
+        for state in [Doing, Review, Done] {
+            let id = walk_id(state);
+            let branch = format!("ks/{id}-walk");
+            repo.git(&["checkout", "--quiet", "-B", &branch, "main"]);
+            let file = format!("src/auth/{}.ts", id.replace('-', "_"));
+            repo.write(&file, "export const walk = 1;\n");
+            // `add -A` would sweep up the ticket files sitting untracked in the working
+            // tree and commit them onto THIS branch (merges.rs makes the same point).
+            repo.git(&["add", "--", &file]);
+            repo.git(&[
+                "commit",
+                "--quiet",
+                "-m",
+                &format!("{id}: work\n\nKanspec: {id}\n"),
+            ]);
+            heads.insert(id, repo.sha("HEAD").trim().to_string());
+            repo.git(&["checkout", "--quiet", "main"]);
+        }
+        Bench { repo, heads }
+    }
+
+    /// (Re)writes the fixture for `state` and returns its id.
+    ///
+    /// Called before EVERY command rather than reasoned about: a refusal moves nothing (the
+    /// walk asserts that below), but a suggestion that SUCCEEDS does, and the next branch of
+    /// the walk has to start from the same place this one did.
+    fn seed(&self, state: State) -> &'static str {
+        let id = walk_id(state);
+        let mut s = format!(
+            "---\nid: {id}\ntitle: the suggestion walk ({state})\nstate: {state}\ndeps: []\n"
+        );
+        // `start` writes `branch:` and `claimed_by:`; only `ship` writes `head:` (§2.16).
+        if let Some(head) = self.heads.get(id) {
+            s += &format!("branch: ks/{id}-walk\nclaimed_by: trevor\n");
+            if matches!(state, Review | Done) {
+                s += &format!("head: {head}\n");
+            }
+        }
+        s += "created: 2026-08-30T09:00:00Z\n---\nThe fixture the suggestion walk runs \
+              against.\n\n## Log\n";
+        for line in walk_log(state) {
+            s += line;
+        }
+        self.repo.write(&format!(".kanspec/tickets/{id}.md"), &s);
+        id
+    }
+
+    /// The state on disk right now — read from the file, not from a second `kanspec` run.
+    fn state_of(&self, id: &str) -> State {
+        let body = self.repo.read(&format!(".kanspec/tickets/{id}.md"));
+        let raw = body
+            .lines()
+            .find_map(|l| l.strip_prefix("state:"))
+            .unwrap_or_else(|| panic!("{id} has no `state:` line"))
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        State::parse(&raw).unwrap_or_else(|| panic!("`{raw}` is not a state"))
+    }
+
+    /// Runs one suggested command for real, exactly as it was printed.
+    fn run(&self, cmd: &str) -> Said {
+        let mut args = argv(cmd);
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("kanspec"),
+            "the walk only follows `kanspec` commands: {cmd}"
+        );
+        args.remove(0);
+        args.push("--json".to_string());
+        let r = self.repo.ks(&args);
+        if r.code == 0 {
+            return Said::Ok;
+        }
+        let v: serde_json::Value = serde_json::from_str(&r.stdout).unwrap_or_else(|e| {
+            panic!(
+                "`{cmd}` exited {} without JSON ({e}):\n{}",
+                r.code, r.stdout
+            )
+        });
+        let fixes = v["error"]["fix"]
+            .as_array()
+            .unwrap_or_else(|| panic!("invariant 9: `{cmd}` refused with no fix list:\n{v}"))
+            .iter()
+            .map(|f| f.as_str().unwrap_or_default().to_string())
+            .collect();
+        Said::No(
+            v["error"]["message"].as_str().unwrap_or("?").to_string(),
+            fixes,
+        )
+    }
+}
+
+/// The suggestions this file is answerable for: every invocation [`Verb::command_as`] mints,
+/// plus the read-only lookups a refusal may point at.
+///
+/// A fix outside it ends the walk, for one of two reasons. `git commit -m "…"` and
+/// `edit .kanspec/specs/auth.md on this branch` are not commands this tool can run at all —
+/// there is nothing to auto-follow, which is exactly the honest terminus this test is
+/// looking for. And a fix that carries a DISPOSITION flag (`--no-code`, `--no-followups`,
+/// `--spawn`, `--drop-step`) is an answer to a question the close-out gate asked, not a
+/// suggested transition; that gate owns its own chain and its own tests.
+fn vocabulary(id: &str) -> Vec<String> {
+    let tid = kanspec::ids::TicketId::parse(id).expect("a walk id");
+    let mut v: Vec<String> = ALL_VERBS
+        .iter()
+        .map(|verb| verb.command_as("kanspec", &tid))
+        .collect();
+    v.push(format!("kanspec show {id}"));
+    v.push(format!("kanspec log {id}"));
+    v.push(format!("kanspec scan --explain {id}"));
+    v
+}
+
+/// `--why "not started yet"` -> `--why "..."`, `new "rate-limit login"` -> `new "..."`.
+///
+/// Two suggestions that differ only in their prose are the SAME suggestion: they run the
+/// same verb against the same ticket and get the same answer. Collapsing the prose is what
+/// lets the walk recognise the ring in the transcript above — and what stops it counting a
+/// re-worded reason as progress.
+fn normalize(cmd: &str) -> String {
+    let t = argv(cmd);
+    let mut out: Vec<String> = Vec::with_capacity(t.len());
+    let mut title_seen = false;
+    for (i, tok) in t.iter().enumerate() {
+        let after_why = i > 0 && t[i - 1] == "--why";
+        let is_new_title = t.get(1).map(String::as_str) == Some("new")
+            && i > 1
+            && !tok.starts_with('-')
+            && !std::mem::replace(&mut title_seen, true);
+        out.push(if after_why || is_new_title {
+            "...".to_string()
+        } else {
+            tok.clone()
+        });
+    }
+    out.iter()
+        .map(|tok| {
+            if tok.is_empty() || tok == "..." || tok.contains(char::is_whitespace) {
+                format!("\"{tok}\"")
+            } else {
+                tok.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[test]
+fn the_suggestion_normaliser_the_walk_leans_on_actually_works() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    // a re-worded reason is the same suggestion
+    assert_eq!(
+        normalize("kanspec park t-ea32 --why \"not started yet\""),
+        V::Park.command_as("kanspec", &id)
+    );
+    assert_eq!(
+        normalize("kanspec scan --confirm t-ea32 --why \"squash merged by hand\""),
+        V::Confirm.command_as("kanspec", &id)
+    );
+    assert_eq!(
+        normalize("kanspec new \"rate-limit the login endpoint\""),
+        V::New.command_as("kanspec", &id)
+    );
+    // ...but a disposition flag is a DIFFERENT command, and stays one
+    assert_ne!(
+        normalize("kanspec done t-ea32 --no-code --why \"docs only\""),
+        V::Done.command_as("kanspec", &id)
+    );
+    assert_eq!(normalize("kanspec show t-ea32"), "kanspec show t-ea32");
+    // and every minted invocation is already in its own normal form
+    for &v in ALL_VERBS {
+        let cmd = v.command_as("kanspec", &id);
+        assert_eq!(normalize(&cmd), cmd, "`{v}`");
+    }
+}
+
+/// One node: run `cmd` against a fresh ticket in `root`, then follow everything it suggests.
+fn follow(
+    b: &Bench,
+    root: State,
+    cmd: &str,
+    chain: &mut Vec<(String, String)>,
+    proven: &mut std::collections::BTreeSet<(&'static str, String)>,
+) {
+    let key = (root.as_str(), normalize(cmd));
+    // THE property. A command already standing in the chain that led here means an agent
+    // following the arrows is going round, and will go round for ever.
+    if let Some(i) = chain.iter().position(|(c, _)| normalize(c) == key.1) {
+        panic!(
+            "the suggested fixes never terminate — from a {root} ticket, step {} sends an \
+             agent back to step {}:\n\n{}",
+            chain.len() + 1,
+            i + 1,
+            walk_transcript(chain, cmd),
+        );
+    }
+    assert!(
+        chain.len() < MAX_STEPS,
+        "from a {root} ticket the suggestions are still going after {MAX_STEPS} steps:\n\n{}",
+        walk_transcript(chain, cmd),
+    );
+    if proven.contains(&key) {
+        return;
+    }
+
+    let id = b.seed(root);
+    if let Said::No(message, fixes) = b.run(cmd) {
+        // The whole walk rests on this: a refusal is a refusal, so every branch explored
+        // below starts from the same ticket the branch above did.
+        assert_eq!(
+            b.state_of(id),
+            root,
+            "`{cmd}` refused AND moved the ticket off {root}"
+        );
+        let next: Vec<String> = fixes
+            .iter()
+            .filter(|f| vocabulary(id).contains(&normalize(f)))
+            .cloned()
+            .collect();
+        chain.push((
+            cmd.to_string(),
+            format!("{message}\n     → {}", fixes.join("\n     → ")),
+        ));
+        for f in next {
+            follow(b, root, &f, chain, proven);
+        }
+        chain.pop();
+    }
+    proven.insert(key);
+}
+
+fn walk_transcript(chain: &[(String, String)], last: &str) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for (i, (cmd, said)) in chain.iter().enumerate() {
+        let _ = writeln!(s, "  {}. $ {cmd}\n     ✗ {said}", i + 1);
+    }
+    let _ = writeln!(s, "  {}. $ {last}", chain.len() + 1);
+    s
+}
+
+/// THE regression: the suggestion GRAPH, walked from every (state, verb) the CLI can say.
+#[test]
+fn following_the_suggested_fixes_terminates_from_every_state_and_verb() {
+    let b = Bench::new();
+    let mut proven = std::collections::BTreeSet::new();
+    for &state in ALL_STATES {
+        let id = kanspec::ids::TicketId::parse(walk_id(state)).unwrap();
+        for &verb in ALL_VERBS {
+            // `new` MINTS an id; there is no way to aim it at an existing ticket, so the
+            // `(state, new)` refusals in TABLE have no CLI invocation to walk from.
+            if verb == V::New {
+                continue;
+            }
+            follow(
+                &b,
+                state,
+                &verb.command_as("kanspec", &id),
+                &mut Vec::new(),
+                &mut proven,
+            );
+        }
+    }
+    // Every root, plus everything they suggest, actually ran.
+    assert!(
+        proven.len() >= ALL_STATES.len() * (ALL_VERBS.len() - 1),
+        "the walk explored only {} nodes",
+        proven.len()
+    );
+    // ...and it really did FOLLOW, rather than quietly filtering every suggestion away and
+    // passing on an empty graph. Neither of these is a verb, so the only way the walk can
+    // have run them is that a refusal pointed at them.
+    for (state, cmd) in [
+        (Todo, format!("kanspec show {}", walk_id(Todo))),
+        (
+            Dropped,
+            V::New.command_as("kanspec", &kanspec::ids::TicketId::parse("t-0c01").unwrap()),
+        ),
+    ] {
+        assert!(
+            proven.contains(&(state.as_str(), cmd.clone())),
+            "no {state} refusal ever sent the walk to `{cmd}`"
+        );
+    }
+
+    // ...and terminating is the floor, not the goal. What a closed ticket is told to do has
+    // to WORK on the spot — look at it, or open a new ticket — which is the difference
+    // between a chain that ends and a chain that gives up.
+    let id = kanspec::ids::TicketId::parse(b.seed(Dropped)).unwrap();
+    for fix in require(&id, Dropped, V::Start).unwrap_err().fixes().iter() {
+        assert!(
+            matches!(b.run(fix.as_str()), Said::Ok),
+            "a dropped ticket is told `{fix}`, and it does not even run"
+        );
+    }
+}
+
+/// The end of the chain, spelled out for the two states a ticket cannot legally leave.
+///
+/// A `done` or `dropped` ticket has nowhere to go: the table allows only `confirm` and
+/// `repair`, and both of those answer a question about work that is over. So the refusal
+/// says the true, final thing — look at it, or open a new ticket — rather than naming a
+/// verb that will bounce straight back here.
+#[test]
+fn a_terminal_ticket_is_told_something_final_rather_than_sent_round_again() {
+    let id = kanspec::ids::TicketId::parse("t-ea32").unwrap();
+    for terminal in [Done, Dropped] {
+        for &verb in ALL_VERBS {
+            if next(Some(terminal), verb).is_some() {
+                continue;
+            }
+            let e = require(&id, terminal, verb).unwrap_err();
+            let fixes: Vec<&str> = e.fixes().iter().map(|f| f.as_str()).collect();
+            assert_eq!(
+                fixes,
+                ["kanspec show t-ea32", "kanspec new \"...\""],
+                "`{verb}` from {terminal}"
+            );
+            for f in &fixes {
+                must_run(f, &format!("`{verb}` from {terminal}"));
+            }
+        }
     }
 }
 
