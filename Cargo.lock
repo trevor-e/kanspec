@@ -753,6 +753,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "toml",
+ "unicode-width",
 ]
 
 [[package]]

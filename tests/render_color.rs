@@ -29,8 +29,11 @@
 
 mod common;
 
+use std::path::Path;
+use std::process::Command;
+
 use common::TestRepo;
-use kanspec::out::{pad_visible, paint, visible_len, Color};
+use kanspec::out::{pad_visible, paint, spoken_as, visible_len, Color};
 use serde_json::Value;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,5 +400,334 @@ fn every_command_renders_the_same_layout_painted_as_it_does_plain() {
         painted_commands >= 12,
         "only {painted_commands} commands actually emitted colour; this test is supposed to \
          cover the whole id-bearing surface"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (a) DISPLAY WIDTH — a column is what the terminal DRAWS, not a `char`
+//
+// ROUND-E REGRESSION (ARCHITECTURE D-50, reopened). `visible_len` counted `char`s, so a
+// wide glyph measured one column where the terminal draws two:
+//
+//     chars=100  columns=100   plain ascii title
+//     chars=100  columns=102   emoji title
+//     chars=100  columns=117   CJK title
+//
+// Every budget in `out.rs` flows through that one function, so a CJK title was
+// right-aligned into seventeen columns the terminal did not have and the line WRAPPED —
+// the same broken alignment the padding bug above produced, from the opposite direction,
+// and equally invisible to the colour-vs-plain property, because colour is not what
+// changes.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every character in this file's fixtures that a terminal draws TWO columns wide. Small
+/// and enumerated on purpose: [`columns`] is the *independent* oracle the width assertions
+/// below are judged against, and an oracle that called `unicode-width` would share every
+/// bug with the code under test — the same reason `strip_ansi` is hand-written above.
+const WIDE: &[char] = &[
+    '認', '証', 'ト', 'ー', 'ク', 'ン', 'の', '有', '効', '期', '限', 'を', '延', '長', 'す', 'る',
+    '🚀',
+];
+
+/// 16 Japanese characters, every one East Asian *Wide*: 16 `char`s, 32 columns.
+const CJK_TITLE: &str = "認証トークンの有効期限を延長する";
+/// 6 emoji among ASCII: 29 `char`s, 35 columns.
+const EMOJI_TITLE: &str = "🚀🚀🚀 ship the rate limiter 🚀🚀🚀";
+/// The control. Same shape, no wide glyph, so `chars` and columns agree — its rendering
+/// must not move by a single byte.
+const ASCII_TITLE: &str = "Extend the auth token expiry";
+
+/// The independent display-width oracle: one column per character, except the enumerated
+/// [`WIDE`] ones, which are two.
+fn columns(s: &str) -> usize {
+    strip_ansi(s)
+        .chars()
+        .map(|c| if WIDE.contains(&c) { 2 } else { 1 })
+        .sum()
+}
+
+#[test]
+fn the_width_oracle_is_honest() {
+    assert_eq!(columns("t-ec64"), 6);
+    assert_eq!(columns(CJK_TITLE), 32);
+    assert_eq!(columns(EMOJI_TITLE), 35);
+    assert_eq!(columns(ASCII_TITLE), ASCII_TITLE.chars().count());
+    assert_eq!(
+        columns("\u{1b}[1m認証\u{1b}[0m"),
+        4,
+        "escapes are not columns"
+    );
+    // The premise of the whole finding, as an assertion: counting `char`s is not counting
+    // columns.
+    assert_eq!(CJK_TITLE.chars().count(), 16);
+    assert_eq!(EMOJI_TITLE.chars().count(), 29);
+}
+
+#[test]
+fn visible_len_measures_columns_not_chars() {
+    // ASCII is untouched — the id column, and every existing assertion in the suite,
+    // depend on this half staying byte-for-byte what it always was.
+    assert_eq!(visible_len("t-ec64"), 6);
+    assert_eq!(visible_len(ASCII_TITLE), ASCII_TITLE.chars().count());
+
+    // …and a wide glyph is two columns, painted or not.
+    assert_eq!(visible_len(CJK_TITLE), columns(CJK_TITLE));
+    assert_eq!(visible_len(EMOJI_TITLE), columns(EMOJI_TITLE));
+    assert_eq!(
+        visible_len(&paint(CJK_TITLE, Color::Bold, true)),
+        columns(CJK_TITLE),
+        "SGR escapes still occupy no columns"
+    );
+    assert!(
+        visible_len(CJK_TITLE) > CJK_TITLE.chars().count(),
+        "the bug itself: `chars().count()` under-counts a CJK title by one column per glyph"
+    );
+
+    // A combining mark is drawn ON the previous glyph, so it adds nothing: `e` + U+0301 is
+    // one column, not two.
+    assert_eq!(visible_len("e\u{301}"), 1);
+    assert_eq!(visible_len(""), 0);
+
+    // Padding is the point: `pad_visible` budgets through `visible_len`, so it pads by
+    // COLUMNS.
+    assert_eq!(columns(&pad_visible(CJK_TITLE, 40)), 40);
+    assert_eq!(columns(&pad_visible("認証", 9)), 9);
+    assert_eq!(pad_visible("認証", 9), "認証     ", "4 columns + 5 spaces");
+}
+
+/// THE END-TO-END HALF, against the real binary: a CJK title and an emoji title must fit
+/// the terminal they are rendered for, and every right-aligned fix must still land in the
+/// same column as every other one.
+///
+/// The arithmetic, for whoever has to debug this later: a fix that fits is padded by
+/// `width - visible + 3`, so the line ends at EXACTLY `width` columns. That identity is
+/// what "the arrows line up" means, and it is what the `char` count broke — `ready`
+/// believed the CJK row was 16 columns narrower than it was, padded as though it fit, and
+/// drew a 116-column line into a 100-column terminal.
+#[test]
+fn a_wide_title_renders_inside_the_column_budget_and_stays_aligned() {
+    let repo = TestRepo::new();
+    for title in [ASCII_TITLE, CJK_TITLE, EMOJI_TITLE] {
+        repo.ks(["new", title]).ok();
+    }
+
+    let out = repo.ks_env(["ready"], &[("COLUMNS", "100")]).ok();
+    for title in [ASCII_TITLE, CJK_TITLE, EMOJI_TITLE] {
+        assert!(
+            out.stdout.contains(title),
+            "`ready` never rendered {title:?}:\n{}",
+            out.stdout
+        );
+    }
+
+    let mut aligned = 0usize;
+    for line in out.stdout.lines() {
+        assert!(
+            columns(line) <= 100,
+            "a {}-column line was drawn into a 100-column terminal, so it WRAPPED:\n{line}\n\
+             --- full output ---\n{}",
+            columns(line),
+            out.stdout
+        );
+        // A fix that fits is right-aligned, and every such line therefore ends at the
+        // width — which is the whole reason the arrows form a column.
+        if line.contains('→') && !line.starts_with("    ") {
+            assert_eq!(
+                columns(line),
+                100,
+                "this fix is not in the same column as the others:\n{line}\n--- full output \
+                 ---\n{}",
+                out.stdout
+            );
+            aligned += 1;
+        }
+    }
+    assert_eq!(
+        aligned, 3,
+        "all three titles must render a right-aligned fix, or this proves nothing:\n{}",
+        out.stdout
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (b) invoked_as — the tool speaks the name it was called by
+//
+// 123 fix strings are hardcoded `fix!("kanspec …")`, so a user of the `ks` binary was told
+// to run `kanspec` by every refusal outside the transition layer. `Fix::cmd` now rewrites
+// the COMMAND WORD through `out::spoken`, and that is where the whole subtlety lives: fix
+// strings that contain `kanspec` for another reason — a path under `.kanspec/`, a commit
+// message — must come through untouched, and a naive `replace` corrupts every one of them.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The rewrite rule, stated as a table. The first block is what MUST change; the second is
+/// what must not, and every entry in it is a real fix string in `src/` today.
+#[test]
+fn spoken_rewrites_the_command_word_and_nothing_else() {
+    for (input, want) in [
+        ("kanspec doctor", "ks doctor"),
+        ("kanspec done t-31aa", "ks done t-31aa"),
+        ("kanspec", "ks"),
+        (
+            "kanspec park t-88fe --why \"...\"",
+            "ks park t-88fe --why \"...\"",
+        ),
+        // A command quoted inside prose — both of these ship today.
+        (
+            "compare against `kanspec init --help` defaults",
+            "compare against `ks init --help` defaults",
+        ),
+        (
+            "ask your human to run `kanspec accept D-8c1a`",
+            "ask your human to run `ks accept D-8c1a`",
+        ),
+    ] {
+        assert_eq!(spoken_as(input, "ks"), want, "{input:?} was not rewritten");
+        assert_eq!(
+            spoken_as(input, "kanspec"),
+            input,
+            "{input:?} must be byte-identical for the `kanspec` binary"
+        );
+    }
+
+    // THE HAZARD. Every one of these is a real fix string, and `replace("kanspec", "ks")`
+    // mangles all of them — into `.ks/config.toml`, a commit message nobody wrote, and a
+    // ticket path that does not exist.
+    for untouched in [
+        "git add -A .kanspec && git commit -m \"kanspec: sync\"",
+        "set [ci] provider = \"none\" in .kanspec/config.toml",
+        "edit .kanspec/config.toml and raise id_width",
+        "edit .kanspec/specs/auth.md on this branch",
+        "open /w/.kanspec/tickets/t-31aa.md and add a `---` frontmatter block",
+        "git mv .kanspec/tickets/t-31aa.md .kanspec/tickets/t-9c41.md",
+        "unset KANSPEC_NOW",
+        "set [hooks] landcheck = false in .kanspec/config.toml",
+        // The word as prose, and the word as the prefix of a longer one.
+        "kanspec: sync",
+        "kanspecish",
+        "run kanspec-legacy instead",
+    ] {
+        assert_eq!(
+            spoken_as(untouched, "ks"),
+            untouched,
+            "the rewrite CORRUPTED a fix string that says `kanspec` for another reason"
+        );
+    }
+
+    // Mixed: the command word changes, the path in the same string does not.
+    assert_eq!(
+        spoken_as("kanspec doctor --fix .kanspec/tickets/t-31aa.md", "ks"),
+        "ks doctor --fix .kanspec/tickets/t-31aa.md"
+    );
+}
+
+/// `CARGO_BIN_EXE_<name>` is set for every `[[bin]]`. The shared harness knows only the
+/// `kanspec` one, and the OTHER one is the entire point of this test.
+fn bin(name: &str) -> &'static str {
+    match name {
+        "kanspec" => env!("CARGO_BIN_EXE_kanspec"),
+        "ks" => env!("CARGO_BIN_EXE_ks"),
+        other => panic!("no such bin: {other}"),
+    }
+}
+
+/// `TestRepo::ks_in_env`'s determinism pins, applied to whichever binary is named.
+fn run_bin(name: &str, cwd: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new(bin(name))
+        .current_dir(cwd)
+        .args(args)
+        .env("KANSPEC_NOW", common::NOW)
+        .env("KANSPEC_ACTOR", common::ACTOR)
+        .env("KANSPEC_ACTOR_KIND", "human")
+        .env("KANSPEC_ID_SEED", common::ID_SEED)
+        .env("NO_COLOR", "1")
+        .env_remove("CLAUDE_SESSION_ID")
+        .env_remove("CURSOR_SESSION_ID")
+        .env_remove("CODEX_SESSION_ID")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("the binary must be runnable");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The `  → <command>` lines a human refusal writes to stderr.
+fn fix_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("→ "))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn a_refusal_names_the_binary_the_user_actually_typed() {
+    let repo = TestRepo::new();
+
+    // The same refusal under both bins: every fix names the binary that refused, and the
+    // human and `--json` surfaces agree on it — they are one string, because `Fix` is
+    // `#[serde(transparent)]` and the rewrite happens once, at construction.
+    for (name, other) in [("kanspec", "ks"), ("ks", "kanspec")] {
+        let (code, _, stderr) = run_bin(name, &repo.root, &["show", "t-0000"]);
+        assert_eq!(code, 1, "`{name} show t-0000` must refuse:\n{stderr}");
+        let fixes = fix_lines(&stderr);
+        assert!(!fixes.is_empty(), "no fix at all:\n{stderr}");
+        for f in &fixes {
+            assert!(
+                f.starts_with(&format!("{name} ")),
+                "`{name}` told the user to run `{f}` — it must speak its own name:\n{stderr}"
+            );
+            assert!(
+                !f.starts_with(&format!("{other} ")),
+                "`{name}` told the user to run the OTHER binary: {f:?}"
+            );
+        }
+
+        let (_, stdout, _) = run_bin(name, &repo.root, &["show", "t-0000", "--json"]);
+        let v: Value = serde_json::from_str(&stdout).expect("a JSON refusal envelope");
+        let json: Vec<String> = v["error"]["fix"]
+            .as_array()
+            .expect("error.fix is an array")
+            .iter()
+            .map(|f| f.as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            json, fixes,
+            "the human and `--json` refusals named different commands"
+        );
+    }
+
+    // THE GUARD, end to end. `store::read_entity` raises ONE refusal carrying both halves:
+    // a `.kanspec/` path that must survive verbatim, and a `kanspec doctor` command that
+    // must not. A naive `replace` turns the path into `.ks/tickets/…` — a file that does
+    // not exist, inside advice whose entire promise is that it RUNS.
+    repo.write(".kanspec/tickets/t-9999.md", "no frontmatter at all\n");
+    let (code, _, stderr) = run_bin("ks", &repo.root, &["ls"]);
+    assert_eq!(
+        code, 1,
+        "a ticket without frontmatter must refuse:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(".kanspec/tickets/t-9999.md"),
+        "the `.kanspec/` PATH was corrupted by the rename:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(".ks/tickets"),
+        "a naive replace rewrote a path into one that does not exist:\n{stderr}"
+    );
+    let fixes = fix_lines(&stderr);
+    assert!(
+        fixes.iter().any(|f| f == "ks doctor"),
+        "the COMMAND half of the same refusal still says `kanspec`: {fixes:?}"
+    );
+    assert!(
+        fixes
+            .iter()
+            .any(|f| f.contains(".kanspec/tickets/t-9999.md")),
+        "the PATH half of the same refusal was rewritten: {fixes:?}"
     );
 }

@@ -14,6 +14,7 @@ use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
+use unicode_width::UnicodeWidthStr;
 
 use crate::cli::ColorChoice;
 use crate::ctx::OutMode;
@@ -188,7 +189,10 @@ impl Line {
         match tail {
             None => writeln!(w, "{left}"),
             Some(t) => {
-                let visible = visible_len(&left) + 3 + t.chars().count();
+                // BOTH halves measure in columns. `t.chars().count()` was the same D-50
+                // undercount as the old `visible_len`, and it is reachable through a wide
+                // ticket TITLE quoted into a `--why` fix, not only through `left`.
+                let visible = visible_len(&left) + 3 + visible_len(&t);
                 if visible <= st.width {
                     let pad = st.width - visible + 3;
                     writeln!(w, "{left}{:pad$}{}", "", paint(&t, Color::Cyan, st.color))
@@ -223,22 +227,109 @@ pub fn pad_visible(s: &str, width: usize) -> String {
     out
 }
 
-/// ANSI escapes do not occupy columns; count what the terminal actually shows.
+/// ANSI escapes occupy no columns, and a wide glyph occupies two: count what the terminal
+/// actually DRAWS.
+///
+/// THE ONE measurement in this file. [`pad_visible`] and [`Line::write`]'s right-aligned
+/// tail both budget through it, so this one function governs every column in the product.
+///
+/// It used to count `char`s (ARCHITECTURE D-50), which is right only for ASCII:
+///
+/// ```text
+/// chars=100  columns=100   plain ascii title
+/// chars=100  columns=102   emoji title
+/// chars=100  columns=117   CJK title
+/// ```
+///
+/// A CJK title therefore measured seventeen columns short, the tail was right-aligned into
+/// space the terminal did not have, and the line wrapped — destroying the alignment this
+/// whole file exists to produce. `unicode-width` is the East Asian Width table (UAX #11)
+/// plus the emoji rules, and it is measured over the RUN rather than per `char` so that a
+/// ZWJ emoji sequence and a combining mark count once. It is already in the tree —
+/// `comfy-table`, which measures the board's columns, depends on it — so the two width
+/// models in the crate now agree by construction rather than by luck.
+///
+/// Still SGR-only, deliberately: an escape ends at the first `m`, which is right for every
+/// escape kanspec emits and wrong for the OSC-8 hyperlinks it does not.
 pub fn visible_len(s: &str) -> usize {
-    let mut n = 0usize;
+    let mut cols = 0usize;
+    // The byte where the current *visible* run starts. While `in_esc`, it is stale and
+    // deliberately unread: the escape's own end reassigns it.
+    let mut run = 0usize;
     let mut in_esc = false;
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         if in_esc {
             if c == 'm' {
                 in_esc = false;
+                run = i + c.len_utf8();
             }
         } else if c == '\u{1b}' {
+            cols += s[run..i].width();
             in_esc = true;
-        } else {
-            n += 1;
         }
     }
-    n
+    if !in_esc {
+        cols += s[run..].width();
+    }
+    cols
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speaking the name the user typed
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rewrite the command word of a next-command string to the binary the user actually
+/// typed — `ks` for `src/bin/ks.rs`, `kanspec` for `src/bin/kanspec.rs`.
+///
+/// [`Fix::cmd`](crate::error::Fix::cmd) calls this, which is what lets all ~123 hardcoded
+/// `fix!("kanspec …")` call sites keep saying `kanspec` in the source and still tell a `ks`
+/// user to run `ks`. Doing it at construction rather than per surface also means the human
+/// rendering and the `#[serde(transparent)]` `--json` fix list cannot disagree about what
+/// to run.
+///
+/// **A naive `replace("kanspec", ks)` CORRUPTS real fix strings**, which is the whole
+/// design constraint. All three of these ship today:
+///
+/// ```text
+/// git add -A .kanspec && git commit -m "kanspec: sync"    # a commit MESSAGE
+/// open /w/.kanspec/tickets/t-31aa.md and add a `---` …    # a PATH
+/// unset KANSPEC_NOW                                       # an env var
+/// ```
+///
+/// So the rewrite fires only where `kanspec` stands in COMMAND POSITION: at the very start
+/// of the string, or immediately after a backtick (the fixes that quote a command inside
+/// prose), and only where the word ends there — end of string, a space, or the closing
+/// backtick. `.kanspec/` is preceded by `.`, `"kanspec: sync"` is preceded by `"` and
+/// followed by `:`, and `KANSPEC_NOW` is not even the same bytes; none of the three can
+/// match, whatever else is in the string.
+pub fn spoken(cmd: &str) -> String {
+    spoken_as(cmd, crate::cli::invoked_as())
+}
+
+/// [`spoken`] against an explicit binary name. Split out for the same reason
+/// `Verb::command_as` is (ARCHITECTURE D-43): it is the seam tests pin both spellings
+/// through without racing a set-once `OnceLock`.
+pub fn spoken_as(cmd: &str, ks: &str) -> String {
+    const NAME: &str = "kanspec";
+    if ks == NAME {
+        return cmd.to_string();
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let mut at = 0usize;
+    while let Some(i) = cmd[at..].find(NAME) {
+        let start = at + i;
+        let end = start + NAME.len();
+        // Command position OPENS here: the string starts, or a backtick quoted a command.
+        // Never after the `.` of `.kanspec/`, nor the `"` of a commit message.
+        let opens = start == 0 || cmd[..start].ends_with('`');
+        // …and the word ENDS here: `kanspec: sync` and `kanspec_thing` are not commands.
+        let closes = matches!(cmd[end..].chars().next(), None | Some(' ') | Some('`'));
+        out.push_str(&cmd[at..start]);
+        out.push_str(if opens && closes { ks } else { NAME });
+        at = end;
+    }
+    out.push_str(&cmd[at..]);
+    out
 }
 
 /// comfy-table preset wrapper — one table style for the whole product.
@@ -410,6 +501,57 @@ mod tests {
         assert_eq!(paint("x", Color::Red, false), "x");
         assert!(paint("x", Color::Red, true).len() > 1);
         assert_eq!(visible_len(&paint("abc", Color::Red, true)), 3);
+    }
+
+    /// ROUND-E REGRESSION (ARCHITECTURE D-50), the half `tests/render_color.rs` reaches
+    /// only through `left`: the TAIL was measured with `t.chars().count()`, which is the
+    /// same undercount, and a wide glyph gets into the tail whenever a fix quotes a ticket
+    /// title back at you (`kanspec park <id> --why "…"`).
+    ///
+    /// Both budgets are now columns, so the identity that makes the arrows form a column
+    /// holds for a wide line too: a fix that fits is padded until the line ends at EXACTLY
+    /// `st.width`, and a fix that does not fit takes its own continuation line rather than
+    /// wrapping.
+    #[test]
+    fn a_wide_glyph_is_budgeted_in_columns_on_both_sides_of_the_line() {
+        let st = Style::plain(); // width 100
+        let render = |line: &Line| {
+            let mut buf: Vec<u8> = Vec::new();
+            line.write(&mut buf, &st).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        // WIDE TAIL. 16 CJK characters are 32 columns, not 16.
+        let cjk = "認証トークンの有効期限を延長する";
+        assert_eq!(cjk.chars().count(), 16);
+        assert_eq!(visible_len(cjk), 32);
+        let out = render(
+            &Line::state(crate::transitions::State::Doing, "stalled")
+                .id("t-88fe")
+                .fix(format!("kanspec park t-88fe --why \"{cjk}\"")),
+        );
+        let drawn = visible_len(out.trim_end_matches('\n'));
+        assert_eq!(drawn, st.width, "a fitting line ends at the width: {out:?}");
+
+        // WIDE TEXT that fits on its own but leaves no room for the fix: the fix takes its
+        // own continuation line instead of being right-aligned into columns that are not
+        // there. 34 chars, 68 columns.
+        let long = format!("{cjk}{cjk}認証");
+        assert_eq!((long.chars().count(), visible_len(&long)), (34, 68));
+        let out = render(
+            &Line::state(crate::transitions::State::Todo, &long)
+                .id("t-0001")
+                .fix("kanspec start t-0001"),
+        );
+        let (first, rest) = out.trim_end_matches('\n').split_once('\n').expect("a wrap");
+        assert_eq!(visible_len(first), 12 + 68, "{first:?}");
+        assert_eq!(rest, "    → kanspec start t-0001");
+        // THE BUG: the `char` count made that 12 + 34 + 3 + 20 = 69, which "fits", so the
+        // fix was right-aligned — and the line the terminal actually drew was 134 columns.
+        assert!(
+            12 + long.chars().count() + 3 + 20 <= st.width,
+            "the old budget thought this fit"
+        );
     }
 
     /// ROUND-D REGRESSION, ranked #1 by the adversarial audit: it hit 100% of human
