@@ -1185,13 +1185,25 @@ mod tests {
         put(&mut s, t);
         assert!(found(run_all(&s), "unproven_close").is_empty());
 
-        // 3. the durable `--no-code` waiver — prose under `## Log`, signed and dated
+        // 3. the durable `--no-code` waiver — prose under `## Log`, signed and dated.
+        // No `ship` in the trail: the gate refuses `--no-code` on work shipped for review,
+        // so this is the only shape a waiver the gate actually granted can have.
         let mut s = snap();
         let mut t = forged_close("t-0003");
+        t.log.retain(|e| e.verb != Verb::Ship);
         t.body = "Body.\n\n## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n"
             .to_string();
         put(&mut s, t);
         assert!(found(run_all(&s), "unproven_close").is_empty());
+
+        // 3b. …and the same waiver line pasted onto a trail that WAS shipped corroborates
+        // nothing: the gate would have refused that pair, so the log contradicts itself.
+        let mut s = snap();
+        let mut t = forged_close("t-0013");
+        t.body = "Body.\n\n## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n"
+            .to_string();
+        put(&mut s, t);
+        assert_eq!(found(run_all(&s), "unproven_close").len(), 1);
 
         // 4. a ladder run that actually put it in main — the cache, computed from git
         let mut s = snap();

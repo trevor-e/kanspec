@@ -290,13 +290,30 @@ pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
         _ => None,
     });
     if let Some(sha) = sha {
-        return Some(CloseEvidence::Proof(sha.to_string()));
+        // A note is plain text in the log the forger is already editing, so it corroborates
+        // only until git contradicts it. A DEFINITIVE not-merged verdict does exactly that:
+        // the ladder was asked and answered no, while the note claims the work is in main.
+        // `Unknown` deliberately does NOT disqualify — a genuinely old close whose branch
+        // was deleted and gc'd reads unknown forever, and flagging it would punish the
+        // legitimate case to catch nothing the next rung does not already catch.
+        let contradicted =
+            merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::NotMerged);
+        if !contradicted {
+            return Some(CloseEvidence::Proof(sha.to_string()));
+        }
     }
     if t.body
         .lines()
         .any(|l| l.trim_start().starts_with(NO_CODE_WAIVER))
     {
-        return Some(CloseEvidence::NoCode);
+        // The gate refuses `--no-code` on a ticket that was shipped for review, so a trail
+        // carrying a Ship verb alongside a waiver is self-contradictory: that pair is one
+        // the gate would never have granted. Mirroring the gate's own rule here is what
+        // makes the waiver cost more than one appended line to forge.
+        let shipped = t.log.iter().any(|e| e.verb == Verb::Ship);
+        if !shipped {
+            return Some(CloseEvidence::NoCode);
+        }
     }
     if !names_a_rev(t) {
         return Some(CloseEvidence::NothingToLand);
@@ -1275,6 +1292,32 @@ mod tests {
         }
     }
 
+    /// The ladder was asked and answered no — the one verdict that outranks a note.
+    fn not_merged() -> MergeFact {
+        MergeFact {
+            status: MergeStatus::NotMerged,
+            sha: None,
+            method: Method::Ancestry,
+            pr: None,
+            why: None,
+            checked_at: ago(1),
+            changed: Vec::new(),
+        }
+    }
+
+    /// The ladder looked and could not tell — must never disqualify a note.
+    fn unknown_fact() -> MergeFact {
+        MergeFact {
+            status: MergeStatus::Unknown,
+            sha: None,
+            method: Method::PatchId,
+            pr: None,
+            why: Some("unknown (squash suspected, no gh)".into()),
+            checked_at: ago(1),
+            changed: Vec::new(),
+        }
+    }
+
     // ── the dependency graph ─────────────────────────────────────────────────
 
     #[test]
@@ -1591,15 +1634,46 @@ mod tests {
             Some(CloseEvidence::InMain)
         );
 
-        // the recorded `--no-code` waiver — prose under `## Log`, which `replay` skips
+        // The recorded `--no-code` waiver — prose under `## Log`, which `replay` skips.
+        // The trail carries NO Ship: the gate refuses `--no-code` on a ticket shipped for
+        // review, so this is the only shape a real waiver can have.
         let mut s = snap();
         let mut t = closed("t-0003");
+        t.log.retain(|e| e.verb != Verb::Ship);
         t.log.last_mut().unwrap().note = Some("no-code: docs only".into());
         t.body = "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
         put(&mut s, t);
         assert_eq!(
             close_evidence(&s, &s.tickets[&tid("t-0003")]),
             Some(CloseEvidence::NoCode)
+        );
+
+        // EVASION 1 — the same waiver line appended to a trail that WAS shipped. The gate
+        // would have refused that pair, so the log contradicts itself and corroborates
+        // nothing. Without this, forging a close costs one copied line of prose.
+        let mut s = snap();
+        let mut t = closed("t-0009");
+        t.log.last_mut().unwrap().note = None;
+        t.body = "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
+        put(&mut s, t);
+        assert_eq!(close_evidence(&s, &s.tickets[&tid("t-0009")]), None);
+
+        // EVASION 2 — the gate's note grammar copied from a real closed ticket, while the
+        // ladder has already been asked about THIS ticket and answered no. Git outranks a
+        // line of text in the file being forged.
+        let mut s = snap();
+        put(&mut s, closed("t-0010"));
+        s.git.tickets.insert(tid("t-0010"), not_merged());
+        assert_eq!(close_evidence(&s, &s.tickets[&tid("t-0010")]), None);
+
+        // …but an `unknown` verdict must NOT disqualify: an old close whose branch was
+        // deleted and gc'd reads unknown forever, and flagging it punishes the honest case.
+        let mut s = snap();
+        put(&mut s, closed("t-0011"));
+        s.git.tickets.insert(tid("t-0011"), unknown_fact());
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0011")]),
+            Some(CloseEvidence::Proof("a1b9c3d".into()))
         );
 
         // an attestation (D-12) answers first, so `doctor` says it in exactly one voice
