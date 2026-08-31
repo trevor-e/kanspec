@@ -7,31 +7,101 @@
 //! the impls that would break it — it *will* be tempting the first time someone wants a
 //! fast `status`.
 //!
+//! # What the ladder is allowed to say
+//!
+//! Every rung answers **merged / not-merged / inconclusive**, and only a rung that can
+//! *prove absence* may say no. Ancestry-negative is inconclusive, because a squash-merged
+//! branch is genuinely not an ancestor of main. That asymmetry is invariant 2, and it is
+//! why `unknown` is a first-class verdict carrying its reason rather than an error path: a
+//! confident wrong answer is the worst thing this file can produce, and an honest
+//! `unknown (squash suspected, no gh)` is a success.
+//!
+//! # The two storage tiers, and why they differ
+//!
+//! The ladder's result goes to `cache/gitstate.json` as a plain [`crate::cache::MergeFact`]
+//! — **badge-grade**, forgeable by a text editor, and disposable. The `done` gate never
+//! reads it: [`proof_for_done`] re-runs the ladder and mints a fresh, sealed
+//! [`MergedProof`] — **proof-grade**. That split is J-8, and [`Detection::to_fact`] is
+//! deliberately one-way.
+//!
+//! The one human input is [`plan_confirm`], and it is stored in the third place: the
+//! **ticket's own `## Log`** (D-11). An attestation is an asserted act with an actor, so it
+//! must survive `rm -rf cache/` and be visibly signed. Every subsequent [`scan_all`] reads
+//! it back out of the log and projects it into the cache, which is what makes the override
+//! outlive a cache wipe instead of needing to be repeated.
+//!
 //! Owner: **S3**.
-
-// Wave-0 skeleton. The bodies below are `todo!("S3: …")`; these two allows exist ONLY so
-// the skeleton compiles clippy-clean and MUST be deleted by S3 when the bodies land.
-#![allow(unused_variables, dead_code)]
 
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cache::{GitState, MergeFact};
+use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor, GITSTATE_VERSION};
 use crate::ctx::{Actor, Ctx};
-use crate::error::Result;
-use crate::gh::Gh;
-use crate::git::{Git, Method, RungTrace, Sha, Unknown};
+use crate::error::{GateDetail, KsError, Result};
+use crate::gh::{merged_pr, Gh, GhUnavailable};
+use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
 use crate::ids::TicketId;
-use crate::model::{Snapshot, Ticket};
-use crate::plan::Plan;
+use crate::logentry::LOG_HEADING;
+use crate::model::{Snapshot, Spec, Ticket};
+use crate::plan::{EntityRef, Op, Plan};
+use crate::transitions::Verb;
+use crate::{fix, fixes};
+
+/// Past this, a verdict reached by *elimination* is stamped with the fetch age instead:
+/// "nothing on main mentions you" is only as true as the last fetch. Mirrors the default
+/// of `[windows] fetch_max_age_secs`; the ladder takes no config, so the constant lives
+/// beside the rung that reads it.
+const FETCH_MAX_SECS: u64 = 300;
+
+/// The `## Log` note `scan --confirm` writes and [`confirmed_proof`] reads back. It is a
+/// stable prefix rather than free prose, because this line **is** the attestation's
+/// storage — the cache is not.
+const CONFIRM_NOTE: &str = "in main";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The seals
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Same-module privacy — no `pub(in …)`, which does not compile in a flat layout (E0742).
+///
+/// The seal is four absences, each of which `tests/proof_is_sealed.rs` greps for and each
+/// of which is demonstrated here as a compile-fail doctest. First, the honest half of the
+/// split — the *cache* DTO really is deserializable, which is what makes these tests
+/// meaningful rather than a compiler that simply cannot see `serde`:
+///
+/// ```
+/// fn de<T: serde::de::DeserializeOwned>() {}
+/// fn dflt<T: Default>() {}
+/// de::<kanspec::cache::MergeFact>();     // badge-grade: a text editor can write one
+/// dflt::<kanspec::cache::GitState>();
+/// ```
+///
+/// …and now the proof-grade value, which none of that is true of:
+///
+/// ```compile_fail
+/// fn de<T: serde::de::DeserializeOwned>() {}
+/// de::<kanspec::scan::MergedProof>();    // E0277: no `Deserialize` — a cache cannot mint one
+/// ```
+///
+/// ```compile_fail
+/// fn dflt<T: Default>() {}
+/// dflt::<kanspec::scan::MergedProof>();  // E0277: no `Default` — there is no empty proof
+/// ```
+///
+/// The last one needs its own control, since a typo'd path would "pass" a compile-fail
+/// test on its own. Reading the SHA through the accessor compiles; reaching for the field
+/// does not:
+///
+/// ```
+/// fn read(p: &kanspec::scan::MergedProof) -> &kanspec::git::Sha { p.sha() }
+/// ```
+///
+/// ```compile_fail
+/// // E0616: private field, and no public constructor anywhere in the crate.
+/// fn forge(p: &kanspec::scan::MergedProof) -> &kanspec::git::Sha { &p.sha }
+/// ```
 #[derive(Clone, Debug, Serialize)]
 pub struct MergedProof {
     ticket: TicketId,
@@ -42,6 +112,21 @@ pub struct MergedProof {
 }
 
 impl MergedProof {
+    /// One of the TWO mints in the crate (the other is [`confirmed_proof`]), and it takes a
+    /// [`Detection`] — a value only [`ladder`] can build.
+    fn from_detection(ticket: &TicketId, d: &Detection) -> Option<MergedProof> {
+        match &d.verdict {
+            Verdict::Landed { sha, method, pr } => Some(MergedProof {
+                ticket: ticket.clone(),
+                sha: sha.clone(),
+                method: *method,
+                pr: *pr,
+                checked_at: d.checked_at,
+            }),
+            _ => None,
+        }
+    }
+
     pub fn ticket(&self) -> &TicketId {
         &self.ticket
     }
@@ -82,6 +167,13 @@ pub struct NoCodeWaiver {
 impl NoCodeWaiver {
     /// Refuses an empty `why`: an unexplained escape is the one thing this type exists to
     /// prevent.
+    ///
+    /// The durable record is a **prose line under the ticket's `## Log`** — deliberately
+    /// not shaped like a [`crate::logentry::LogEntry`], so `transitions::replay` skips it
+    /// (a second parseable entry for one act would break the very proof the log exists
+    /// for) while a human reading the file, or `git log -p`, sees the waiver and its
+    /// author. The `done` transition's own note carries the same `why`; this line is what
+    /// survives independently of the planner that wrote it.
     pub fn record(
         plan: &mut Plan,
         id: &TicketId,
@@ -89,7 +181,31 @@ impl NoCodeWaiver {
         by: &Actor,
         at: DateTime<Utc>,
     ) -> Result<NoCodeWaiver> {
-        todo!("S3: refuse an empty why; push the durable Op recording it; return the waiver")
+        let why = why.trim();
+        if why.is_empty() {
+            return Err(KsError::gate(
+                "no_code_without_why",
+                format!("`{id}` cannot close as no-code without a recorded reason"),
+                fixes![
+                    fix!("kanspec done {id} --no-code --why \"docs only\""),
+                    fix!("kanspec scan --explain {id}"),
+                ],
+            ));
+        }
+        let by = by.label();
+        plan.push(Op::AppendSection {
+            entity: EntityRef::Ticket(id.clone()),
+            heading: LOG_HEADING,
+            line: format!(
+                "  no-code waiver by {by} at {}: {why}",
+                at.format("%Y-%m-%dT%H:%MZ")
+            ),
+        });
+        Ok(NoCodeWaiver {
+            why: why.to_string(),
+            by,
+            at,
+        })
     }
     pub fn why(&self) -> &str {
         &self.why
@@ -183,7 +299,38 @@ impl Detection {
     /// Down-converts the sealed, in-process value to the plain cache DTO. The cache is
     /// badge-grade; the gate is proof-grade. **There is deliberately no inverse.**
     pub fn to_fact(&self, changed: Vec<String>) -> MergeFact {
-        todo!("S3: Verdict -> MergeStatus + sha/method/pr/why, stamped with checked_at")
+        match &self.verdict {
+            Verdict::Landed { sha, method, pr } => MergeFact {
+                status: MergeStatus::Merged,
+                sha: Some(sha.as_str().to_string()),
+                method: *method,
+                pr: *pr,
+                why: None,
+                checked_at: self.checked_at,
+                changed,
+            },
+            Verdict::NotLanded => MergeFact {
+                status: MergeStatus::NotMerged,
+                sha: None,
+                // No method concluded, so none is claimed. The rung table lives in
+                // `Detection`, which is where `--explain` reads it from.
+                method: Method::None,
+                pr: None,
+                why: None,
+                checked_at: self.checked_at,
+                changed,
+            },
+            Verdict::Unknown(u) => MergeFact {
+                status: MergeStatus::Unknown,
+                sha: None,
+                method: Method::None,
+                // The badge explains itself without re-running anything.
+                why: Some(u.badge()),
+                pr: None,
+                checked_at: self.checked_at,
+                changed,
+            },
+        }
     }
 }
 
@@ -191,10 +338,64 @@ impl Detection {
 // The ladder
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
+/// [`ladder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadOrigin {
+    /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
+    /// is proof the branch carried commits of its own.
+    Recorded,
+    /// The branch tip, resolved live. Says nothing about whether the branch ever carried a
+    /// commit.
+    BranchTip,
+}
+
+/// `<head:>` if recorded, else the branch tip — DESIGN.md's "head-or-tip". Both are
+/// resolved *through git*, because [`Sha`] has no public constructor: a SHA in this crate
+/// is provably something git printed, never something an agent typed.
+fn head_of(git: &Git, t: &Ticket) -> std::result::Result<(Sha, HeadOrigin), Unknown> {
+    let recorded =
+        t.fm.head
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null");
+    if let Some(h) = recorded {
+        return match git.head_sha(h) {
+            Ok(hs) => Ok((hs.sha().clone(), HeadOrigin::Recorded)),
+            // gc'd after reflog expiry (D-8), or a rewritten history. Never "not merged".
+            Err(_) => Err(Unknown::HeadNotInObjectStore { sha: h.to_string() }),
+        };
+    }
+    let branch =
+        t.fm.branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+    let Some(b) = branch else {
+        return Err(Unknown::NoHead);
+    };
+    match git.head_sha(b) {
+        Ok(hs) => Ok((hs.sha().clone(), HeadOrigin::BranchTip)),
+        // The branch was deleted after the merge and no `head:` was ever recorded, so
+        // there is nothing left to ask git about.
+        Err(_) => Err(Unknown::HeadNotInObjectStore { sha: b.to_string() }),
+    }
+}
+
+fn trace(method: Method, cmd: &str, exit: i32, saw: &str, verdict: &'static str) -> RungTrace {
+    RungTrace {
+        method,
+        cmd: cmd.to_string(),
+        exit,
+        saw: saw.to_string(),
+        verdict,
+    }
+}
+
 /// THE LADDER, in the recon-corrected order. Every rung returns a verdict; **exit 128
 /// anywhere is Unknown, never No.**
 ///
-/// - **guard 0** `rev-parse --verify --quiet '<head>^{commit}'` -> `HeadNotInObjectStore`
+/// - **guard 0** `rev-parse --verify '<head>^{commit}'` -> `NoHead` / `HeadNotInObjectStore`
 /// - **guard 0b** `rev-list --count <main>..<head> == 0` -> `ZeroCommitBranch`
 ///   (a fresh `start` branch is trivially an ancestor of main — a VERIFIED false MERGED
 ///   for work that never happened)
@@ -208,6 +409,22 @@ impl Detection {
 ///   (D-3). Merged iff output non-empty AND every line is `-`; any `+` ->
 ///   `SquashSuspectedNoGh`
 /// - **5** otherwise Unknown, with every `RungTrace` attached
+///
+/// # Guard 0b's position (a deviation from §7's literal ordering, reported)
+///
+/// §7 runs guard 0b before rung 1, and `tests/common/merges.rs` records why that cannot
+/// stand: after a true merge the branch tip **is** reachable from main, so
+/// `rev-list --count main..head` is `0` for a real merge exactly as it is for a branch that
+/// never committed. Run first, the guard answers `unknown` for the one shape ancestry can
+/// prove; run after a *negative* ancestry (merges.rs's other suggestion) it can never fire
+/// at all, since `count == 0` implies ancestry.
+///
+/// The two cases are not distinguishable by reachability — once merged, your commits are on
+/// main either way — so the guard keys off **provenance** instead: it fires only when the
+/// SHA came from a live branch tip with no recorded `head:`. `head:` is written by `ship`
+/// out of real git output, so its presence means the branch demonstrably carried work; its
+/// absence plus a zero-commit branch is precisely the fresh-`start` false MERGED the guard
+/// was added (D-4) to prevent.
 pub fn ladder(
     git: &Git,
     gh: &Gh,
@@ -216,13 +433,282 @@ pub fn ladder(
     fetch_age: Option<Duration>,
     now: DateTime<Utc>,
 ) -> Detection {
-    todo!("S3: the six rungs above, each pushing a RungTrace, sealed by Detection::seal")
+    let mut tr: Vec<RungTrace> = Vec::new();
+    let age = fetch_age.map(|d| d.as_secs());
+    macro_rules! done {
+        ($v:expr) => {
+            return Detection::seal($v, now, age, tr)
+        };
+    }
+
+    // ── guard 0: is there anything to ask about? ─────────────────────────────
+    let (head, origin) = match head_of(git, t) {
+        Ok(h) => h,
+        Err(u) => {
+            let saw = u.badge();
+            tr.push(trace(
+                Method::None,
+                "git rev-parse --verify <head-or-tip>^{commit}",
+                1,
+                &saw,
+                "unknown",
+            ));
+            done!(Verdict::Unknown(u))
+        }
+    };
+
+    // ── guard 0b: a branch that never carried a commit is not "merged" ───────
+    if origin == HeadOrigin::BranchTip {
+        let cmd = format!("git rev-list --count {main}..{}", head.short());
+        match git.commits_ahead(main, &head) {
+            Tri::Yes(0) => {
+                tr.push(trace(Method::None, &cmd, 0, "0", "unknown"));
+                done!(Verdict::Unknown(Unknown::ZeroCommitBranch))
+            }
+            Tri::Unknown(u) => {
+                let saw = u.badge();
+                tr.push(trace(Method::None, &cmd, 128, &saw, "unknown"));
+                done!(Verdict::Unknown(u))
+            }
+            _ => {}
+        }
+    }
+
+    // ── rung 1: ANCESTRY — exact for true merges and fast-forwards ───────────
+    let cmd = format!("git merge-base --is-ancestor {} {main}", head.short());
+    match git.is_ancestor(&head, main) {
+        Tri::Yes(()) => {
+            tr.push(trace(Method::Ancestry, &cmd, 0, "ancestor", "merged"));
+            done!(Verdict::Landed {
+                sha: head,
+                method: Method::Ancestry,
+                pr: t.fm.pr,
+            })
+        }
+        Tri::Unknown(u) => {
+            let saw = u.badge();
+            tr.push(trace(Method::Ancestry, &cmd, 128, &saw, "unknown"));
+            done!(Verdict::Unknown(u))
+        }
+        // Ancestry-NEGATIVE is inconclusive, not NotMerged — a squash-merged branch is
+        // genuinely not an ancestor. Only rungs that can PROVE absence say No.
+        Tri::No => tr.push(trace(
+            Method::Ancestry,
+            &cmd,
+            1,
+            "not an ancestor",
+            "inconclusive",
+        )),
+    }
+
+    // ── rung 2: GH — the ONLY rung that sees a title-only squash ─────────────
+    if gh.available() {
+        let (cmd, prs) = match t.fm.pr {
+            Some(n) => (format!("gh pr view {n}"), gh.pr_view(n).map(|p| vec![p])),
+            None => match t.fm.branch.as_deref() {
+                Some(b) => (
+                    format!("gh pr list --head {b} --state all"),
+                    gh.pr_for_head(b),
+                ),
+                None => ("gh pr".to_string(), Ok(Vec::new())),
+            },
+        };
+        match prs {
+            // Absent gh, unauthenticated gh, a network failure, a missing fixture: every
+            // one of them is inconclusive with a reason. None of them is a negative.
+            Err(GhUnavailable(why)) => tr.push(trace(Method::GhPr, &cmd, 1, &why, "inconclusive")),
+            Ok(list) => match merged_pr(&list) {
+                None => tr.push(trace(
+                    Method::GhPr,
+                    &cmd,
+                    0,
+                    &format!("{} pr(s), none merged", list.len()),
+                    "inconclusive",
+                )),
+                Some(pr) => match pr.merge_commit.as_deref() {
+                    // GitHub says MERGED and cannot say what landed. Not a SHA we can
+                    // re-verify, so not an answer.
+                    None => tr.push(trace(
+                        Method::GhPr,
+                        &cmd,
+                        0,
+                        &format!("#{} MERGED, no merge commit", pr.number),
+                        "inconclusive",
+                    )),
+                    Some(oid) => {
+                        // Re-verify gh's CLAIM as a local git FACT, and get a real SHA.
+                        // `head_sha` is the only public way to turn a string into a
+                        // `Sha`, and it earns its keep here: it fails when the merge
+                        // commit is not in our object store at all.
+                        let local = git.head_sha(oid).ok().map(|h| h.sha().clone());
+                        let ancestor =
+                            local.filter(|s| matches!(git.is_ancestor(s, main), Tri::Yes(())));
+                        match ancestor {
+                            Some(sha) => {
+                                tr.push(trace(
+                                    Method::GhPr,
+                                    &format!("{cmd} + is-ancestor {}", sha.short()),
+                                    0,
+                                    &format!("#{} MERGED", pr.number),
+                                    "merged",
+                                ));
+                                done!(Verdict::Landed {
+                                    sha,
+                                    method: Method::GhPr,
+                                    pr: Some(pr.number),
+                                })
+                            }
+                            // A stale fetch or a different base branch. gh's word alone is
+                            // not a confident answer about THIS main.
+                            None => {
+                                tr.push(trace(
+                                    Method::GhPr,
+                                    &format!("{cmd} + is-ancestor {oid}"),
+                                    1,
+                                    "merge commit is not on main",
+                                    "unknown",
+                                ));
+                                done!(Verdict::Unknown(Unknown::GhMergedButNotAncestor {
+                                    merge_sha: oid.to_string(),
+                                }))
+                            }
+                        }
+                    }
+                },
+            },
+        }
+    } else {
+        tr.push(trace(
+            Method::GhPr,
+            "gh auth status",
+            1,
+            "unavailable",
+            "inconclusive",
+        ));
+    }
+
+    // ── rung 3: TRAILER — unanchored + boundary-terminated ───────────────────
+    let cmd = format!(
+        "git log {main} -E --grep 'Kanspec: {}' --format=%H",
+        t.fm.id.as_str()
+    );
+    match git.grep_trailer(main, &t.fm.id) {
+        Tri::Yes(shas) if !shas.is_empty() => {
+            tr.push(trace(
+                Method::Trailer,
+                &cmd,
+                0,
+                &format!("{} hit(s)", shas.len()),
+                "merged",
+            ));
+            // Blind to reverts, so it is weighted BELOW ancestry — the badge says so.
+            done!(Verdict::Landed {
+                sha: shas[0].clone(),
+                method: Method::Trailer,
+                pr: t.fm.pr,
+            })
+        }
+        Tri::Unknown(u) => {
+            let saw = u.badge();
+            tr.push(trace(Method::Trailer, &cmd, 128, &saw, "unknown"));
+            done!(Verdict::Unknown(u))
+        }
+        _ => tr.push(trace(Method::Trailer, &cmd, 0, "0 hits", "inconclusive")),
+    }
+
+    // ── rung 4: PATCH-ID — rebase/cherry-pick + SINGLE-commit squash only ────
+    // DESIGN.md rung 4 is backwards (D-3): recon measured a real 2-commit squash as `+2`,
+    // i.e. NOT merged — the exact case the rung was supposed to cover.
+    let cmd = format!("git cherry {main} {}", head.short());
+    match git.cherry(main, &head) {
+        Tri::Yes(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
+            tr.push(trace(
+                Method::PatchId,
+                &cmd,
+                0,
+                &format!("all - ({} patch(es) upstream)", lines.len()),
+                "merged",
+            ));
+            done!(Verdict::Landed {
+                sha: head,
+                method: Method::PatchId,
+                pr: t.fm.pr,
+            })
+        }
+        // We only reach rung 4 with commits main does not have, so an empty `cherry` means
+        // the two questions disagree. Conflicting signals are unknown, by policy.
+        Tri::Yes(lines) if lines.is_empty() => {
+            tr.push(trace(Method::PatchId, &cmd, 0, "no output", "unknown"));
+            done!(Verdict::Unknown(Unknown::ConflictingSignals {
+                rungs: tr.clone()
+            }))
+        }
+        Tri::Yes(lines) => {
+            let plus = lines.iter().filter(|l| !l.upstream).count();
+            tr.push(trace(
+                Method::PatchId,
+                &cmd,
+                0,
+                &format!("+{plus}"),
+                "unknown",
+            ));
+            // A `+` line CANNOT distinguish an unmerged branch from a multi-commit squash,
+            // so it is Unknown — never NotMerged. This is R-4, and it is why
+            // `scan --confirm` exists.
+            done!(Verdict::Unknown(Unknown::SquashSuspectedNoGh {
+                plus_lines: plus
+            }))
+        }
+        Tri::Unknown(u) => {
+            let saw = u.badge();
+            tr.push(trace(Method::PatchId, &cmd, 128, &saw, "unknown"));
+            done!(Verdict::Unknown(u))
+        }
+        Tri::No => {}
+    }
+
+    // Every rung declined without even a suspicion. Stale fetch is the most actionable
+    // reason to name.
+    if let Some(a) = age.filter(|a| *a > FETCH_MAX_SECS) {
+        done!(Verdict::Unknown(Unknown::FetchStale { age_secs: a }))
+    }
+    done!(Verdict::NotLanded)
 }
 
 /// The `done` gate. **RE-RUNS the ladder** rather than trusting the cache — "a 60s-old
 /// merged is not a gate".
+///
+/// The recorded human override ([`confirmed_proof`]) is consulted only *after* the ladder
+/// declines, so a confirmation can never overrule fresh git truth — it can only speak where
+/// git has nothing to say.
 pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
-    todo!("S3: run the ladder; Landed -> MergedProof; else Gate{{NotLanded{{trace}}}} naming scan --explain / --confirm")
+    let main = ctx.git.resolve_main(&ctx.cfg.main)?;
+    let d = ladder(&ctx.git, &ctx.gh, t, &main, ctx.git.fetch_age(), ctx.now);
+    if let Some(p) = MergedProof::from_detection(&t.fm.id, &d) {
+        return Ok(p);
+    }
+    if let Some(p) = confirmed_proof(&ctx.git, t) {
+        return Ok(p);
+    }
+    let id = &t.fm.id;
+    let why = match d.verdict() {
+        Verdict::Unknown(u) => u.badge(),
+        _ => format!("nothing on {main} carries this ticket's work"),
+    };
+    Err(KsError::gate_detail(
+        "not_landed",
+        format!("{id} is not on {main} — {why}"),
+        // The trace IS the refusal: pre-formatting it into the message would throw away
+        // the `--explain`-grade output that makes the gate arguable rather than arbitrary.
+        GateDetail::NotLanded {
+            trace: d.explain().to_vec(),
+        },
+        fixes![
+            fix!("kanspec scan --explain {id}"),
+            fix!("kanspec scan --confirm {id} --why \"...\""),
+            fix!("kanspec done {id} --no-code --why \"...\""),
+        ],
+    ))
 }
 
 pub struct ScanOpts {
@@ -235,8 +721,238 @@ pub struct ScanOpts {
 /// ONLY producer of [`ScanToken`]. Runs **outside** the lock (gh/network); the caller then
 /// opens a short `transact` to persist via `Op::WriteGitState`.
 pub fn scan_all(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<(GitState, ScanToken)> {
-    todo!("S3: optional fetch, ladder per non-terminal ticket, spec anchors, branch facts")
+    let (state, token, _) = scan_all_detailed(ctx, snap, opts)?;
+    Ok((state, token))
 }
+
+/// What a scan pass produces: the cache DTO, the capability to write it, and the sealed
+/// ladder run behind every row it holds.
+pub type ScanOutcome = (GitState, ScanToken, Vec<(TicketId, Detection)>);
+
+/// [`scan_all`] plus the sealed [`Detection`] behind every fact it wrote.
+///
+/// `scan --explain` renders the rung table of the run that produced the verdict — there is
+/// no second ladder run that could disagree with the first — and the cache DTO cannot carry
+/// a trace, so the detections come back beside it rather than being re-derived. Additive:
+/// [`scan_all`] keeps §2.15's signature exactly, which is what `server.rs` calls.
+pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<ScanOutcome> {
+    // Everything that touches the network happens HERE, before the caller takes the lock.
+    if opts.fetch && ctx.cfg.git.fetch {
+        // Best effort by design: offline is not a reason to refuse an answer, it is a
+        // reason to stamp the answer with the fetch age (DESIGN.md, merge detection).
+        let _ = ctx.git.fetch();
+    }
+    let main = ctx.git.resolve_main(&ctx.cfg.main)?;
+    let fetch_age = ctx.git.fetch_age();
+
+    // A TARGETED scan must not discard the facts it did not recompute; a full scan starts
+    // clean so a deleted ticket's fact cannot outlive it. Facts computed against a
+    // different `main` are discarded either way — mixing them would answer "merged into
+    // what?" with two different branches.
+    let mut state = match &opts.only {
+        Some(_) if snap.git.main == main && snap.git.version == GITSTATE_VERSION => {
+            snap.git.clone()
+        }
+        _ => GitState::default(),
+    };
+    state.main = main.clone();
+    // When `scan` last RAN, which is what `GitState::freshness` claims. A targeted scan
+    // moves it too, and that is why every `MergeFact` carries its own `checked_at`: the
+    // per-ticket badge is never fresher than the ticket's own ladder run.
+    state.scanned_at = Some(ctx.now);
+    state.fetch_age_secs = fetch_age.map(|d| d.as_secs());
+
+    let mut detections = Vec::new();
+    for t in snap.tickets.values() {
+        match &opts.only {
+            Some(id) if *id != t.fm.id => continue,
+            // A terminal ticket has nowhere left to go: `derive` reads its state, not its
+            // merge fact, and re-asking git about it every scan costs four subprocesses.
+            None if t.fm.state.terminal() => continue,
+            _ => {}
+        }
+
+        let d = ladder(&ctx.git, &ctx.gh, t, &main, fetch_age, ctx.now);
+        let changed = touched_paths(&ctx.git, t, &main);
+        // The human attestation lives in the ticket's `## Log` (D-11), so every scan reads
+        // it back and projects it into the cache. THAT is what makes `scan --confirm`
+        // survive `rm -rf cache/` — the override is re-derived, never remembered.
+        let fact = match (d.verdict(), confirmed_proof(&ctx.git, t)) {
+            (Verdict::Landed { .. }, _) => d.to_fact(changed),
+            (_, Some(p)) => confirmed_fact(&p, d.checked_at(), changed),
+            (_, None) => d.to_fact(changed),
+        };
+        state.tickets.insert(t.fm.id.clone(), fact);
+        if let Some(b) = branch_fact(&ctx.git, t, &main) {
+            state.branches.insert(t.fm.id.clone(), b);
+        }
+        detections.push((t.fm.id.clone(), d));
+    }
+
+    // Spec anchors are recomputed WHOLE on every scan, targeted or not: `merges_since` is
+    // a result, never an accumulator (D-10). A counter in a disposable cache silently
+    // resets to zero on a wipe, which under-fires the tripwire — the dangerous direction.
+    for (name, spec) in &snap.specs {
+        state
+            .specs
+            .insert(name.clone(), spec_anchor(ctx, &main, spec));
+    }
+
+    Ok((state, ScanToken(()), detections))
+}
+
+/// How many trailer-matched commits the fallback below will diff. A branch bigger than this
+/// is a squash waiting to happen, and the list is a staleness input, not an audit log.
+const TRAILER_DIFF_MAX: usize = 20;
+
+/// The paths a ticket's branch changed relative to main — recorded per ticket so `derive`
+/// can recompute spec staleness at READ time (D-10). Deletes are excluded: a spec glob
+/// matching a path that no longer exists has not been "touched" by it.
+///
+/// `Git::changed_paths` is a THREE-dot diff (2 dots would leak main's own changes), and
+/// three dots collapse to nothing the moment a *true* merge puts the branch's commits on
+/// main — `merge-base(main, head)` is then the head itself. The commits are still
+/// identifiable by the `Kanspec:` trailer the commit hook writes, so the fallback asks each
+/// of them directly. A true merge with no trailers (a repo that never ran `init`) records
+/// no paths, which is the honest answer rather than main's whole history.
+fn touched_paths(git: &Git, t: &Ticket, main: &str) -> Vec<String> {
+    let Some(rev) = ticket_rev(t) else {
+        return Vec::new();
+    };
+    let mut out = added_or_modified(git.changed_paths(main, &rev));
+    if out.is_empty() {
+        if let Tri::Yes(shas) = git.grep_trailer(main, &t.fm.id) {
+            for sha in shas.iter().take(TRAILER_DIFF_MAX) {
+                // `<sha>^...<sha>` — the merge base of a commit and its parent IS the
+                // parent, so three dots and two agree here.
+                let parent = format!("{}^", sha.as_str());
+                out.extend(added_or_modified(git.changed_paths(&parent, sha.as_str())));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn added_or_modified(paths: Tri<Vec<crate::git::ChangedPath>>) -> Vec<String> {
+    match paths {
+        Tri::Yes(v) => v
+            .into_iter()
+            .filter(|c| c.status != 'D')
+            .map(|c| c.path)
+            .collect(),
+        // "Cannot answer" is not "changed nothing", but the cache has no third state for a
+        // path list, and every consumer treats an absent path as untouched.
+        _ => Vec::new(),
+    }
+}
+
+/// `head:` if recorded, else the branch — the same "head-or-tip" [`head_of`] resolves,
+/// as a rev string for the git calls that take one.
+fn ticket_rev(t: &Ticket) -> Option<String> {
+    t.fm.head
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "null")
+        .or_else(|| {
+            t.fm.branch
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
+/// The Worktrees tab's row and the STALLED tripwire's input.
+fn branch_fact(git: &Git, t: &Ticket, main: &str) -> Option<BranchFact> {
+    let branch = t.fm.branch.clone();
+    let rev = ticket_rev(t)?;
+    let (ahead, behind) = match git.ahead_behind(main, &rev) {
+        Some((a, b)) => (Some(a), Some(b)),
+        None => (None, None),
+    };
+    Some(BranchFact {
+        head: git
+            .head_sha(&rev)
+            .ok()
+            .map(|h| h.sha().as_str().to_string()),
+        ahead,
+        behind,
+        last_commit_at: git.last_commit_at(&rev),
+        pushed: branch
+            .as_deref()
+            .is_some_and(|b| git.head_sha(&format!("origin/{b}")).is_ok()),
+        branch,
+    })
+}
+
+/// The spec's last-edit anchor plus the merges that touched its `code:` globs since. Both
+/// are git questions, asked fresh every scan.
+fn spec_anchor(ctx: &Ctx, main: &str, spec: &Spec) -> SpecAnchor {
+    let touch = repo_relative(ctx, &spec.path)
+        .and_then(|rel| ctx.git.last_touch(main, &Pathspec::glob(&rel)));
+    let globs: Vec<Pathspec> = spec.fm.code.iter().map(|g| Pathspec::glob(g)).collect();
+    let merges_since = match &touch {
+        // `--first-parent` inside `merges_touching`: the tripwire counts MERGES, not
+        // commits, or it over-fires by the size of every PR (D-9).
+        Some((sha, _)) if !globs.is_empty() => match ctx.git.merges_touching(sha, main, &globs) {
+            Tri::Yes(n) => n,
+            _ => 0,
+        },
+        // No anchor is "we cannot count from anywhere", which is not "0 merges since".
+        _ => 0,
+    };
+    SpecAnchor {
+        last_edit_sha: touch.as_ref().map(|(s, _)| s.as_str().to_string()),
+        last_edit_at: touch.as_ref().map(|(_, at)| *at),
+        merges_since,
+        dead_globs: spec
+            .fm
+            .code
+            .iter()
+            .filter(|g| !glob_matches_anything(&ctx.git, g))
+            .cloned()
+            .collect(),
+    }
+}
+
+fn repo_relative(ctx: &Ctx, p: &std::path::Path) -> Option<String> {
+    p.strip_prefix(ctx.layout.repo_root())
+        .ok()
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+}
+
+/// Glob rot: a `code:` glob matching zero tracked files is an amber dot on the feature
+/// strip, not a silently-empty staleness count.
+fn glob_matches_anything(git: &Git, glob: &str) -> bool {
+    match git.run_ps(&["ls-files", "-z"], &[Pathspec::glob(glob)]) {
+        Ok(o) => o.code == 0 && !o.out.trim().is_empty(),
+        // Cannot tell — say nothing rather than flag a glob that may be fine.
+        Err(_) => true,
+    }
+}
+
+/// The cache projection of a recorded human attestation. Badge-grade, like every other
+/// row: the proof-grade value is minted at the gate by [`confirmed_proof`].
+fn confirmed_fact(p: &MergedProof, checked_at: DateTime<Utc>, changed: Vec<String>) -> MergeFact {
+    MergeFact {
+        status: MergeStatus::Merged,
+        sha: Some(p.sha().as_str().to_string()),
+        method: Method::HumanConfirm,
+        pr: p.pr(),
+        why: Some(format!(
+            "confirmed by hand {}",
+            p.checked_at().format("%Y-%m-%dT%H:%MZ")
+        )),
+        checked_at,
+        changed,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The recorded human override
+// ─────────────────────────────────────────────────────────────────────────────
 
 pub struct ConfirmFacts {
     pub sha: Option<Sha>,
@@ -249,12 +965,279 @@ pub struct ConfirmFacts {
 /// The recorded human override. Appends an attributed `Verb::Confirm` line to the
 /// TICKET'S `## Log`, not a cache entry: a human attestation is an ASSERTED ACT WITH AN
 /// ACTOR, so it must survive `rm -rf cache/` and be visibly signed (D-11).
+///
+/// PURE — every git call that produced `f.sha` happened before the lock.
 pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<Plan> {
-    todo!("S3: refuse an empty why; emit Op::Transition{{verb: Confirm}} with the attestation as its note")
+    let t = snap.ticket(id)?;
+    let why = f.why.trim();
+    if why.is_empty() {
+        return Err(KsError::gate(
+            "confirm_without_why",
+            format!("`{id}` cannot be confirmed in main without a recorded reason"),
+            fixes![
+                fix!("kanspec scan --confirm {id} --why \"squash merged by hand, verified\""),
+                fix!("kanspec scan --explain {id}"),
+            ],
+        ));
+    }
+    // A confirmation that names no commit is unreadable later: `confirmed_proof` needs a
+    // SHA to hand the gate, and "trust me" is exactly what this tool refuses.
+    let sha = f
+        .sha
+        .as_ref()
+        .map(|s| s.as_str().to_string())
+        .or_else(|| t.fm.head.clone())
+        .ok_or_else(|| {
+            KsError::gate(
+                "confirm_without_head",
+                format!("`{id}` records neither a `head:` SHA nor a resolvable branch to confirm"),
+                fixes![fix!("kanspec ship {id}"), fix!("kanspec show {id}"),],
+            )
+        })?;
+    Ok(Plan::of(vec![Op::Transition {
+        id: id.clone(),
+        verb: Verb::Confirm,
+        actor: f.actor.clone(),
+        at: f.at,
+        // The note IS the storage — see `CONFIRM_NOTE`.
+        detail: format!("{CONFIRM_NOTE} {sha} — {why}"),
+        also: Vec::new(),
+    }]))
 }
 
 /// Reads a recorded confirmation back out of the log — the ONLY non-ladder route to a
 /// [`MergedProof`].
-pub fn confirmed_proof(t: &Ticket) -> Option<MergedProof> {
-    todo!("S3: find the newest Verb::Confirm entry and seal it with Method::HumanConfirm")
+///
+/// NOTE (deviation from ARCHITECTURE.md §2.15, reported): the contract's signature is
+/// `confirmed_proof(t: &Ticket)`. It cannot be honoured as written — [`Sha`]'s only
+/// constructor is private to `git.rs`, so a function with no `&Git` cannot produce the
+/// `sha` field a `MergedProof` requires. Taking `&Git` is also the stronger seal: the
+/// attested commit is re-resolved through git, so an attestation naming a commit this repo
+/// does not have yields no proof at all.
+pub fn confirmed_proof(git: &Git, t: &Ticket) -> Option<MergedProof> {
+    let entry = t.log.iter().rev().find(|e| {
+        e.verb == Verb::Confirm
+            && e.note
+                .as_deref()
+                .is_some_and(|n| n.trim().starts_with(CONFIRM_NOTE))
+    })?;
+    let rev = confirm_note_sha(entry.note.as_deref()?)
+        .map(str::to_string)
+        .or_else(|| t.fm.head.clone())?;
+    let sha = git.head_sha(&rev).ok()?.sha().clone();
+    Some(MergedProof {
+        ticket: t.fm.id.clone(),
+        sha,
+        method: Method::HumanConfirm,
+        pr: t.fm.pr,
+        // The moment a human looked, not the moment we read the line back.
+        checked_at: entry.at,
+    })
+}
+
+fn confirm_note_sha(note: &str) -> Option<&str> {
+    let rest = note.trim().strip_prefix(CONFIRM_NOTE)?.trim_start();
+    let tok = rest.split_whitespace().next()?;
+    let hex = tok.len() >= 7
+        && tok.len() <= 64
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    hex.then_some(tok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::logentry::LogEntry;
+    use crate::transitions::State;
+
+    fn tid(s: &str) -> TicketId {
+        TicketId::parse(s).unwrap()
+    }
+
+    /// `Plan` is deliberately not `Debug` (it holds a `ScanToken`), so `unwrap_err` is
+    /// unavailable on a planner's result.
+    #[track_caller]
+    fn refusal(r: Result<Plan>) -> &'static str {
+        match r {
+            Ok(p) => panic!("expected a refusal, got a plan with {} ops", p.ops.len()),
+            Err(e) => e.code().unwrap_or(e.kind()),
+        }
+    }
+
+    fn at() -> DateTime<Utc> {
+        "2026-08-31T12:00:00Z".parse().unwrap()
+    }
+
+    fn detection(v: Verdict) -> Detection {
+        Detection::seal(v, at(), Some(11), vec![])
+    }
+
+    fn ticket(id: &str) -> Ticket {
+        let fm: crate::model::TicketFm = serde_yaml_ng::from_str(&format!(
+            "id: {id}\ntitle: t\nstate: review\ncreated: 2026-08-30T09:00:00Z\n"
+        ))
+        .unwrap();
+        Ticket {
+            fm,
+            path: std::path::PathBuf::from(format!(".kanspec/tickets/{id}.md")),
+            body: String::new(),
+            steps: Vec::new(),
+            log: Vec::new(),
+            mtime: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    // ── the down-conversion is one-way, and lossy on purpose ─────────────────
+
+    #[test]
+    fn an_unknown_verdict_becomes_a_cache_row_that_explains_itself() {
+        let d = detection(Verdict::Unknown(Unknown::SquashSuspectedNoGh {
+            plus_lines: 2,
+        }));
+        let f = d.to_fact(vec!["src/auth/login.ts".into()]);
+        assert_eq!(f.status, MergeStatus::Unknown);
+        assert_eq!(f.why.as_deref(), Some("unknown (squash suspected, no gh)"));
+        assert_eq!(
+            f.method,
+            Method::None,
+            "no rung concluded, so none is named"
+        );
+        assert!(f.sha.is_none());
+        assert_eq!(f.changed, ["src/auth/login.ts"]);
+        assert_eq!(f.checked_at, at());
+    }
+
+    #[test]
+    fn a_not_landed_verdict_never_carries_a_method_or_a_sha() {
+        let f = detection(Verdict::NotLanded).to_fact(vec![]);
+        assert_eq!(f.status, MergeStatus::NotMerged);
+        assert_eq!(f.method, Method::None);
+        assert!(f.sha.is_none() && f.why.is_none());
+    }
+
+    /// The proof is minted from a `Detection` and nothing else — the whole of invariant 1's
+    /// compile-time half rests on there being no other route.
+    #[test]
+    fn only_a_landed_detection_mints_a_proof() {
+        let id = tid("t-9c41");
+        for v in [
+            Verdict::NotLanded,
+            Verdict::Unknown(Unknown::ZeroCommitBranch),
+            Verdict::Unknown(Unknown::GhUnavailable {
+                why: "no gh".into(),
+            }),
+        ] {
+            assert!(
+                MergedProof::from_detection(&id, &detection(v)).is_none(),
+                "an inconclusive ladder must mint nothing"
+            );
+        }
+    }
+
+    // ── the confirmation round-trip: the note IS the storage ─────────────────
+
+    #[test]
+    fn a_confirmation_round_trips_through_the_log_line_it_writes() {
+        let mut snap = Snapshot::empty(Config::default(), at());
+        let id = tid("t-dddd");
+        snap.tickets.insert(id.clone(), ticket("t-dddd"));
+        let f = ConfirmFacts {
+            sha: None,
+            actor: Actor::Human {
+                name: "trevor".into(),
+            },
+            at: at(),
+            why: "  ".into(),
+            invocation: "kanspec scan --confirm t-dddd".into(),
+        };
+        // An unexplained attestation is refused, and so is one that names no commit.
+        assert_eq!(refusal(plan_confirm(&snap, &f, &id)), "confirm_without_why");
+        let f = ConfirmFacts {
+            why: "github squash, verified by hand".into(),
+            ..f
+        };
+        assert_eq!(
+            refusal(plan_confirm(&snap, &f, &id)),
+            "confirm_without_head"
+        );
+
+        // With a SHA, the plan is exactly one recorded, attributed non-transition.
+        snap.tickets.get_mut(&id).unwrap().fm.head = Some("a1b9c3d5f00".into());
+        let plan = plan_confirm(&snap, &f, &id).unwrap();
+        let Some(Op::Transition {
+            verb, detail, at, ..
+        }) = plan.ops.first()
+        else {
+            panic!("expected one Transition, got {} ops", plan.ops.len());
+        };
+        assert_eq!(*verb, Verb::Confirm);
+        assert_eq!(plan.ops.len(), 1);
+
+        // And the line it produces is parseable back into the SHA the human attested to.
+        let line = LogEntry {
+            at: *at,
+            state: State::Review,
+            actor: "trevor".into(),
+            verb: Verb::Confirm,
+            note: Some(detail.clone()),
+        }
+        .format();
+        let back = LogEntry::parse(&line).expect("the confirm line is a legal log entry");
+        assert_eq!(
+            confirm_note_sha(back.note.as_deref().unwrap()),
+            Some("a1b9c3d5f00"),
+            "the attested SHA must survive the log grammar: {line}"
+        );
+        assert!(back
+            .note
+            .unwrap()
+            .contains("github squash, verified by hand"));
+    }
+
+    #[test]
+    fn a_note_that_is_not_an_attestation_yields_no_sha() {
+        assert_eq!(confirm_note_sha("in main a1b9c3d — why"), Some("a1b9c3d"));
+        assert_eq!(confirm_note_sha("in main — why"), None, "no SHA named");
+        assert_eq!(confirm_note_sha("in main NOTHEX0 — why"), None);
+        assert_eq!(confirm_note_sha("in main a1b9c3 — too short"), None);
+        assert_eq!(confirm_note_sha("rework, see #12"), None);
+    }
+
+    // ── the no-code waiver ───────────────────────────────────────────────────
+
+    #[test]
+    fn a_no_code_waiver_refuses_an_empty_why_and_records_a_durable_line() {
+        let mut plan = Plan::empty();
+        let id = tid("t-9c41");
+        let by = Actor::Human {
+            name: "trevor".into(),
+        };
+        assert_eq!(
+            NoCodeWaiver::record(&mut plan, &id, "   ", &by, at())
+                .unwrap_err()
+                .code(),
+            Some("no_code_without_why")
+        );
+        assert!(plan.is_empty(), "a refused waiver plans nothing");
+
+        let w = NoCodeWaiver::record(&mut plan, &id, " docs only ", &by, at()).unwrap();
+        assert_eq!(w.why(), "docs only");
+        assert_eq!(w.by(), "trevor");
+        let Some(Op::AppendSection { heading, line, .. }) = plan.ops.first() else {
+            panic!("the waiver must be durable before it is usable");
+        };
+        assert_eq!(*heading, LOG_HEADING);
+        assert!(
+            line.contains("docs only") && line.contains("trevor"),
+            "{line}"
+        );
+        // Durable, but NOT a second transition: `replay` must not see it as an entry.
+        assert!(
+            crate::logentry::parse_log(&format!("## Log\n{line}\n")).is_empty(),
+            "the waiver line must not parse as a log entry: {line}"
+        );
+    }
 }
