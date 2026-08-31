@@ -14,7 +14,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Fix, KsError, Result};
+use crate::error::{Fix, Fixes, KsError, Result};
 use crate::ids::TicketId;
 use crate::logentry::LogEntry;
 use crate::model::Ticket;
@@ -267,9 +267,9 @@ fn join_or(parts: &[&str]) -> String {
 
 /// The typed refusal every mutating verb goes through.
 ///
-/// Both fix lines are built from [`Verb::command`] and `invoked_as`, never from the verb's
-/// name and never from a hardcoded `kanspec`: a `ks` user is told to run `ks`, and the
-/// suggested verb is spelled the way clap actually accepts it.
+/// Both fix lines come from [`onward`], which builds them out of [`Verb::command_as`] and
+/// `invoked_as` — never from the verb's name and never from a hardcoded `kanspec`: a `ks`
+/// user is told to run `ks`, and the suggested verb is spelled the way clap accepts it.
 pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State> {
     match next(Some(from), verb) {
         Some(to) => Ok(to),
@@ -278,12 +278,56 @@ pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State> {
             from,
             verb,
             allowed: allowed_slice(Some(from)),
-            fix: fixes![
-                fix!("{} show {id}", crate::cli::invoked_as()),
-                Fix::cmd(allowed_slice(Some(from))[0].command(id)),
-            ],
+            fix: onward(id, from),
         }),
     }
+}
+
+/// What to do instead — and it has to be something that ENDS.
+///
+/// Invariant 9 asks for the one command that fixes this. For a ticket that can still move
+/// that is the first verb the table allows, and those chains are short and true: `start` on
+/// a `todo` claims it, `ship` on a `doing` reviews it. Nothing below changes them.
+///
+/// A **terminal** ticket is the case that was broken. `done` and `dropped` allow only
+/// `confirm` and `repair`, and naming the first of those — `scan --confirm` — sent an agent
+/// round a ring it could not get out of, because on a ticket that never had a branch
+/// `--confirm` has nothing to attest and answers `ship`, and `ship` answers `scan --confirm`:
+///
+/// ```text
+/// ✗ t-8e2b is dropped, not doing or review — cannot done
+///   → ks scan --confirm t-8e2b --why "..."
+/// ✗ `t-8e2b` records neither a `head:` SHA nor a resolvable branch to confirm
+///   → kanspec ship t-8e2b
+/// ✗ t-8e2b is dropped, not doing — cannot ship
+///   → kanspec scan --confirm t-8e2b --why "..."      ← and round again
+/// ```
+///
+/// A human reads the third line and stops. An agent whose whole contract is "run the
+/// suggested command" does not, so a fix that is *runnable* is not yet a fix that is
+/// *followable*: the chain has to terminate as well. Neither of the two verbs a terminal
+/// state allows is worth naming here — `confirm` attests a merge for work that is over, and
+/// `repair` refuses outright on a ticket whose `## Log` already replays (`nothing_to_repair`).
+/// The honest advice for a closed ticket is the true, final one: look at what happened, or
+/// open a NEW ticket for the work that still wants doing.
+///
+/// `tests/transition_table.rs` walks the whole suggestion graph with the real binary and
+/// fails on a repeated command, so a future fix line that bounces is a failing test rather
+/// than an agent spinning in someone's terminal.
+fn onward(id: &TicketId, from: State) -> Fixes {
+    let ks = crate::cli::invoked_as();
+    if from.terminal() {
+        // `New` mints an id rather than taking one, so `command_as` spells it with the
+        // title it needs — the same single source of truth as every other suggestion.
+        return fixes![
+            fix!("{ks} show {id}"),
+            Fix::cmd(Verb::New.command_as(ks, id)),
+        ];
+    }
+    fixes![
+        fix!("{ks} show {id}"),
+        Fix::cmd(allowed_slice(Some(from))[0].command_as(ks, id)),
+    ]
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -467,6 +511,44 @@ mod tests {
     fn terminal_states_accept_only_confirm_and_repair() {
         for st in [State::Done, State::Dropped] {
             assert_eq!(allowed_slice(Some(st)), FROM_TERMINAL);
+        }
+    }
+
+    /// The rule behind [`onward`], stated as a property rather than as the two literal
+    /// strings `tests/transition_table.rs` pins: a closed ticket is never sent at a verb its
+    /// own state allows. Both of those — `confirm` and `repair` — answer questions about
+    /// work that is over, and pointing at one is how the refusal chain came to have no end.
+    #[test]
+    fn a_terminal_refusal_never_names_a_verb_that_comes_straight_back() {
+        let id = TicketId::parse("t-ea32").unwrap();
+        for st in [State::Done, State::Dropped] {
+            let offered = onward(&id, st);
+            for &v in allowed_slice(Some(st)) {
+                let cmd = v.command_as("kanspec", &id);
+                assert!(
+                    !offered.iter().any(|f| f.as_str() == cmd),
+                    "a {st} ticket was told `{cmd}`, which lands it back here"
+                );
+            }
+            // ...and it IS told the two things that end the chain: look, or open a new one.
+            assert_eq!(
+                offered.iter().map(Fix::as_str).collect::<Vec<_>>(),
+                [
+                    "kanspec show t-ea32",
+                    Verb::New.command_as("kanspec", &id).as_str()
+                ]
+            );
+        }
+        // A ticket that can still move keeps the advice it had: the first legal verb.
+        for st in [State::Todo, State::Doing, State::Review] {
+            assert_eq!(
+                onward(&id, st).iter().last().map(Fix::as_str),
+                Some(
+                    allowed_slice(Some(st))[0]
+                        .command_as("kanspec", &id)
+                        .as_str()
+                )
+            );
         }
     }
 
