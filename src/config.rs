@@ -210,7 +210,7 @@ impl Config {
 
     /// Split out from [`Config::load`] so the parse half is testable without a filesystem.
     pub fn parse(text: &str, origin: &str) -> Result<Config> {
-        toml::from_str(text).map_err(|e| {
+        let cfg: Config = toml::from_str(text).map_err(|e| {
             KsError::invalid(
                 format!("{origin} is not valid config: {e}"),
                 fixes![
@@ -218,7 +218,27 @@ impl Config {
                     fix!("compare against `kanspec init --help` defaults"),
                 ],
             )
-        })
+        })?;
+        // `sync = "branch"` parses — the variant exists so v0.4 can fill it in — but
+        // NOTHING implements it: `Store::transact` auto-commits only under `Commit`, and
+        // `status` suppresses its "N tracker changes pending" line for `Branch` on the
+        // assumption that a branch-syncing repo has nothing pending. Together that is the
+        // worst shape a config knob can have: it syncs nothing AND silences the one line
+        // that would have said so. Refusing is the only honest answer until it is built.
+        if cfg.sync == SyncMode::Branch {
+            return Err(KsError::gate(
+                "sync_branch_v04",
+                format!(
+                    "{origin}: `sync = \"branch\"` lands in v0.4 — nothing implements it \
+                     yet, and it would silently commit and push nothing"
+                ),
+                fixes![
+                    fix!("sync = \"batch\"   # dirty the tree; commit when you commit"),
+                    fix!("sync = \"commit\"  # auto-commit every verb"),
+                ],
+            ));
+        }
+        Ok(cfg)
     }
 
     /// What `init` writes — every default made visible, with the comments that explain
@@ -231,7 +251,7 @@ impl Config {
 
 main             = "{main}"      # the branch merge detection resolves against
 id_width         = {id_width}                 # hex digits in a minted id; widens on collision
-sync             = "{sync}"           # batch | commit | branch(v0.4)
+sync             = "{sync}"           # batch | commit   (branch = team mode, v0.4)
 port             = {port}              # `kanspec up` binds 127.0.0.1:<port>
 branch_prefix    = "{branch_prefix}"             # `start` creates <prefix><id>-<slug>
 worktree         = {worktree}                # `start` makes a worktree without being asked?
@@ -318,6 +338,20 @@ mod tests {
         assert_eq!(c.windows.stall_secs, 7_200);
         assert_eq!(c.sync, SyncMode::Batch);
         assert!(!c.hooks.landcheck, "landcheck is opt-in (D-14)");
+    }
+
+    /// A knob that parses, does nothing, AND silences the warning that would reveal it is
+    /// the worst shape available. `sync = "branch"` is all three until v0.4 builds it.
+    #[test]
+    fn sync_branch_refuses_rather_than_silently_syncing_nothing() {
+        let e = Config::parse("sync = \"branch\"\n", "test").unwrap_err();
+        assert_eq!(e.kind(), "gate");
+        assert!(format!("{e}").contains("v0.4"), "{e}");
+        // …and the two that DO work still parse.
+        for ok in ["batch", "commit"] {
+            Config::parse(&format!("sync = \"{ok}\"\n"), "test")
+                .unwrap_or_else(|e| panic!("`{ok}` must still parse: {e}"));
+        }
     }
 
     #[test]

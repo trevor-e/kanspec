@@ -174,15 +174,15 @@ pub struct ReviewReport {
 }
 
 /// How many threads on this proposal nobody has resolved — the number `approve` gates on
-/// and `review` reports. Counts the ORPHAN tray too: a thread whose item was deleted is
-/// the most, not the least, likely to be the one being dodged.
+/// and `review` reports.
+///
+/// Delegates to [`crate::derive::unresolved`] rather than counting again. `board`, `prime`
+/// and `status` already read that one, and two definitions of the number a GATE turns on is
+/// how you get `status` reporting "no open threads" while `approve` refuses. It counts a
+/// thread whose target item was deleted, which is right: an orphaned objection is the one
+/// most likely to be getting dodged, not the least.
 pub fn unresolved(s: &Snapshot, p: &Proposal) -> usize {
-    let ops = s.comments.get(&p.fm.id).map(Vec::as_slice).unwrap_or(&[]);
-    let (live, orphan) = crate::cmd::comment::fold_threads(p, ops);
-    live.iter()
-        .chain(orphan.iter())
-        .filter(|t| t.resolved.is_none())
-        .count()
+    crate::derive::unresolved(s, &p.fm.id)
 }
 
 /// draft -> review, then print the review page URL.
