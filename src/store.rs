@@ -590,6 +590,7 @@ impl<'c> Store<'c> {
                 .iter()
                 .find_map(|o| match o {
                     Op::Transition { id, .. } => Some(id.to_string()),
+                    Op::StampRule { spec, .. } => Some(spec.to_string()),
                     _ => o.entity().map(EntityRef::id),
                 })
                 .unwrap_or_else(|| "store".to_string());
@@ -697,6 +698,19 @@ impl<'c> Store<'c> {
                             fixes![fix!("kanspec show {id}")],
                         ));
                     }
+                }
+            }
+            Op::StampRule { spec, anchor, line } => {
+                let path = l.spec(spec);
+                let doc = doc_at(&path, staged, false)?;
+                if !fm::stamp_rule(doc, *line, anchor, crate::rulesdoc::ADOPTED_TOKEN) {
+                    // The snapshot was reloaded inside the lock, so this means the bullet
+                    // moved between planning and applying — refuse rather than stamp a
+                    // token onto whatever line took its place.
+                    return Err(KsError::conflict(
+                        format!("spec {spec} no longer has rule [{anchor}] on line {line}"),
+                        fixes![fix!("kanspec rules --audit")],
+                    ));
                 }
             }
             Op::AppendJsonl { path, line } => match slot(staged, path) {

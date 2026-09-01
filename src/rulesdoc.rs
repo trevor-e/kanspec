@@ -333,7 +333,7 @@ pub fn render_text(d: &RulesDoc) -> String {
     // ── spec rules ───────────────────────────────────────────────────────────
     o.push_str(&format!(
         " SPEC RULES: {} across {} {} \
-         (each carries its {{p-xxxx}} source token; `kanspec why <anchor>`)\n",
+         (`kanspec why <anchor>` walks one home; `rules --audit` flags any with no source)\n",
         d.counts.spec_rules,
         d.counts.capabilities,
         if d.counts.capabilities == 1 {
@@ -423,16 +423,42 @@ pub fn audit(s: &Snapshot, d: &RulesDoc) -> Vec<AuditWarning> {
         }
     }
 
+    for a in adoptable(s) {
+        out.push(AuditWarning {
+            subject: format!("spec {} [{}]", a.spec, a.anchor),
+            message: "no provenance token (pre-kanspec) — adopt or delete".to_string(),
+            fix: "kanspec rules --adopt".to_string(),
+            adoptable: true,
+        });
+    }
+    out
+}
+
+/// One pre-kanspec rule bullet: carries no `{p-xxxx}` and has not been adopted.
+#[derive(Debug, Clone, Serialize)]
+pub struct Adoptable {
+    pub spec: SpecName,
+    pub anchor: String,
+    /// 1-based line within the spec's BODY — what `Op::StampRule` rewrites
+    pub line: usize,
+}
+
+/// Every bullet `--audit` warns about and `--adopt` stamps, in `BTreeMap` spec order then
+/// file order. ONE definition, so the two flags can never disagree about what is adoptable
+/// — and so the count in the refusal-free summary is the count in the audit.
+pub fn adoptable(s: &Snapshot) -> Vec<Adoptable> {
+    let mut out = Vec::new();
     for spec in s.specs.values() {
         for r in &spec.rules {
+            // A rule carrying either token has an answer already: real provenance, or a
+            // human who adopted it. `--adopt` must be idempotent across a 800-rule import.
             if !r.provenance.is_empty() || r.text.contains(ADOPTED_TOKEN) {
                 continue;
             }
-            out.push(AuditWarning {
-                subject: format!("spec {} [{}]", spec.name, r.anchor),
-                message: "no provenance token (pre-kanspec) — adopt or delete".to_string(),
-                fix: "kanspec rules --adopt".to_string(),
-                adoptable: true,
+            out.push(Adoptable {
+                spec: spec.name.clone(),
+                anchor: r.anchor.clone(),
+                line: r.line,
             });
         }
     }

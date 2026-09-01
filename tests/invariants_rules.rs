@@ -445,9 +445,13 @@ fn every_handler_that_writes_a_projected_entity_republishes_the_projections() {
             continue;
         }
         let src = std::fs::read_to_string(&path).expect("a readable handler");
+        // `EntityRef::` catches the ops that name an entity; `Op::StampRule` rewrites a
+        // spec BODY without one, so the scan must name it too — an op that edits a
+        // projected entity by a second route is exactly how this guard goes blind.
         let touches_a_projected_entity = ["Spec(", "Decision(", "Quirk("]
             .iter()
-            .any(|t| src.contains(&format!("EntityRef::{t}")));
+            .any(|t| src.contains(&format!("EntityRef::{t}")))
+            || src.contains("Op::StampRule");
         if !touches_a_projected_entity {
             continue;
         }
@@ -611,8 +615,11 @@ fn audit_prints_only_its_warnings_so_the_default_stdout_stays_the_injection_surf
     assert!(repo.ks(["prime"]).ok().stdout.starts_with(&plain));
 }
 
+/// The migration path: an imported corpus has no proposal to point at, so `--adopt` is the
+/// only way its rules ever stop warning. It must actually STAMP — an exit 0 that changed
+/// nothing is how an audit comes to look clean.
 #[test]
-fn adopt_refuses_out_loud_rather_than_exiting_zero_having_changed_nothing() {
+fn adopt_stamps_the_pre_kanspec_bullet_so_the_audit_goes_quiet() {
     let repo = TestRepo::new();
     seed(&repo);
     append_rule(
@@ -620,14 +627,57 @@ fn adopt_refuses_out_loud_rather_than_exiting_zero_having_changed_nothing() {
         "auth",
         "- [auth.oauth] GitHub OAuth is the only SSO.",
     );
-    let r = repo.ks(["rules", "--adopt"]);
-    assert_eq!(
-        r.code, 1,
-        "a no-op that exits 0 is how an audit comes to look clean"
+    assert!(repo
+        .ks(["rules", "--audit"])
+        .ok()
+        .stdout
+        .contains("auth.oauth"));
+
+    let r = repo.ks(["rules", "--adopt"]).ok();
+    assert!(r.stdout.contains("auth.oauth"), "{}", r.stdout);
+    assert!(r.stdout.contains("{pre-kanspec}"), "{}", r.stdout);
+
+    // The token is visible text in the bullet (invariant 5), not hidden state.
+    let body = std::fs::read_to_string(repo.root.join(".kanspec/specs/auth.md")).unwrap();
+    assert!(
+        body.contains("- [auth.oauth] GitHub OAuth is the only SSO. {pre-kanspec}"),
+        "{body}"
     );
-    assert!(r.stderr.contains("provenance"), "{}", r.stderr);
-    // Invariant 9: every refusal names its next command.
-    assert!(r.stderr.contains("→"), "{}", r.stderr);
+
+    // The audit it existed to answer is now quiet…
+    let audit = repo.ks(["rules", "--audit"]).ok();
+    assert!(
+        audit.stdout.contains("every standing rule still points home"),
+        "{}",
+        audit.stdout
+    );
+
+    // …and a second adopt is a no-op, not a second token.
+    let again = repo.ks(["rules", "--adopt"]).ok();
+    assert!(again.stdout.contains("nothing left to adopt"), "{}", again.stdout);
+    let after = std::fs::read_to_string(repo.root.join(".kanspec/specs/auth.md")).unwrap();
+    assert_eq!(body, after, "adoption must be idempotent byte for byte");
+
+    // Adoption is a marker, NOT fabricated provenance: `why` still says nothing is recorded.
+    let why = repo.ks(["why", "auth.oauth"]).ok().stdout;
+    assert!(why.contains("none recorded"), "{why}");
+}
+
+/// `--adopt` is a write, so it must not leak into the injection surface invariant 3 pins.
+#[test]
+fn adopt_prints_only_its_summary_so_the_default_stdout_stays_the_injection_surface() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    append_rule(&repo, "auth", "- [auth.oauth] GitHub OAuth is the only SSO.");
+    let r = repo.ks(["rules", "--adopt"]).ok();
+    assert!(
+        !r.stdout.contains("STANDING RULES"),
+        "--adopt must not re-render the rules: {}",
+        r.stdout
+    );
+    let plain = repo.ks(["rules"]).ok().stdout;
+    assert!(plain.starts_with("STANDING RULES"), "{plain}");
+    assert!(repo.ks(["prime"]).ok().stdout.starts_with(&plain));
 }
 
 /// DESIGN.md budgets `prime` at ~1.5k tokens. Measured on a corpus deliberately larger

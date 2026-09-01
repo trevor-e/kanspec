@@ -567,6 +567,62 @@ pub fn mark_step(doc: &mut MdDoc, index: usize, done: bool) -> bool {
     true
 }
 
+/// Is `line` the rule bullet `- [<anchor>] …`? Mirrors `store::parse_rules`, including its
+/// refusal to read a `- [ ]` / `- [x]` checkbox as a rule.
+fn is_rule_bullet(line: &str, anchor: &str) -> bool {
+    let t = line.trim();
+    let Some(rest) = t.strip_prefix("- [") else {
+        return false;
+    };
+    let Some((a, _)) = rest.split_once(']') else {
+        return false;
+    };
+    let a = a.trim();
+    !a.is_empty() && !a.eq_ignore_ascii_case("x") && a == anchor
+}
+
+/// Byte offset of body line `index` (0-based) and its content without the line ending.
+fn line_span(body: &str, index: usize) -> Option<(usize, &str)> {
+    let mut off = 0usize;
+    for (i, raw) in body.split_inclusive('\n').enumerate() {
+        if i == index {
+            let c = raw.strip_suffix('\n').unwrap_or(raw);
+            return Some((off, c.strip_suffix('\r').unwrap_or(c)));
+        }
+        off += raw.len();
+    }
+    None
+}
+
+/// Append `token` to the rule bullet on 1-based body `line`, which must still be the
+/// `- [anchor] …` bullet the snapshot parsed there. Returns false when it is not — a plan
+/// staging several stamps into one doc must never write a token onto a line that moved
+/// under it.
+///
+/// Stamping cannot change the body's line COUNT, so every other `line` in the same plan
+/// stays valid however many stamps land first. That is the whole reason this appends
+/// rather than rewrites.
+///
+/// Idempotent: a bullet already carrying `token` is left byte-identical, so re-running
+/// `rules --adopt` is a no-op rather than a second token.
+pub fn stamp_rule(doc: &mut MdDoc, line: usize, anchor: &str, token: &str) -> bool {
+    let Some(i) = line.checked_sub(1) else {
+        return false;
+    };
+    let Some((start, raw)) = line_span(&doc.body, i) else {
+        return false;
+    };
+    if !is_rule_bullet(raw, anchor) {
+        return false;
+    }
+    if raw.contains(token) {
+        return true;
+    }
+    let at = start + raw.trim_end().len();
+    doc.body.insert_str(at, &format!(" {token}"));
+    true
+}
+
 /// SAFETY GUARD — `Store::transact` calls this before ANY byte moves, and
 /// `doctor::check_frontmatter_writable` calls it on every file. It compares the line
 /// indexer's top-level keys against `serde_yaml_ng`'s; a mismatch (a quoted key, an
@@ -925,5 +981,84 @@ Implement [auth.lockout].
     fn the_indexer_and_serde_agree_on_the_design_md_corpus() {
         let d = split(TICKET).unwrap();
         writable(&d.fm).expect("the reference ticket must be writable");
+    }
+
+    // ── stamp_rule ───────────────────────────────────────────────────────────
+
+    const SPEC: &str = "---\nfeature: Login\ncode: [src/auth/**]\n---\n# auth\n\n## Rules\n- [auth.jwt] Login issues a JWT valid 24h.\n- [auth.lockout] 5 failed logins lock the account. {p-7de2}\n";
+
+    fn spec_doc() -> MdDoc {
+        split(SPEC).unwrap()
+    }
+
+    /// The line number comes from `store::parse_rules`, which indexes the same `doc.body`.
+    fn line_of(doc: &MdDoc, anchor: &str) -> usize {
+        doc.body
+            .lines()
+            .position(|l| l.trim().starts_with(&format!("- [{anchor}]")))
+            .unwrap()
+            + 1
+    }
+
+    #[test]
+    fn stamp_rule_appends_the_token_to_that_bullet_and_nothing_else() {
+        let mut d = spec_doc();
+        let n = line_of(&d, "auth.jwt");
+        assert!(stamp_rule(&mut d, n, "auth.jwt", "{pre-kanspec}"));
+        assert!(d
+            .body
+            .contains("- [auth.jwt] Login issues a JWT valid 24h. {pre-kanspec}"));
+        // the sibling rule is untouched, and the body still has the same line count
+        assert!(d.body.contains("- [auth.lockout] 5 failed logins lock the account. {p-7de2}\n"));
+        assert_eq!(d.body.lines().count(), spec_doc().body.lines().count());
+    }
+
+    #[test]
+    fn stamp_rule_is_idempotent_so_a_second_adopt_is_a_no_op() {
+        let mut d = spec_doc();
+        let n = line_of(&d, "auth.jwt");
+        assert!(stamp_rule(&mut d, n, "auth.jwt", "{pre-kanspec}"));
+        let once = d.render();
+        assert!(stamp_rule(&mut d, n, "auth.jwt", "{pre-kanspec}"));
+        assert_eq!(once, d.render(), "a second stamp must not add a second token");
+    }
+
+    /// The guard that makes a line number safe to carry in `Op::StampRule`: if the bullet
+    /// moved, the stamp refuses instead of writing onto whatever took its place.
+    #[test]
+    fn stamp_rule_refuses_when_the_line_is_not_that_anchors_bullet() {
+        let mut d = spec_doc();
+        let n = line_of(&d, "auth.jwt");
+        assert!(!stamp_rule(&mut d, n, "auth.lockout", "{pre-kanspec}"));
+        assert!(!stamp_rule(&mut d, 1, "auth.jwt", "{pre-kanspec}"), "# auth is not a bullet");
+        assert!(!stamp_rule(&mut d, 9_999, "auth.jwt", "{pre-kanspec}"));
+        assert!(!stamp_rule(&mut d, 0, "auth.jwt", "{pre-kanspec}"));
+        assert_eq!(d.render(), SPEC, "a refused stamp must move no bytes");
+    }
+
+    /// `- [ ]` / `- [x]` are checkboxes, not rules — `store::parse_rules` skips them and so
+    /// must this, or a ticket body could be stamped through a mis-planned op.
+    #[test]
+    fn stamp_rule_never_treats_a_checkbox_as_a_rule() {
+        let src = "---\nid: t-9c41\n---\n- [ ] do the thing\n- [x] did the thing\n";
+        let mut d = split(src).unwrap();
+        assert!(!stamp_rule(&mut d, 1, "", "{pre-kanspec}"));
+        assert!(!stamp_rule(&mut d, 2, "x", "{pre-kanspec}"));
+        assert_eq!(d.render(), src);
+    }
+
+    /// The token goes after the last non-space character, so a CRLF line ending and any
+    /// trailing spaces survive — `fm_bytes` byte-identity is the whole point.
+    #[test]
+    fn stamp_rule_lands_before_trailing_whitespace_and_crlf() {
+        let src = "---\nfeature: x\n---\r\n- [a.b] text.  \r\n- [c.d] more.\n";
+        let mut d = split(src).unwrap();
+        assert!(stamp_rule(&mut d, 1, "a.b", "{pre-kanspec}"));
+        assert!(
+            d.body.starts_with("- [a.b] text. {pre-kanspec}  \r\n"),
+            "{:?}",
+            d.body
+        );
+        assert!(d.body.ends_with("- [c.d] more.\n"));
     }
 }

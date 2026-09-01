@@ -103,6 +103,22 @@ pub enum Op {
         id: TicketId,
         checks: Vec<(usize, bool)>,
     },
+    /// `rules --adopt`: stamp the adoption token onto a pre-kanspec rule bullet.
+    ///
+    /// The ONLY op that rewrites a line inside an entity body, and deliberately the
+    /// narrowest one that can be: it appends one fixed token to the `- [anchor]` bullet the
+    /// snapshot parsed at `line`, in a spec, and can reach nothing else. `SetFields` is
+    /// frontmatter-only and `AppendSection` appends, so a migrated corpus had no way to
+    /// answer `rules --audit` before this existed.
+    ///
+    /// `line` is safe to carry across a multi-stamp plan because stamping never changes the
+    /// body's line count, and the planner runs against the snapshot reloaded INSIDE the
+    /// lock; `fm::stamp_rule` re-verifies the anchor anyway.
+    StampRule {
+        spec: SpecName,
+        anchor: String,
+        line: usize,
+    },
     /// `comments.jsonl` (v0.2)
     AppendJsonl { path: PathBuf, line: String },
     /// `close`: -> `proposals/closed/`
@@ -153,7 +169,9 @@ impl Op {
     }
 
     /// The entity a plan step is about, when it has one. `MoveDir`, `AppendJsonl`,
-    /// `WriteGenerated` and `WriteGitState` name raw paths instead.
+    /// `WriteGenerated` and `WriteGitState` name raw paths instead; `StampRule` names a
+    /// `SpecName` rather than owning an `EntityRef`, so it answers `None` here and
+    /// `Store::transact` reads its subject off the variant directly.
     pub fn entity(&self) -> Option<&EntityRef> {
         match self {
             Op::SetFields { entity, .. }
@@ -255,6 +273,15 @@ impl Plan {
                         ));
                     }
                 }
+                Op::StampRule { spec, .. } => {
+                    if !snap.specs.contains_key(spec) {
+                        return Err(KsError::not_found(
+                            "spec",
+                            spec.to_string(),
+                            fixes![fix!("kanspec features")],
+                        ));
+                    }
+                }
                 Op::AppendJsonl { .. }
                 | Op::MoveDir { .. }
                 | Op::WriteGenerated { .. }
@@ -287,6 +314,9 @@ impl Plan {
                 | Op::CreateEntity { entity, .. }
                 | Op::AppendSection { entity, .. } => {
                     out.insert(layout.path_for(entity));
+                }
+                Op::StampRule { spec, .. } => {
+                    out.insert(layout.spec(spec));
                 }
                 Op::AppendJsonl { path, .. } | Op::WriteGenerated { path, .. } => {
                     out.insert(path.clone());
