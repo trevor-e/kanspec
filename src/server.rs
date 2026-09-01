@@ -212,6 +212,14 @@ pub fn router(state: AppState) -> axum::Router {
         .route("/api/ticket/{id}/drop", post(post_drop))
         .route("/api/ticket/{id}/done", post(post_done))
         .route("/api/scan", post(post_scan))
+        // The review page. `/p/<id>` itself is served by the SPA fallback; these are the
+        // data and write endpoints behind it.
+        .route("/api/proposal/{id}", get(api_proposal))
+        .route("/api/proposal/{id}/comment", post(post_comment))
+        .route("/api/proposal/{id}/review", post(post_review))
+        .route("/api/proposal/{id}/approve", post(post_approve))
+        .route("/api/comment/{id}/reply", post(post_reply))
+        .route("/api/comment/{id}/resolve", post(post_resolve))
         .route("/events", get(events))
         .fallback(get(static_asset))
         .with_state(state)
@@ -472,6 +480,132 @@ async fn post_done(
     Ok(Json(r))
 }
 
+// ── the review page ──────────────────────────────────────────────────────────
+
+async fn api_proposal(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<crate::cmd::proposal::ProposalPage> {
+    Ok(Json(
+        blocking(&st, move |ctx| crate::cmd::proposal::page(ctx, &id)).await?,
+    ))
+}
+
+/// `{target, body}` — the browser POSTs the same shape the CLI takes, and it lands through
+/// `cmd::comment`, so the row a click writes is byte-identical to the row a command writes.
+/// That is invariant 7: there is no second write path to keep in sync.
+#[derive(Debug, Default, Deserialize)]
+pub struct CommentBody {
+    #[serde(default)]
+    pub target: String,
+    #[serde(default)]
+    pub body: String,
+}
+
+async fn post_comment(
+    State(st): State<AppState>,
+    Path(_id): Path<String>,
+    raw: String,
+) -> ApiResult<crate::cmd::comment::CommentReport> {
+    let b: CommentBody = body_of(&raw)?;
+    let out = blocking(&st, move |ctx| {
+        crate::cmd::comment::comment(
+            ctx,
+            &crate::cli::CommentArgs {
+                cmd: crate::cli::CommentCommand::Add {
+                    target: b.target.clone(),
+                    body: b.body.clone(),
+                },
+            },
+        )
+    })
+    .await?;
+    publish(&st, 0);
+    Ok(Json(out))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ReplyBody {
+    #[serde(default)]
+    pub body: String,
+}
+
+async fn post_reply(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    raw: String,
+) -> ApiResult<crate::cmd::comment::CommentReport> {
+    let b: ReplyBody = body_of(&raw)?;
+    let out = blocking(&st, move |ctx| {
+        crate::cmd::comment::comment(
+            ctx,
+            &crate::cli::CommentArgs {
+                cmd: crate::cli::CommentCommand::Reply {
+                    id: id.clone(),
+                    body: b.body.clone(),
+                },
+            },
+        )
+    })
+    .await?;
+    publish(&st, 0);
+    Ok(Json(out))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResolveBody {
+    #[serde(default)]
+    pub note: String,
+}
+
+async fn post_resolve(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+    raw: String,
+) -> ApiResult<crate::cmd::comment::CommentReport> {
+    let b: ResolveBody = body_of(&raw)?;
+    let out = blocking(&st, move |ctx| {
+        crate::cmd::comment::comment(
+            ctx,
+            &crate::cli::CommentArgs {
+                cmd: crate::cli::CommentCommand::Resolve {
+                    id: id.clone(),
+                    note: b.note.clone(),
+                },
+            },
+        )
+    })
+    .await?;
+    publish(&st, 0);
+    Ok(Json(out))
+}
+
+async fn post_review(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<crate::cmd::proposal::ReviewReport> {
+    let out = blocking(&st, move |ctx| {
+        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id: id.clone() })
+    })
+    .await?;
+    publish(&st, 0);
+    Ok(Json(out))
+}
+
+/// Approval from the page is still the gated verb: it refuses over unresolved threads
+/// exactly as the CLI does, because it IS the CLI's function.
+async fn post_approve(
+    State(st): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<crate::cmd::proposal::ApproveReport> {
+    let out = blocking(&st, move |ctx| {
+        crate::cmd::proposal::approve(ctx, &crate::cli::ApproveArgs { id: id.clone() })
+    })
+    .await?;
+    publish(&st, 0);
+    Ok(Json(out))
+}
+
 async fn post_scan(State(st): State<AppState>) -> ApiResult<crate::cmd::scan::ScanReport> {
     let r = blocking(&st, |ctx| crate::cmd::scan::scan(ctx, &quiet_scan())).await?;
     publish(&st, 1);
@@ -658,6 +792,12 @@ mod tests {
             "/api/ticket/{id}/drop",
             "/api/ticket/{id}/done",
             "/api/scan",
+            "/api/proposal/{id}",
+            "/api/proposal/{id}/comment",
+            "/api/proposal/{id}/review",
+            "/api/proposal/{id}/approve",
+            "/api/comment/{id}/reply",
+            "/api/comment/{id}/resolve",
             "/events",
         ];
         let mut r: Router<()> = Router::new();

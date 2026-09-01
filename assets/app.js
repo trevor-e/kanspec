@@ -13,6 +13,7 @@
 const $ = (id) => document.getElementById(id);
 
 const state = {
+  review: null,
   board: null,
   rules: null,       // fetched lazily, the first time the Rules tab is shown
   rulesStale: true,  // …and again whenever the board has moved under it
@@ -82,6 +83,10 @@ function copy(text) {
 // ── the network ─────────────────────────────────────────────────────────────
 
 async function refresh() {
+  // On `/p/<id>` the live signal means "the proposal or its threads moved", not "the board
+  // did" — refetching the board there would leave the page a snapshot of the moment it
+  // loaded while claiming to be live.
+  if (state.review) return loadReview(state.review.id);
   if (state.fetching) { state.pending = true; return; }
   state.fetching = true;
   try {
@@ -681,6 +686,306 @@ function applyTheme(t) {
   else document.documentElement.removeAttribute('data-theme');
 }
 
+// ── the review page ─────────────────────────────────────────────────────────
+//
+// `/p/<id>`. The proposal typeset properly, with each `[cN]`/`[pN]`/`[tN]` clickable and
+// its threads in a right-hand rail. Every write goes through the SAME `cmd::*` handler the
+// CLI calls, so a comment typed here and one typed in a terminal are the same bytes on
+// disk — the page is a view of the repo, never a second store.
+
+async function loadReview(id) {
+  try {
+    const res = await fetch('/api/proposal/' + encodeURIComponent(id), {
+      headers: { accept: 'application/json' },
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = (payload && payload.error) || {};
+      renderReviewError(id, err.message || ('HTTP ' + res.status), err.fix && err.fix[0]);
+      return;
+    }
+    state.review = payload;
+    renderReview();
+  } catch (e) {
+    renderReviewError(id, 'cannot reach the server: ' + e.message);
+  }
+}
+
+function renderReviewError(id, message, fix) {
+  const main = $('main');
+  clear(main);
+  const box = el('div', 'review-error');
+  box.appendChild(el('h1', null, id));
+  box.appendChild(el('p', null, message));
+  if (fix) box.appendChild(el('code', null, fix));
+  const back = el('a', 'pill ghost', '← the board');
+  back.href = '/';
+  box.appendChild(back);
+  main.appendChild(box);
+}
+
+// A review POST, with the CLI's own refusal envelope surfaced as a toast.
+async function reviewPost(path, body) {
+  try {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) {
+      const err = (payload && payload.error) || {};
+      toast(err.message || ('refused (HTTP ' + res.status + ')'), 'err', err.fix && err.fix[0]);
+      return false;
+    }
+    await loadReview(state.review.id);
+    return true;
+  } catch (e) {
+    toast('the request did not reach the server: ' + e.message, 'err');
+    return false;
+  }
+}
+
+function renderReview() {
+  const p = state.review;
+  if (!p) return;
+  document.title = p.id + ' · ' + p.title;
+  $('attention').hidden = true;
+  $('features').hidden = true;
+  for (const t of document.querySelectorAll('.tab')) t.setAttribute('aria-selected', 'false');
+
+  const main = $('main');
+  clear(main);
+  const wrap = el('div', 'review');
+
+  // ── the proposal, typeset ──
+  const doc = el('article', 'review-doc');
+  const head = el('header', 'review-head');
+  const crumb = el('a', 'crumb', '← the board');
+  crumb.href = '/';
+  head.appendChild(crumb);
+  head.appendChild(el('h1', null, p.title));
+
+  const meta = el('div', 'review-meta');
+  meta.appendChild(el('span', 'pill mono', p.id));
+  meta.appendChild(el('span', 'pill status-' + p.status, p.status));
+  for (const sp of p.specs) meta.appendChild(el('span', 'pill ghost', 'spec ' + sp));
+  if (p.approved) meta.appendChild(el('span', 'pill ok', 'approved ' + p.approved));
+  head.appendChild(meta);
+  doc.appendChild(head);
+
+  if (p.why) {
+    const why = el('section', 'review-sec');
+    why.appendChild(el('h2', null, 'Why'));
+    why.appendChild(el('p', 'prose', p.why));
+    doc.appendChild(why);
+  }
+
+  const groups = [
+    ['c', 'Changes'],
+    ['p', 'Prescriptions'],
+    ['t', 'Tickets'],
+  ];
+  for (const [kind, label] of groups) {
+    const items = p.items.filter((i) => i.kind === kind);
+    if (!items.length) continue;
+    const sec = el('section', 'review-sec');
+    sec.appendChild(el('h2', null, label));
+    for (const item of items) sec.appendChild(renderItem(item));
+    // DESIGN: the current spec text inlined under Changes, collapsible — so the delta is
+    // reviewed against today's truth without opening a file.
+    if (kind === 'c' && p.context.length) sec.appendChild(renderContext(p.context));
+    doc.appendChild(sec);
+  }
+  wrap.appendChild(doc);
+
+  // ── the rail ──
+  wrap.appendChild(renderRail(p));
+  main.appendChild(wrap);
+}
+
+function anchorOf(item) {
+  return item.id.proposal + '#' + item.kind + item.id.n;
+}
+
+function renderItem(item) {
+  const row = el('div', 'item' + (item.dispositioned ? ' done' : ''));
+  row.id = 'item-' + item.kind + item.id.n;
+  const tag = el('button', 'item-tag', '[' + item.kind + item.id.n + ']');
+  tag.title = 'comment on this item';
+  tag.onclick = () => startThread(anchorOf(item));
+  row.appendChild(tag);
+
+  const body = el('div', 'item-body');
+  body.appendChild(el('span', 'item-text', item.text));
+  if (item.badge) {
+    const cls = item.badge.startsWith('TEMP')
+      ? 'badge temp'
+      : item.badge.startsWith('UNTYPED')
+        ? 'badge untyped'
+        : 'badge promote';
+    body.appendChild(el('span', cls, item.badge));
+  }
+  if (item.ticket) {
+    const link = el('a', 'badge ticket', item.ticket);
+    link.href = '/t/' + item.ticket;
+    body.appendChild(link);
+  }
+  const open = item.threads.filter((t) => !t.resolved).length;
+  if (item.threads.length) {
+    const chip = el('button', 'badge threads' + (open ? ' open' : ''),
+      item.threads.length + (open ? ' · ' + open + ' open' : ' resolved'));
+    chip.onclick = () => {
+      const first = document.getElementById('thread-' + item.threads[0].id);
+      if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+    body.appendChild(chip);
+  }
+  row.appendChild(body);
+  return row;
+}
+
+function renderContext(context) {
+  const box = el('details', 'context');
+  const sum = el('summary', null, 'the specs as they stand today');
+  box.appendChild(sum);
+  for (const c of context) {
+    const b = el('div', 'context-spec');
+    b.appendChild(el('h3', null, c.spec + ' — ' + c.feature));
+    if (!c.rules.length) {
+      b.appendChild(el('p', 'dim', 'no rules yet'));
+    }
+    for (const r of c.rules) {
+      const line = el('div', 'context-rule');
+      line.appendChild(el('span', 'mono dim', '[' + r.anchor + ']'));
+      line.appendChild(el('span', null, ' ' + r.text));
+      b.appendChild(line);
+    }
+    box.appendChild(b);
+  }
+  return box;
+}
+
+function renderRail(p) {
+  const rail = el('aside', 'rail');
+  const head = el('div', 'rail-head');
+  head.appendChild(el('h2', null, 'Review'));
+  const n = p.unresolved;
+  head.appendChild(el('span', 'pill' + (n ? ' warn' : ' ok'),
+    n ? n + ' open' : 'nothing open'));
+  rail.appendChild(head);
+
+  // The gate, stated where the button is, so a refusal is never a surprise.
+  const act = el('div', 'rail-act');
+  if (p.status === 'draft') {
+    const b = el('button', 'pill', 'put up for review');
+    b.onclick = () => reviewPost('/api/proposal/' + p.id + '/review');
+    act.appendChild(b);
+  } else if (p.status === 'review') {
+    const b = el('button', 'pill' + (n ? ' ghost' : ' go'), 'approve');
+    b.disabled = false;
+    b.title = p.blocked_by ? 'refuses while ' + p.blocked_by : 'approve and mint the tickets';
+    b.onclick = () => reviewPost('/api/proposal/' + p.id + '/approve');
+    act.appendChild(b);
+    if (p.blocked_by) act.appendChild(el('span', 'dim', 'blocked by ' + p.blocked_by));
+  } else {
+    act.appendChild(el('span', 'dim', p.status));
+  }
+  rail.appendChild(act);
+
+  const threads = [];
+  for (const item of p.items) for (const t of item.threads) threads.push([item, t]);
+  if (!threads.length && !p.orphaned.length) {
+    rail.appendChild(el('p', 'dim', 'Click any [c1] to start a thread.'));
+  }
+  for (const [item, t] of threads) rail.appendChild(renderThread(t, anchorOf(item)));
+
+  if (p.orphaned.length) {
+    // Invariant 5: a deleted item does not delete the objection to it.
+    rail.appendChild(el('h3', 'orphan-head', 'Orphaned (' + p.orphaned.length + ')'));
+    rail.appendChild(el('p', 'dim', 'the item these point at is gone'));
+    for (const t of p.orphaned) rail.appendChild(renderThread(t, t.target, true));
+  }
+  return rail;
+}
+
+function renderThread(t, target, orphan) {
+  const box = el('div', 'thread' + (t.resolved ? ' resolved' : '') + (orphan ? ' orphan' : ''));
+  box.id = 'thread-' + t.id;
+  const head = el('div', 'thread-head');
+  head.appendChild(el('span', 'mono', target));
+  if (t.edited_since) head.appendChild(el('span', 'badge edited', 'edited since'));
+  box.appendChild(head);
+
+  if (t.quote) box.appendChild(el('blockquote', null, t.quote));
+  const first = el('div', 'msg');
+  first.appendChild(el('span', 'who', t.author || 'someone'));
+  first.appendChild(el('span', null, t.body));
+  box.appendChild(first);
+
+  for (const r of t.replies) {
+    const m = el('div', 'msg reply');
+    m.appendChild(el('span', 'who', r.by || 'someone'));
+    m.appendChild(el('span', null, r.body));
+    box.appendChild(m);
+  }
+
+  if (t.resolved !== null && t.resolved !== undefined) {
+    box.appendChild(el('div', 'resolution', '✓ ' + (t.resolved || 'resolved')));
+    return box;
+  }
+
+  const acts = el('div', 'thread-acts');
+  const reply = el('button', 'link', 'reply');
+  reply.onclick = () => promptThen('Reply', (v) =>
+    reviewPost('/api/comment/' + t.id + '/reply', { body: v }));
+  acts.appendChild(reply);
+  const res = el('button', 'link', 'resolve');
+  // The note is required by the CLI, and it is required here for the same reason: what
+  // changed IS the resolution.
+  res.onclick = () => promptThen('What changed? (required)', (v) =>
+    reviewPost('/api/comment/' + t.id + '/resolve', { note: v }));
+  acts.appendChild(res);
+  box.appendChild(acts);
+  return box;
+}
+
+function startThread(target) {
+  promptThen('Comment on ' + target, (v) =>
+    reviewPost('/api/proposal/' + state.review.id + '/comment', { target, body: v }));
+}
+
+// A tiny inline composer rather than `prompt()`: a modal dialog blocks the SSE refresh and
+// cannot be styled to match, and this page is where a human does their reading.
+function promptThen(label, run) {
+  const old = document.querySelector('.composer');
+  if (old) old.remove();
+  const box = el('div', 'composer');
+  box.appendChild(el('label', null, label));
+  const ta = document.createElement('textarea');
+  ta.rows = 3;
+  box.appendChild(ta);
+  const acts = el('div', 'composer-acts');
+  const ok = el('button', 'pill go', 'send');
+  const no = el('button', 'pill ghost', 'cancel');
+  ok.onclick = async () => {
+    const v = ta.value.trim();
+    if (!v) { ta.focus(); return; }
+    box.remove();
+    await run(v);
+  };
+  no.onclick = () => box.remove();
+  acts.appendChild(ok);
+  acts.appendChild(no);
+  box.appendChild(acts);
+  document.body.appendChild(box);
+  ta.focus();
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ok.click();
+    if (e.key === 'Escape') no.click();
+  });
+}
+
 function boot() {
   applyTheme(localStorage.getItem('ks.theme'));
 
@@ -724,6 +1029,16 @@ function boot() {
   $('scrim').onclick = closeDrawer;
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
   window.addEventListener('focus', refresh);
+
+  // `/p/<id>` is its own page, not a drawer over the board: reviewing is reading, and the
+  // board's columns behind it would be noise.
+  const rev = location.pathname.match(/^\/p\/([^/]+)$/);
+  if (rev) {
+    document.body.classList.add('reviewing');
+    loadReview(decodeURIComponent(rev[1]));
+    subscribe();
+    return;
+  }
 
   const deep = location.pathname.match(/^\/t\/([^/]+)$/);
   refresh().then(() => { if (deep) openTicket(decodeURIComponent(deep[1])); });

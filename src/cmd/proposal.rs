@@ -917,3 +917,170 @@ impl Render for AbandonReport {
             .write(w, st)
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The review page model — everything `/p/<id>` needs, assembled once
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The proposal typeset for review, with its threads already attached to the items they
+/// target and the CURRENT spec text inlined.
+///
+/// Assembled server-side, in one snapshot read, for the reason invariant 7 exists: the page
+/// is a pure view of the repo. If the browser had to stitch a proposal, its comments and
+/// the spec corpus together from three endpoints, it would be able to render a combination
+/// that never existed on disk.
+#[derive(Debug, Serialize)]
+pub struct ProposalPage {
+    pub id: ProposalId,
+    pub title: String,
+    pub status: crate::model::ProposalStatus,
+    pub specs: Vec<SpecName>,
+    pub approved: Option<String>,
+    pub created: String,
+    /// the `## Why` prose, verbatim
+    pub why: String,
+    pub items: Vec<PageItem>,
+    /// threads whose target item is gone — shown, never dropped
+    pub orphaned: Vec<crate::cmd::comment::Thread>,
+    pub unresolved: usize,
+    /// what `approve`/`close` would refuse with right now, or none
+    pub blocked_by: Option<String>,
+    /// the current rules of every spec this proposal names — the "review the delta against
+    /// today's truth without opening files" half
+    pub context: Vec<SpecContext>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PageItem {
+    pub id: ItemRef,
+    /// `c` | `p` | `t`
+    pub kind: char,
+    pub text: String,
+    /// `TEMP` / `PROMOTE → decision` — the badge the page draws
+    pub badge: Option<String>,
+    pub threads: Vec<crate::cmd::comment::Thread>,
+    /// a `[tN]` item's minted ticket, once `approve` has run
+    pub ticket: Option<TicketId>,
+    pub dispositioned: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SpecContext {
+    pub spec: SpecName,
+    pub feature: String,
+    pub rules: Vec<crate::model::Rule>,
+}
+
+/// Assemble [`ProposalPage`]. Read-only: it can refuse, and it can never write.
+pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
+    ctx.require_initialized()?;
+    let s = ctx.snapshot()?;
+    let p = open_proposal(ctx, &s, raw)?;
+
+    let ops = s.comments.get(&p.fm.id).map(Vec::as_slice).unwrap_or(&[]);
+    let (live, orphaned) = crate::cmd::comment::fold_threads(p, ops);
+
+    // The ledger records `p-7de2#t1 minted→t-9c41`, so a `[tN]` card can link its ticket
+    // without a second convention.
+    let ticket_of = |item: &ItemRef| -> Option<TicketId> {
+        let needle = format!("{item} minted→");
+        p.fm.ledger
+            .iter()
+            .find_map(|l| l.split_once(&needle).map(|(_, t)| t.trim().to_string()))
+            .and_then(|t| TicketId::parse(&t).ok())
+    };
+
+    let items = p
+        .items
+        .iter()
+        .map(|i| PageItem {
+            kind: i.id.kind.letter(),
+            // The `(promote: decision)` marker becomes the badge, so leaving it in the
+            // text too would render it twice on the card.
+            text: strip_marker(&i.text),
+            badge: match &i.prescription {
+                Some(crate::model::Prescription::TempUntil(t)) => Some(format!("TEMP until {t}")),
+                Some(crate::model::Prescription::Promote(k)) => {
+                    Some(format!("PROMOTE → {}", promote_word(*k)))
+                }
+                // An untyped prescription is a close blocker, so the page says so where the
+                // author can still fix it rather than at close time.
+                Some(crate::model::Prescription::Untyped) => Some("UNTYPED".to_string()),
+                None => None,
+            },
+            threads: live
+                .iter()
+                .filter(|t| t.target == i.id.to_string())
+                .cloned()
+                .collect(),
+            ticket: ticket_of(&i.id),
+            dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
+            id: i.id.clone(),
+        })
+        .collect();
+
+    let context = p
+        .fm
+        .specs
+        .iter()
+        .filter_map(|n| s.specs.get(n))
+        .map(|sp| SpecContext {
+            spec: sp.name.clone(),
+            feature: sp.fm.feature.clone(),
+            rules: sp.rules.clone(),
+        })
+        .collect();
+
+    let open = unresolved(&s, p);
+    Ok(ProposalPage {
+        title: p.fm.title.clone(),
+        status: p.fm.status,
+        specs: p.fm.specs.clone(),
+        approved: p.fm.approved.clone(),
+        created: p.fm.created.to_string(),
+        why: section(&p.body, "## Why"),
+        items,
+        orphaned,
+        unresolved: open,
+        blocked_by: (open > 0).then(|| {
+            format!(
+                "{open} unresolved review thread{}",
+                if open == 1 { "" } else { "s" }
+            )
+        }),
+        context,
+        id: p.fm.id.clone(),
+    })
+}
+
+/// `(promote: decision) rate-limit state in Redis` -> `rate-limit state in Redis`.
+fn strip_marker(text: &str) -> String {
+    let t = text.trim();
+    if !t.starts_with('(') {
+        return t.to_string();
+    }
+    match t.find(')') {
+        Some(i) => t[i + 1..].trim().to_string(),
+        None => t.to_string(),
+    }
+}
+
+/// The prose under one `## ` heading, up to the next one.
+fn section(body: &str, heading: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for line in body.lines() {
+        if line.trim_end() == heading {
+            inside = true;
+            continue;
+        }
+        if inside && line.starts_with("## ") {
+            break;
+        }
+        if inside {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.trim().to_string()
+}

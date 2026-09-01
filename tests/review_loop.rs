@@ -325,6 +325,51 @@ fn the_positional_fallback_refuses_rather_than_inventing_a_shipped_change() {
     assert!(!r.stderr.contains("[c1]"), "c1 had evidence: {}", r.stderr);
 }
 
+/// The review page is assembled server-side in one snapshot read, so the browser can never
+/// render a combination of proposal, threads and spec text that never existed on disk.
+#[test]
+fn the_review_page_carries_the_threads_the_badges_and_the_spec_as_it_stands() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\ncredential stuffing hit staging\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n- [p1] (promote: decision) state lives in Redis\n- [p2] (temp until t-31aa) keep the captcha\n\n## Tickets\n- [t1] Rate-limit login endpoint\n",
+    );
+    let spec = repo.read(".kanspec/specs/auth.md");
+    repo.write(
+        ".kanspec/specs/auth.md",
+        &format!("{spec}- [auth.jwt] Login issues a JWT valid 24h.\n"),
+    );
+    repo.ks(["comment", "add", &format!("{id}#c1"), "--body", "too broad"])
+        .ok();
+
+    let ctx = common::ctx_at(&repo.root);
+    let model = kanspec::cmd::proposal::page(&ctx, id).expect("the page assembles");
+
+    assert_eq!(model.why, "credential stuffing hit staging");
+    // The prescription markers become BADGES, and the text does not repeat them.
+    let p1 = model.items.iter().find(|i| i.kind == 'p' && i.id.n == 1).unwrap();
+    assert_eq!(p1.badge.as_deref(), Some("PROMOTE → decision"));
+    assert!(!p1.text.contains("promote:"), "{}", p1.text);
+    let p2 = model.items.iter().find(|i| i.kind == 'p' && i.id.n == 2).unwrap();
+    assert!(p2.badge.as_deref().unwrap().starts_with("TEMP"), "{p2:?}");
+
+    // The thread is attached to the item it targets, not to a flat list the page must sort.
+    let c1 = model.items.iter().find(|i| i.kind == 'c').unwrap();
+    assert_eq!(c1.threads.len(), 1);
+    assert_eq!(c1.threads[0].body, "too broad");
+    assert_eq!(model.unresolved, 1);
+    assert!(model.blocked_by.is_some(), "the gate is stated on the page");
+
+    // …and the spec as it stands today rides along, so the delta is reviewed against
+    // current truth without opening a file.
+    assert_eq!(model.context.len(), 1);
+    assert!(model.context[0].rules.iter().any(|r| r.anchor == "auth.jwt"));
+}
+
 /// `abandon` makes no claim that anything was dispositioned, so it must never stamp a
 /// ledger or move the directory — only `close` earns those.
 #[test]

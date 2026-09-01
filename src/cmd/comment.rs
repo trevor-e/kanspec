@@ -42,7 +42,7 @@ pub struct CommentsReport {
 
 /// `{target, quote, body}` is the whole payload an agent needs — self-locating with zero
 /// page context.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Thread {
     pub id: CommentId,
     pub target: String,
@@ -56,7 +56,7 @@ pub struct Thread {
     pub edited_since: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Reply {
     pub by: String,
     pub body: String,
