@@ -23,6 +23,14 @@ pub struct Config {
     pub sync: SyncMode,
     pub port: u16,
     pub branch_prefix: String,
+    /// Whether `start` creates a linked worktree without being asked.
+    ///
+    /// Off by default, and deliberately a REPO setting rather than a personal one: whether
+    /// worktrees suit a project is a property of the project — untracked `.env` files,
+    /// build output, `node_modules`, absolute paths baked into configs — so it is equally
+    /// true for every teammate and every agent working in it. One person works it out; the
+    /// committed config settles it for everyone.
+    pub worktree: bool,
     pub worktree_dir: PathBuf,
     pub lock_timeout_secs: u64,
     pub paths: Paths,
@@ -40,6 +48,7 @@ impl Default for Config {
             sync: SyncMode::Batch,
             port: 5757,
             branch_prefix: "ks/".into(),
+            worktree: false,
             worktree_dir: PathBuf::from("../kanspec-wt"),
             lock_timeout_secs: 5,
             paths: Paths::default(),
@@ -225,7 +234,11 @@ id_width         = {id_width}                 # hex digits in a minted id; widen
 sync             = "{sync}"           # batch | commit | branch(v0.4)
 port             = {port}              # `kanspec up` binds 127.0.0.1:<port>
 branch_prefix    = "{branch_prefix}"             # `start` creates <prefix><id>-<slug>
-worktree_dir     = "{worktree_dir}"  # `start --worktree` puts worktrees here
+worktree         = {worktree}                # `start` makes a worktree without being asked?
+                                 # off by default: worktrees suit some repos badly
+                                 # (untracked .env, build output, node_modules).
+                                 # Override either way with --worktree / --no-worktree.
+worktree_dir     = "{worktree_dir}"  # where those worktrees go
 lock_timeout_secs = {lock}                # how long a verb waits for the advisory lock
 
 [paths]
@@ -263,6 +276,7 @@ landcheck = {landcheck}         # the Stop hook. Opt-in; v0.2.
             sync = "batch",
             port = d.port,
             branch_prefix = d.branch_prefix,
+            worktree = d.worktree,
             worktree_dir = d.worktree_dir.display(),
             lock = d.lock_timeout_secs,
             features = d.paths.features.display(),
@@ -333,6 +347,14 @@ mod tests {
         assert_eq!(c.sync, d.sync);
         assert_eq!(c.port, d.port);
         assert_eq!(c.branch_prefix, d.branch_prefix);
+        // A knob nobody can find is a knob nobody has: `init` must write it, at its
+        // default, next to the directory it governs.
+        assert_eq!(c.worktree, d.worktree);
+        assert!(!d.worktree, "claiming in place stays the default");
+        assert!(
+            text.lines().any(|l| l.trim_start().starts_with("worktree ")),
+            "the scaffold must carry the worktree knob:\n{text}"
+        );
         assert_eq!(c.worktree_dir, d.worktree_dir);
         assert_eq!(c.lock_timeout_secs, d.lock_timeout_secs);
         assert_eq!(c.paths.features, d.paths.features);

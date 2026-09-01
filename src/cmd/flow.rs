@@ -182,7 +182,8 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     let base = ctx.git.resolve_main(&ctx.cfg.main)?;
     let branch = branch_name(ctx, &id, &t.fm.title);
     let existed = branch_exists(ctx, &branch);
-    let (wt_display, wt_abs) = if a.worktree {
+    let want_wt = wants_worktree(ctx, a);
+    let (wt_display, wt_abs) = if want_wt {
         let rel = worktree_rel(ctx, &id);
         let abs = ctx.repo.primary_root().join(&rel);
         (Some(rel), Some(abs))
@@ -646,8 +647,20 @@ fn primary_is_movable(ctx: &Ctx) -> bool {
 /// Deliberately carries no `→ fix`: the only command that would swap this claim for the
 /// worktree arrangement is `start --worktree`, and `start` on a `doing` ticket is an illegal
 /// transition. A fix line that refuses when you run it is worse than no fix line.
+/// `--worktree` / `--no-worktree` beat the repo's `worktree =` setting, which is off by
+/// default. The flags are the one-off; the config is what the repo has settled on.
+fn wants_worktree(ctx: &Ctx, a: &StartArgs) -> bool {
+    if a.worktree {
+        return true;
+    }
+    if a.no_worktree {
+        return false;
+    }
+    ctx.cfg.worktree
+}
+
 fn tracker_note(ctx: &Ctx, a: &StartArgs, branch: &str, base: &str) -> Option<String> {
-    if a.worktree || ctx.cfg.sync != crate::config::SyncMode::Batch {
+    if wants_worktree(ctx, a) || ctx.cfg.sync != crate::config::SyncMode::Batch {
         return None;
     }
     Some(format!(
@@ -1097,6 +1110,7 @@ mod tests {
         StartArgs {
             id: "t-9c41".into(),
             worktree,
+            no_worktree: false,
         }
     }
 

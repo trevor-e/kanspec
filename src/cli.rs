@@ -302,8 +302,11 @@ pub struct StartArgs {
     /// The ticket to claim
     pub id: String,
     /// Also create a linked worktree under [worktree_dir]
-    #[arg(long)]
+    #[arg(long, conflicts_with = "no_worktree")]
     pub worktree: bool,
+    /// Claim in place, even where the repo sets `worktree = true`
+    #[arg(long)]
+    pub no_worktree: bool,
 }
 
 #[derive(Args, Debug)]

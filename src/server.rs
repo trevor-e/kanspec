@@ -330,8 +330,10 @@ async fn api_ticket(
 
 #[derive(Debug, Default, Deserialize)]
 pub struct StartBody {
+    /// Absent means "whatever the repo's `worktree =` setting says" — the same three
+    /// states the CLI has, so a POST and the equivalent CLI verb still agree.
     #[serde(default)]
-    pub worktree: bool,
+    pub worktree: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -387,7 +389,8 @@ async fn post_start(
             ctx,
             &StartArgs {
                 id,
-                worktree: b.worktree,
+                worktree: b.worktree == Some(true),
+                no_worktree: b.worktree == Some(false),
             },
         )
     })
@@ -699,10 +702,14 @@ mod tests {
 
     #[test]
     fn an_empty_post_body_is_the_default_body() {
+        // Absent is None, not false: the board must be able to say "repo default"
+        // as well as "yes" and "no", the same three states the CLI has.
         let b: StartBody = body_of("").unwrap();
-        assert!(!b.worktree);
+        assert_eq!(b.worktree, None);
         let b: StartBody = body_of("{\"worktree\":true}").unwrap();
-        assert!(b.worktree);
+        assert_eq!(b.worktree, Some(true));
+        let b: StartBody = body_of("{\"worktree\":false}").unwrap();
+        assert_eq!(b.worktree, Some(false));
         let b: WhyBody = body_of("{\"why\":\"blocked on review\"}").unwrap();
         assert_eq!(b.why, "blocked on review");
         assert!(body_of::<StartBody>("not json").is_err());

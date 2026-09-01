@@ -1164,3 +1164,101 @@ fn the_git_add_dash_a_wedge_is_visible_and_the_printed_recovery_undoes_it() {
         "the primary never left main, so nothing drifted: {still}"
     );
 }
+
+/// `worktree =` in the repo's config sets what `start` does when nobody says otherwise.
+///
+/// It is a REPO setting on purpose: whether worktrees suit a project (untracked `.env`,
+/// build output, `node_modules`) is a fact about the project, equally true for every
+/// teammate and every agent in it — so one person works it out and the committed config
+/// settles it. The flags stay available for the one-off in either direction.
+#[test]
+fn the_repo_can_default_start_to_a_worktree_and_either_flag_still_wins() {
+    // ── default is OFF: the historical behaviour, unchanged ──────────────────
+    let repo = TestRepo::new();
+    let id = new_ticket(&repo, "claims in place by default");
+    repo.ks(["start", &id]).ok();
+    assert!(
+        !worktree_of(&repo, &id).is_dir(),
+        "with no setting and no flag, `start` must claim in place"
+    );
+    // ── worktree = true: `start` makes one unasked ───────────────────────────
+    let repo = TestRepo::new();
+    set_worktree_default(&repo, true);
+    let id = new_ticket(&repo, "claims into a worktree");
+    let r = repo.ks(["start", &id]).ok();
+    assert!(
+        worktree_of(&repo, &id).is_dir(),
+        "the repo asked for a worktree by default: {}",
+        r.stdout
+    );
+
+    // ── --no-worktree beats the repo default ─────────────────────────────────
+    let repo = TestRepo::new();
+    set_worktree_default(&repo, true);
+    let id = new_ticket(&repo, "opts out for this one claim");
+    repo.ks(["start", &id, "--no-worktree"]).ok();
+    assert!(
+        !worktree_of(&repo, &id).is_dir(),
+        "--no-worktree must beat `worktree = true`"
+    );
+
+    // ── --worktree beats an explicit false ───────────────────────────────────
+    let repo = TestRepo::new();
+    set_worktree_default(&repo, false);
+    let id = new_ticket(&repo, "opts in for this one claim");
+    repo.ks(["start", &id, "--worktree"]).ok();
+    assert!(
+        worktree_of(&repo, &id).is_dir(),
+        "--worktree must beat `worktree = false`"
+    );
+
+    // ── the two flags are mutually exclusive, and say so ─────────────────────
+    let repo = TestRepo::new();
+    let id = new_ticket(&repo, "cannot ask for both");
+    let both = repo.ks(["start", &id, "--worktree", "--no-worktree"]);
+    assert_eq!(both.code, 64, "{}{}", both.stdout, both.stderr);
+}
+
+/// Turning the default on must also silence the `git add -A` wedge warning, which exists
+/// only for the claim-in-place arrangement.
+#[test]
+fn the_wedge_warning_follows_the_effective_worktree_choice_not_the_flag() {
+    let repo = TestRepo::new();
+    set_worktree_default(&repo, true);
+    let id = new_ticket(&repo, "no wedge to warn about");
+    let r = repo.ks(["start", &id]).ok();
+    assert!(
+        !r.stdout.contains("git add -A"),
+        "a worktree claim has no tracker wedge to warn about: {}",
+        r.stdout
+    );
+
+    let repo = TestRepo::new();
+    let id = new_ticket(&repo, "wedge is real here");
+    let r = repo.ks(["start", &id]).ok();
+    assert!(
+        r.stdout.contains("git add -A"),
+        "claiming in place must still name the hazard: {}",
+        r.stdout
+    );
+}
+
+fn set_worktree_default(repo: &TestRepo, on: bool) {
+    let p = ".kanspec/config.toml";
+    let cfg = repo.read(p);
+    // Replace the key if it is there, append if not — a duplicate key is a TOML error,
+    // and the fixture writes a minimal config rather than the full `init` scaffold.
+    let next = match cfg.lines().find(|l| l.trim_start().starts_with("worktree ")) {
+        Some(line) => cfg.replace(line, &format!("worktree = {on}")),
+        None => format!("{cfg}\nworktree = {on}\n"),
+    };
+    repo.write(p, &next);
+}
+
+fn new_ticket(repo: &TestRepo, title: &str) -> String {
+    str_at(&json_in(repo, &repo.root, &["new", title]), "id").to_string()
+}
+
+fn worktree_of(repo: &TestRepo, id: &str) -> std::path::PathBuf {
+    repo.root.join("..").join("kanspec-wt").join(id)
+}
