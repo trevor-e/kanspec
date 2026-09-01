@@ -79,9 +79,11 @@ enum Needs {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Run {
     Yes,
-    /// v0.2: the handler is unwritten, so it cannot be asserted to *succeed* — but it is
-    /// still run, by `every_v02_arm_refuses_in_the_documented_exit_range` below. Round D
-    /// converted these from `todo!()` (exit **101**, no envelope) to a typed `Gate`.
+    /// The review-loop verbs. They are BUILT, but they need a proposal (and often an item
+    /// or a thread) that this fixture deliberately does not have, so they cannot be
+    /// asserted to *succeed* here — `tests/review_loop.rs` does that against a real one.
+    /// They are still run, by `every_v02_arm_answers_in_the_documented_exit_range` below,
+    /// because the property that matters at this seam is the ENVELOPE, not the verdict.
     V02,
     /// Hidden, but genuinely answerable in v0.1: bare `ci` reports the detected provider
     /// and an empty row set, which is the true answer for a repo whose per-ticket CI
@@ -282,9 +284,21 @@ fn nothing_is_excluded_from_the_run_matrix_without_a_reason() {
                 "{} is a hidden v0.2 arm but the matrix tries to run it",
                 case.path
             ),
+            // `V02` no longer means "hidden". The review-loop verbs ship; they are
+            // excluded from the SUCCESS matrix because they need a proposal (or an item,
+            // or a thread) this fixture deliberately does not build —
+            // `tests/review_loop.rs` drives them against a real one.
+            //
+            // Exactly two arms stay hidden, for two different reasons, and naming them
+            // here is what stops the set growing quietly again:
+            //   `landcheck` — a hook entry point whose exit code is load-bearing, not a
+            //                 verb a human types.
+            //   `ci`        — genuinely partial: bare `ci` reports the detected provider,
+            //                 but the per-ticket CI reader (homerunner journal + SSE, gh
+            //                 fallback) is not built, so `ci why` still refuses.
             Run::V02 | Run::V02Read => assert!(
-                hidden.contains(top),
-                "{} is excluded as v0.2 but the CLI ships it as v0.1",
+                !hidden.contains(top) || matches!(top, "landcheck" | "ci"),
+                "{} is hidden but is neither the Stop hook, the partial CI reader,                  nor a shipped verb",
                 case.path
             ),
             Run::Server => assert_eq!(
@@ -325,11 +339,13 @@ fn every_command_accepts_the_json_flag() {
 /// backtrace to stderr and *nothing* to stdout. Under `--json` that is the worst shape
 /// available: an agent gets an empty stdout, an undocumented code, and no fix.
 ///
-/// A verb kanspec has not built yet must REFUSE like any other gate. This runs all ten
-/// hidden arms for real — `V02Read` included, which is held to the weaker half (no panic,
-/// documented code, JSON on stdout) because bare `ci` answers honestly with exit 0.
+/// The arms are BUILT now, so this no longer asserts they refuse — it asserts the property
+/// that outlived the refusal and is the reason the test was written: whatever a verb
+/// decides, it decides it in the documented exit range and says so in a JSON envelope on
+/// stdout. A refusal here is an ordinary one (no proposal in this fixture), so it is held
+/// to invariant 9's fix list rather than to any wording.
 #[test]
-fn every_v02_arm_refuses_in_the_documented_exit_range() {
+fn every_v02_arm_answers_in_the_documented_exit_range() {
     let repo = TestRepo::new();
     seed(&repo);
 
@@ -349,7 +365,7 @@ fn every_v02_arm_refuses_in_the_documented_exit_range() {
         assert_ne!(
             r.code,
             101,
-            "`kanspec {}` panicked instead of refusing:\n{}",
+            "`kanspec {}` panicked instead of answering:\n{}",
             argv.join(" "),
             r.stderr
         );
@@ -371,24 +387,11 @@ fn every_v02_arm_refuses_in_the_documented_exit_range() {
             )
         });
 
-        if case.run == Run::V02Read {
-            // The honest-answer half: it succeeded, so it must not carry a refusal shape.
-            assert_eq!(r.code, 0, "`kanspec {}` -> {v}", argv.join(" "));
+        if r.code == 0 {
             assert!(v.is_object(), "`kanspec {}` -> {v}", argv.join(" "));
             continue;
         }
-
-        // An unwritten verb must not report SUCCESS — an exit 0 that did nothing is how a
-        // human comes to believe the verb worked (D-37's reasoning, applied to the set).
-        assert_eq!(
-            r.code,
-            1,
-            "`kanspec {}` should be a gate refusal (1), not {}",
-            argv.join(" "),
-            r.code
-        );
-        // …and it refuses through the same `--json` envelope as every other refusal,
-        // carrying the fix list invariant 9 demands.
+        // A refusal carries the envelope and the fix list invariant 9 demands.
         assert_eq!(
             v.get("ok"),
             Some(&serde_json::Value::Bool(false)),
@@ -403,27 +406,32 @@ fn every_v02_arm_refuses_in_the_documented_exit_range() {
             "`kanspec {}` refused with an empty fix list",
             argv.join(" ")
         );
-        // The message must say WHAT is missing, not merely that something is.
+        // And it says WHAT is wrong, not merely that something is.
         let msg = v["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            msg.contains("v0.2"),
-            "`kanspec {}` does not say it is unimplemented: {msg}",
+            !msg.trim().is_empty(),
+            "`kanspec {}` refused with an empty message",
             argv.join(" ")
         );
     }
 }
 
 /// `landcheck` is the Stop hook, and exit **2** is its sealed "block this session" answer.
-/// An unimplemented check that blocks every agent session from ending is strictly worse
-/// than one that says so, so the refusal must be a 1 — asserted separately from the loop
-/// above because this is the one arm where the wrong code has teeth.
+/// A session that is actually clean must never be blocked — a Stop hook that cries wolf is
+/// one a human switches off, and then it protects nothing.
+///
+/// The complement (a real disagreement DOES mint a 2) is covered where the disagreement can
+/// be staged; here the point is the false positive.
 #[test]
-fn the_unimplemented_landcheck_never_blocks_a_session() {
+fn landcheck_never_blocks_a_clean_session() {
     let repo = TestRepo::new();
     seed(&repo);
     let r = repo.ks(["landcheck", "--json"]);
-    assert_ne!(r.code, 2, "an unwritten landcheck must never mint a block");
-    assert_eq!(r.code, 1, "stderr:\n{}", r.stderr);
+    assert_ne!(r.code, 2, "a clean session must never be blocked:\n{}", r.stdout);
+    assert_eq!(r.code, 0, "stderr:\n{}", r.stderr);
+    // Opt-in per repo (D-14): with the hook off it is silent as well as clean.
+    let dry = repo.ks(["landcheck", "--dry-run", "--json"]);
+    assert_ne!(dry.code, 2, "--dry-run must never mint a block");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

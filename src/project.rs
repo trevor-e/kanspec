@@ -340,6 +340,7 @@ mod tests {
                 anchor: "auth.lockout".into(),
                 text: "5 failed logins lock the account.".into(),
                 provenance: vec![ProposalId::parse("p-7de2").unwrap()],
+                items: Vec::new(),
                 line: 1,
             }],
         }

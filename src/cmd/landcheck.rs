@@ -10,17 +10,12 @@
 //!
 //! Owner: **V2**, v0.2.
 
-// Wave-0 skeleton. The bodies below are unwritten; these two allows exist ONLY so the
-// skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
-#![allow(unused_variables, dead_code)]
-
 use serde::Serialize;
 
 use crate::cli::LandcheckArgs;
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::Result;
 use crate::out::{Render, Style};
-use crate::{fix, fixes};
 
 /// Private field: only this file can mint one, so `grep -r 'BlockToken'` is a complete
 /// audit of every route to exit 2.
@@ -66,36 +61,93 @@ impl LandcheckReport {
     }
 }
 
-/// V2 lands here: block when a committed diff exists but the claimed ticket had no update
-/// this session, when unresolved comments target a proposal this session edited, or when
-/// `done` skipped the knowledge check; `--dry-run` reports without minting a `BlockToken`;
-/// honour `[hooks] landcheck`.
+/// The Stop hook: exit 2 while the tracker disagrees with the working tree.
 ///
-/// **Until then it REFUSES rather than panics** (round-D hardening). A `todo!()` here
-/// exited 101 with a backtrace and no `--json` envelope — outside §2.1's documented code
-/// set entirely, and read by a wrapper script as a crashed tool rather than a tool that
-/// declined. It must never accidentally exit 2 either: 2 is the sealed Stop-hook block,
-/// and an unimplemented check that blocks every agent session from ending is strictly
-/// worse than one that says so. `KsError::Gate` exits 1.
+/// It blocks on facts the session can still act on, and each reason names the verb that
+/// clears it — a block with no stated exit is a loop, which is the failure mode a Stop hook
+/// has to avoid above all others.
+///
+/// Two blocking conditions, both COMPUTED rather than asserted:
+/// 1. **git says the work landed and nobody closed the ticket** — `in_main`, the exact
+///    "did it merge?" ambiguity kanspec exists to kill.
+/// 2. **unresolved review threads on a proposal a live ticket implements** — feedback must
+///    be un-ignorable work, not scrollback.
+///
+/// Deliberately NOT here: dwell and staleness tripwires. Those are `status` lines a human
+/// judges, and a Stop hook that blocks on "this has been open a while" blocks on something
+/// the session cannot clear, which is how a hook earns being switched off.
+///
+/// `--dry-run` reports the same reasons and mints no [`BlockToken`], so a human can ask
+/// "what would block me?" without the answer being an exit code.
+///
+/// Config-gated (D-14): with `[hooks] landcheck = false` this is a clean exit 0 and says
+/// nothing, because a hook the repo opted out of must not editorialise.
 pub fn landcheck(ctx: &Ctx, a: &LandcheckArgs) -> Result<LandcheckReport> {
-    Err(KsError::gate(
-        "landcheck_v02",
-        "`landcheck` lands in v0.2 — kanspec will not report a session clean by declining \
-         to look at it",
-        fixes![
-            fix!("set [hooks] landcheck = false in .kanspec/config.toml"),
-            fix!("{} status", ctx.invoked_as),
-            fix!("{} doctor", ctx.invoked_as),
-        ],
-    ))
+    ctx.require_initialized()?;
+    if !ctx.cfg.hooks.landcheck && !a.dry_run {
+        return Ok(LandcheckReport {
+            blocked: false,
+            reasons: Vec::new(),
+            next: Vec::new(),
+            status: Status::Ok,
+        });
+    }
+    let s = ctx.snapshot()?;
+    let mut reasons = Vec::new();
+
+    // 1 — git says it landed; the ticket says otherwise.
+    for t in s.tickets.values() {
+        if crate::derive::in_main(&s, t).is_some() {
+            reasons.push(format!(
+                "{} is in main and still open → {} done {}",
+                t.fm.id, ctx.invoked_as, t.fm.id
+            ));
+        }
+    }
+
+    // 2 — review feedback nobody answered, on a proposal this session is implementing.
+    for t in s.tickets.values() {
+        if t.fm.state.terminal() {
+            continue;
+        }
+        let Some(pid) = &t.fm.proposal else { continue };
+        let Some(p) = s.proposals.get(pid) else {
+            continue;
+        };
+        let open = crate::cmd::proposal::unresolved(&s, p);
+        if open > 0 {
+            reasons.push(format!(
+                "{pid} has {open} unresolved review thread{} → {} comments {pid} --unresolved",
+                if open == 1 { "" } else { "s" },
+                ctx.invoked_as
+            ));
+        }
+    }
+    reasons.sort();
+    reasons.dedup();
+
+    let blocked = !reasons.is_empty();
+    let next = if blocked {
+        vec![format!("{} status", ctx.invoked_as)]
+    } else {
+        Vec::new()
+    };
+    Ok(LandcheckReport {
+        blocked,
+        reasons,
+        next,
+        // `--dry-run` answers the question without BEING the answer: no `BlockToken` is
+        // minted, so the seal still means "this exit 2 came from a real Stop-hook block".
+        status: match (blocked, a.dry_run) {
+            (true, false) => Status::Block(BlockToken(())),
+            (true, true) => Status::Violation,
+            (false, _) => Status::Ok,
+        },
+    })
 }
 
 impl Render for LandcheckReport {
-    /// V2 prints nothing when clean; else one line per reason, each with its verb.
-    ///
-    /// Unreachable while `landcheck` above refuses — the handler is this type's only
-    /// constructor — but written as a real body rather than a `todo!()` so that reaching it
-    /// is a wrong answer instead of a panic.
+    /// Prints nothing when clean; else one line per reason, each with its verb.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         for r in &self.reasons {
             crate::out::Line::new(crate::out::glyph::FIX, r.as_str()).write(w, st)?;

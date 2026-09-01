@@ -545,6 +545,7 @@ mod tests {
                     anchor: a.to_string(),
                     text: t.to_string(),
                     provenance: vec![ProposalId::parse("p-7de2").unwrap()],
+                    items: Vec::new(),
                     line: i + 1,
                 })
                 .collect(),

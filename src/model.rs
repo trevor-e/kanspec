@@ -131,6 +131,15 @@ pub struct Rule {
     pub text: String,
     /// the `{p-xxxx}` tokens: provenance back to the proposal that shipped this rule
     pub provenance: Vec<ProposalId>,
+    /// the `{p-xxxx#c1}` tokens: provenance back to the exact proposal ITEM this rule
+    /// satisfies. Optional by design — a bullet may name only its proposal — but when it is
+    /// there `close` uses it instead of guessing which Change a rule shipped.
+    ///
+    /// An item token also contributes its proposal to `provenance` above, so every existing
+    /// consumer (the feature map's `last_shipped`, `rules --audit`, `why`) sees it without
+    /// knowing this field exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<ItemRef>,
     pub line: usize,
 }
 

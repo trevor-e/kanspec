@@ -176,35 +176,30 @@ pub enum Command {
     /// The agent working set, injected by hooks (~1.5k tokens)
     Prime(PrimeArgs),
 
-    // ── PROPOSALS & REVIEW (v0.2) ────────────────────────────────────────────
+    // ── PROPOSALS & REVIEW ───────────────────────────────────────────────────
     /// Scaffold a one-page proposal
-    #[command(hide = true)]
     Propose(ProposeArgs),
     /// draft -> review; prints the review page URL
-    #[command(hide = true)]
     Review(ReviewArgs),
     /// Read review threads
-    #[command(hide = true)]
     Comments(CommentsArgs),
     /// Add, reply to, or resolve a review thread
-    #[command(hide = true)]
     Comment(CommentArgs),
     /// Approve a proposal — refuses while threads are unresolved
-    #[command(hide = true)]
     Approve(ApproveArgs),
     /// THE close gate: refuses until every [cN]/[pN] item is dispositioned
-    #[command(hide = true)]
     Close(CloseArgs),
     /// Abandon a proposal
-    #[command(hide = true)]
     Abandon(AbandonArgs),
     /// Promote a proposal prescription into a standing record
-    #[command(hide = true)]
     Promote(PromoteArgs),
     /// Expire a proposal prescription
-    #[command(hide = true)]
     Expire(ExpireArgs),
     /// The Stop hook: exit 2 while the tracker disagrees with the working tree
+    ///
+    /// Stays hidden: `setup` installs it as a hook entry point, it is opt-in per repo
+    /// (`[hooks] landcheck`), and it is the only command whose exit code is load-bearing —
+    /// not a verb a human is meant to reach for from `--help`.
     #[command(hide = true)]
     Landcheck(LandcheckArgs),
 }

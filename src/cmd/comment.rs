@@ -7,41 +7,22 @@
 //!
 //! Owner: **V2**, v0.2.
 
-// Wave-0 skeleton. The bodies below are unwritten; these two allows exist ONLY so the
-// skeleton compiles clippy-clean and MUST be deleted by V2 when the bodies land.
-#![allow(unused_variables, dead_code)]
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cli::{CommentArgs, CommentsArgs, ExpireArgs, PromoteArgs};
+use crate::cli::{CommentArgs, CommentCommand, CommentsArgs, ExpireArgs, PromoteArgs};
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
-use crate::ids::{CommentId, ItemRef};
-use crate::out::{Render, Style};
+use crate::ids::{CommentId, ItemRef, ProposalId};
+use crate::model::{CommentOp, CommentOpKind, Proposal, Snapshot};
+use crate::out::{glyph, Color, Line, Render, Style};
+use crate::plan::{Op, Plan};
+use crate::store::Store;
 use crate::{fix, fixes};
 
-/// One wording for "this verb is v0.2", mirroring `ci::not_yet_v02` (S7's precedent).
-///
-/// **Round-D hardening.** These handlers were `todo!()`, so every hidden v0.2 arm exited
-/// **101** with a backtrace and no `--json` envelope — outside §2.1's documented code set
-/// (0/1/2/64/69/70). A `Gate` exits 1 and carries its fix list.
-fn not_yet_v02(ctx: &Ctx, verb: &str, what: &str) -> KsError {
-    KsError::gate(
-        "comment_v02",
-        format!("`{verb}` lands in v0.2 — {what}"),
-        fixes![
-            fix!("{} board", ctx.invoked_as),
-            fix!("{} decide \"...\" --scope \"src/**\"", ctx.invoked_as),
-            fix!("{} quirk add \"...\" --paths \"src/**\"", ctx.invoked_as),
-        ],
-    )
-}
-
-/// The shared placeholder rendering for the reports below. Every one of them is
-/// unreachable while its handler refuses — the handler is the type's only constructor — but
-/// a real body means reaching one is a wrong answer rather than a panic, and each keeps its
-/// intended transcript in the doc comment above it for V2 to write.
+/// The shared `→ next` tail every report in this module ends with.
 fn next_lines(next: &[String], w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
     for n in next {
         crate::out::Line::new(crate::out::glyph::FIX, "next")
@@ -82,25 +63,230 @@ pub struct Reply {
     pub at: DateTime<Utc>,
 }
 
-/// V2: read comments.jsonl, dedupe by `(id, op, at)` (D-19), fold ops into threads, filter
-/// by `--unresolved`.
+/// Which proposals a read is about. `None` means every open one.
 ///
-/// It refuses rather than printing an empty thread list: "no comments" and "kanspec cannot
-/// read comments yet" are different facts, and an agent told the first would stop looking.
+/// A ticket id is accepted and resolved through its `proposal:` field, because "show me the
+/// review feedback on what I am working on" is the question an agent standing on a ticket
+/// actually has, and making it retype the proposal id is friction with no information in it.
+fn scope_of(ctx: &Ctx, s: &Snapshot, id: Option<&str>) -> Result<Vec<ProposalId>> {
+    let Some(raw) = id else {
+        return Ok(s.proposals.keys().cloned().collect());
+    };
+    if let Ok(pid) = ProposalId::parse(raw) {
+        if !s.proposals.contains_key(&pid) {
+            // A CLOSED proposal is a different refusal from a missing one: its threads are
+            // real history, they are just not reachable — closed proposals bind nothing.
+            if s.closed_ids.contains(pid.as_str()) {
+                return Err(KsError::gate(
+                    "proposal_closed",
+                    format!("{pid} is closed — closed proposals bind nothing"),
+                    fixes![fix!("{} rules", ctx.invoked_as)],
+                ));
+            }
+            return Err(KsError::not_found(
+                "proposal",
+                pid.to_string(),
+                fixes![fix!("{} board", ctx.invoked_as)],
+            ));
+        }
+        return Ok(vec![pid]);
+    }
+    let tid = crate::ids::TicketId::parse(raw)?;
+    let t = s.ticket(&tid)?;
+    match &t.fm.proposal {
+        Some(pid) if s.proposals.contains_key(pid) => Ok(vec![pid.clone()]),
+        _ => Err(KsError::not_found(
+            "proposal for ticket",
+            tid.to_string(),
+            fixes![fix!("{} show {tid}", ctx.invoked_as)],
+        )),
+    }
+}
+
+/// Fold one proposal's op log into threads, splitting the ones whose target item is gone.
+///
+/// The ops arrive from `store::read_comments` already deduped by `(id, op, at)` and sorted
+/// by time, so this is a pure regroup: the first `comment` row seeds a thread, `reply` rows
+/// append in order, and the last `resolve` row closes it.
+///
+/// A `reply`/`resolve` whose `comment` row is missing is DROPPED rather than synthesised
+/// into a headless thread — with `merge=union` a half-arrived thread is a normal transient
+/// state of the file, and inventing a thread with no body would render as feedback nobody
+/// wrote.
+pub fn fold_threads(p: &Proposal, ops: &[CommentOp]) -> (Vec<Thread>, Vec<Thread>) {
+    let mut by_id: BTreeMap<String, Thread> = BTreeMap::new();
+    let mut order: Vec<String> = Vec::new();
+
+    for op in ops {
+        let key = op.id.as_str().to_string();
+        match op.op {
+            CommentOpKind::Comment => {
+                let Some(target) = op.target.clone() else {
+                    continue;
+                };
+                if by_id.contains_key(&key) {
+                    continue;
+                }
+                order.push(key.clone());
+                by_id.insert(
+                    key,
+                    Thread {
+                        id: op.id.clone(),
+                        target,
+                        quote: op.quote.clone(),
+                        body: op.body.clone().unwrap_or_default(),
+                        author: op.author.clone(),
+                        at: op.at,
+                        replies: Vec::new(),
+                        resolved: None,
+                        edited_since: false,
+                    },
+                );
+            }
+            CommentOpKind::Reply => {
+                if let Some(t) = by_id.get_mut(&key) {
+                    t.replies.push(Reply {
+                        by: op.by.clone().or_else(|| op.author.clone()).unwrap_or_default(),
+                        body: op.body.clone().unwrap_or_default(),
+                        at: op.at,
+                    });
+                }
+            }
+            CommentOpKind::Resolve => {
+                if let Some(t) = by_id.get_mut(&key) {
+                    // The note is the whole point of a resolve, so an empty one still
+                    // resolves the thread but renders as the honest empty string rather
+                    // than leaving it open and losing the act.
+                    t.resolved = Some(op.note.clone().unwrap_or_default());
+                }
+            }
+        }
+    }
+
+    let (mut live, mut orphaned) = (Vec::new(), Vec::new());
+    for key in order {
+        let Some(mut t) = by_id.remove(&key) else {
+            continue;
+        };
+        let item = ItemRef::parse(&t.target)
+            .ok()
+            .and_then(|r| p.items.iter().find(|i| i.id == r));
+        match item {
+            Some(i) => {
+                // Invariant 5: the stored quote is what makes "edited since — view diff"
+                // detectable without a second store. Trimmed on both sides so a reflowed
+                // bullet does not read as an edit.
+                t.edited_since = t
+                    .quote
+                    .as_deref()
+                    .is_some_and(|q| q.trim() != i.text.trim());
+                live.push(t);
+            }
+            // The item is gone. The thread is NOT dropped — it moves to a visible tray, so
+            // deleting a bullet cannot quietly delete the objection to it.
+            None => orphaned.push(t),
+        }
+    }
+    (live, orphaned)
+}
+
+/// Read comments.jsonl, fold ops into threads, filter by `--unresolved`.
 pub fn comments(ctx: &Ctx, a: &CommentsArgs) -> Result<CommentsReport> {
-    Err(not_yet_v02(
-        ctx,
-        "comments",
-        "the comment store lands in v0.2 — an empty thread list here would read as \
-         `no open threads`, which is a different fact",
-    ))
+    ctx.require_initialized()?;
+    let s = ctx.snapshot()?;
+    let scope = scope_of(ctx, &s, a.id.as_deref())?;
+
+    let (mut threads, mut orphaned) = (Vec::new(), Vec::new());
+    for pid in &scope {
+        let Some(p) = s.proposals.get(pid) else {
+            continue;
+        };
+        let ops = s.comments.get(pid).map(Vec::as_slice).unwrap_or(&[]);
+        let (live, orphan) = fold_threads(p, ops);
+        threads.extend(live);
+        orphaned.extend(orphan);
+    }
+    if a.unresolved {
+        threads.retain(|t| t.resolved.is_none());
+        // An orphaned thread nobody resolved is exactly the kind that gets lost, so
+        // `--unresolved` narrows the tray the same way rather than hiding it.
+        orphaned.retain(|t| t.resolved.is_none());
+    }
+
+    let open = threads.iter().filter(|t| t.resolved.is_none()).count();
+    let next = if open > 0 {
+        vec![format!("{} comment resolve <cm-id> --note \"...\"", ctx.invoked_as)]
+    } else {
+        Vec::new()
+    };
+    Ok(CommentsReport {
+        threads,
+        orphaned,
+        next,
+    })
 }
 
 impl Render for CommentsReport {
-    /// V2: one block per thread — target, quote, body, replies — then the orphan tray.
+    /// One block per thread — target, quote, body, replies — then the orphan tray.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+        if self.threads.is_empty() && self.orphaned.is_empty() {
+            writeln!(w, " ✓ no review threads")?;
+            return Ok(());
+        }
+        for t in &self.threads {
+            thread_block(t, w, st)?;
+        }
+        if !self.orphaned.is_empty() {
+            // A tray with a heading, because the whole point is that these are visible.
+            writeln!(
+                w,
+                "\n ORPHANED ({}) — the item these threads point at is gone",
+                self.orphaned.len()
+            )?;
+            for t in &self.orphaned {
+                thread_block(t, w, st)?;
+            }
+        }
         next_lines(&self.next, w, st)
     }
+}
+
+fn thread_block(t: &Thread, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+    let g = if t.resolved.is_some() {
+        glyph::OK
+    } else {
+        '·'
+    };
+    let mut head = Line::new(g, t.target.clone()).id(t.id.clone());
+    if let Some(a) = &t.author {
+        head = head.dim(a.clone());
+    }
+    head.write(w, st)?;
+    if let Some(q) = &t.quote {
+        let tail = if t.edited_since {
+            "  (edited since)"
+        } else {
+            ""
+        };
+        writeln!(
+            w,
+            "   {}{}",
+            crate::out::paint(&format!("“{q}”"), Color::Dim, st.color),
+            tail
+        )?;
+    }
+    writeln!(w, "   {}", t.body)?;
+    for r in &t.replies {
+        writeln!(w, "   ↳ {}: {}", r.by, r.body)?;
+    }
+    if let Some(note) = &t.resolved {
+        writeln!(
+            w,
+            "   {}",
+            crate::out::paint(&format!("resolved: {note}"), Color::Green, st.color)
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -111,19 +297,228 @@ pub struct CommentReport {
     pub next: Vec<String>,
 }
 
-/// V2: `Op::AppendJsonl` one row; `resolve` requires `--note`, which is what changed.
-pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
-    Err(not_yet_v02(
-        ctx,
-        "comment",
-        "there is nothing to comment on until `propose` and the review page land in v0.2",
+/// Find the proposal that owns thread `cm`, and the thread's target — a reply names only a
+/// thread id, so the file it appends to has to be looked up.
+fn thread_home<'a>(
+    ctx: &Ctx,
+    s: &'a Snapshot,
+    cm: &CommentId,
+) -> Result<(&'a Proposal, String, bool)> {
+    for (pid, ops) in &s.comments {
+        let Some(seed) = ops
+            .iter()
+            .find(|o| o.id == *cm && o.op == CommentOpKind::Comment)
+        else {
+            continue;
+        };
+        let Some(p) = s.proposals.get(pid) else {
+            continue;
+        };
+        let resolved = ops
+            .iter()
+            .any(|o| o.id == *cm && o.op == CommentOpKind::Resolve);
+        return Ok((p, seed.target.clone().unwrap_or_default(), resolved));
+    }
+    Err(KsError::not_found(
+        "thread",
+        cm.to_string(),
+        fixes![fix!("{} comments", ctx.invoked_as)],
     ))
 }
 
+/// What a `comment` invocation resolved to before the lock. The `CommentId` for an `add`
+/// is deliberately absent: ids are minted by the `Minter` INSIDE `transact`, against the
+/// id set reloaded under the lock, so a concurrent write cannot hand out the same one.
+struct Prepared {
+    pid: ProposalId,
+    path: std::path::PathBuf,
+    kind: CommentOpKind,
+    /// present on `add` — the anchor and the quote captured at comment time
+    target: Option<String>,
+    quote: Option<String>,
+    body: Option<String>,
+    note: Option<String>,
+    /// present on `reply`/`resolve` — the thread being appended to
+    existing: Option<CommentId>,
+    /// what the report shows as the thread's target, for every op kind
+    shown_target: Option<String>,
+}
+
+fn prepare(ctx: &Ctx, s: &Snapshot, a: &CommentArgs) -> Result<Prepared> {
+    let missing_proposal = |pid: &ProposalId| {
+        if s.closed_ids.contains(pid.as_str()) {
+            KsError::gate(
+                "proposal_closed",
+                format!("{pid} is closed — closed proposals bind nothing"),
+                fixes![fix!("{} rules", ctx.invoked_as)],
+            )
+        } else {
+            KsError::not_found(
+                "proposal",
+                pid.to_string(),
+                fixes![fix!("{} board", ctx.invoked_as)],
+            )
+        }
+    };
+
+    match &a.cmd {
+        CommentCommand::Add { target, body } => {
+            let item = ItemRef::parse(target)?;
+            let p = s
+                .proposals
+                .get(&item.proposal)
+                .ok_or_else(|| missing_proposal(&item.proposal))?;
+            // A thread on an item that does not exist would be born orphaned. Refusing
+            // here is what keeps the orphan tray meaningful: everything in it USED to
+            // point at something.
+            let found = p.items.iter().find(|i| i.id == item).ok_or_else(|| {
+                KsError::not_found(
+                    "item",
+                    item.to_string(),
+                    fixes![fix!("{} comments {}", ctx.invoked_as, item.proposal)],
+                )
+            })?;
+            Ok(Prepared {
+                pid: item.proposal.clone(),
+                path: ctx.layout.comments_jsonl(&p.dir),
+                kind: CommentOpKind::Comment,
+                target: Some(item.to_string()),
+                // Invariant 5: the item's text AT COMMENT TIME. This is the whole
+                // mechanism behind "edited since" and the orphan tray.
+                quote: Some(found.text.clone()),
+                body: Some(body.clone()),
+                note: None,
+                existing: None,
+                shown_target: Some(item.to_string()),
+            })
+        }
+        CommentCommand::Reply { id, body } => {
+            let cm = CommentId::parse(id)?;
+            let (p, target, _) = thread_home(ctx, s, &cm)?;
+            Ok(Prepared {
+                pid: p.fm.id.clone(),
+                path: ctx.layout.comments_jsonl(&p.dir),
+                kind: CommentOpKind::Reply,
+                target: None,
+                quote: None,
+                body: Some(body.clone()),
+                note: None,
+                existing: Some(cm),
+                shown_target: Some(target),
+            })
+        }
+        CommentCommand::Resolve { id, note } => {
+            let cm = CommentId::parse(id)?;
+            let (p, target, already) = thread_home(ctx, s, &cm)?;
+            if already {
+                // Not a silent second row: a resolve that changed nothing must not read
+                // as one that did.
+                return Err(KsError::conflict(
+                    format!("{cm} is already resolved"),
+                    fixes![fix!("{} comments --unresolved", ctx.invoked_as)],
+                ));
+            }
+            Ok(Prepared {
+                pid: p.fm.id.clone(),
+                path: ctx.layout.comments_jsonl(&p.dir),
+                kind: CommentOpKind::Resolve,
+                target: None,
+                quote: None,
+                body: None,
+                note: Some(note.clone()),
+                existing: Some(cm),
+                shown_target: Some(target),
+            })
+        }
+    }
+}
+
+/// `Op::AppendJsonl` one row; `resolve` requires `--note`, which is what changed.
+///
+/// Every row is written through the same store transaction the CLI and the server both go
+/// through (invariant 7) — the browser's POST is not a second write path, it calls this.
+pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
+    ctx.require_initialized()?;
+    let s = ctx.snapshot()?;
+    let prep = prepare(ctx, &s, a)?;
+
+    let mut minted: Option<CommentId> = None;
+    Store::open(ctx).transact(None, &ctx.invocation(), |_s, m| {
+        let id = match &prep.existing {
+            Some(cm) => cm.clone(),
+            None => m.comment(prep.body.as_deref().unwrap_or_default())?,
+        };
+        let row = CommentOp {
+            id: id.clone(),
+            op: prep.kind,
+            target: prep.target.clone(),
+            quote: prep.quote.clone(),
+            body: prep.body.clone(),
+            note: prep.note.clone(),
+            // `author` seeds a thread, `by` marks a later act on it — the two roles the
+            // DESIGN.md JSONL keeps apart.
+            author: matches!(prep.kind, CommentOpKind::Comment).then(|| ctx.actor.label()),
+            by: (!matches!(prep.kind, CommentOpKind::Comment)).then(|| ctx.actor.label()),
+            at: ctx.now,
+        };
+        let line = serde_json::to_string(&row).map_err(|e| {
+            KsError::internal(anyhow::anyhow!("cannot encode the comment row: {e}"))
+        })?;
+        minted = Some(id);
+        Ok(Plan::of(vec![Op::AppendJsonl {
+            path: prep.path.clone(),
+            line,
+        }]))
+    })?;
+    let id = minted
+        .ok_or_else(|| KsError::internal(anyhow::anyhow!("`comment` minted no thread id")))?;
+
+    // Re-read so the open count describes the file as it now is.
+    let after = ctx.snapshot()?;
+    let pid = prep.pid;
+    let open = after
+        .proposals
+        .get(&pid)
+        .map(|p| {
+            let ops = after.comments.get(&pid).map(Vec::as_slice).unwrap_or(&[]);
+            let (live, orphan) = fold_threads(p, ops);
+            live.iter()
+                .chain(orphan.iter())
+                .filter(|t| t.resolved.is_none())
+                .count()
+        })
+        .unwrap_or(0);
+
+    Ok(CommentReport {
+        id,
+        op: match prep.kind {
+            CommentOpKind::Comment => "comment",
+            CommentOpKind::Reply => "reply",
+            CommentOpKind::Resolve => "resolve",
+        },
+        target: prep.shown_target,
+        next: if open > 0 {
+            vec![format!("{} comments {pid} --unresolved", ctx.invoked_as)]
+        } else {
+            vec![format!("{} approve {pid}", ctx.invoked_as)]
+        },
+    })
+}
+
 impl Render for CommentReport {
-    /// V2: `▸ cm-88f1 resolved` plus the remaining open-thread count.
+    /// `▸ cm-88f1 resolved` plus the remaining open-thread count.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        next_lines(&self.next, w, st)
+        let past = match self.op {
+            "comment" => "commented",
+            "reply" => "replied",
+            _ => "resolved",
+        };
+        let mut l = Line::new('▸', past).id(self.id.clone());
+        if let Some(t) = &self.target {
+            l = l.dim(t.clone());
+        }
+        l.fix(self.next.first().cloned().unwrap_or_default())
+            .write(w, st)
     }
 }
 
@@ -137,20 +532,206 @@ pub struct PromoteReport {
     pub next: Vec<String>,
 }
 
-/// V2: mint the standing record with `source:` pre-filled from the item anchor; a decision
+/// Resolve a prescription anchor to its proposal and item, refusing the three ways it can
+/// be wrong: unknown proposal, closed proposal, missing item.
+fn prescription<'a>(
+    ctx: &Ctx,
+    s: &'a Snapshot,
+    raw: &str,
+) -> Result<(&'a Proposal, ItemRef, String)> {
+    let item = ItemRef::parse(raw)?;
+    let p = s.proposals.get(&item.proposal).ok_or_else(|| {
+        if s.closed_ids.contains(item.proposal.as_str()) {
+            KsError::gate(
+                "proposal_closed",
+                format!("{} is closed — closed proposals bind nothing", item.proposal),
+                fixes![fix!("{} rules", ctx.invoked_as)],
+            )
+        } else {
+            KsError::not_found(
+                "proposal",
+                item.proposal.to_string(),
+                fixes![fix!("{} board", ctx.invoked_as)],
+            )
+        }
+    })?;
+    let found = p.items.iter().find(|i| i.id == item).ok_or_else(|| {
+        KsError::not_found(
+            "item",
+            item.to_string(),
+            fixes![fix!("{} close {}", ctx.invoked_as, item.proposal)],
+        )
+    })?;
+    Ok((p, item, found.text.clone()))
+}
+
+/// Append one disposition to a proposal's `ledger:`, preserving what is already there.
+///
+/// The ledger is the ONE place `close` and `doctor::check_ledger_complete` both read, via
+/// `derive::dispositioned` — so an act that dispositions an item must land here or the gate
+/// will ask for it again.
+fn ledger_op(p: &Proposal, entry: String) -> Op {
+    let mut ledger = p.fm.ledger.clone();
+    ledger.push(entry);
+    Op::SetFields {
+        entity: crate::plan::EntityRef::Proposal(p.fm.id.clone()),
+        sets: vec![(
+            crate::keys::Key::Proposal(crate::keys::ProposalKey::Ledger),
+            crate::fm::Yv::list(ledger),
+        )],
+    }
+}
+
+/// Mint the standing record with `source:` pre-filled from the item anchor; a decision
 /// lands PROPOSED (invariant 8 — agents never self-accept).
 pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
-    Err(not_yet_v02(
-        ctx,
-        "promote",
-        "promotion reads its `source:` from a proposal item anchor, which lands in v0.2 — \
-         `decide` mints the same standing record by hand today",
-    ))
+    ctx.require_initialized()?;
+    let s = ctx.snapshot()?;
+    let (p, item, text) = prescription(ctx, &s, &a.item)?;
+
+    if crate::derive::dispositioned(&p.fm.ledger, &item) {
+        return Err(KsError::conflict(
+            format!("{item} is already dispositioned"),
+            fixes![fix!("{} close {}", ctx.invoked_as, item.proposal)],
+        ));
+    }
+    // Compile the globs BEFORE the lock: a record whose scope cannot compile steers
+    // nobody, and `prime` would silently never inject it.
+    crate::rulesdoc::Scope::of(&a.scope)?;
+
+    let pid = item.proposal.clone();
+    let anchor = item.to_string();
+    let title = text.trim().to_string();
+    if title.is_empty() {
+        return Err(KsError::invalid(
+            format!("{item} has no text to promote"),
+            fixes![fix!("{} comments {pid}", ctx.invoked_as)],
+        ));
+    }
+
+    match a.as_kind {
+        crate::cli::PromoteKind::Spec => {
+            // NOT a gap. DESIGN.md's spec workflow is that a rule bullet is written on the
+            // IMPLEMENTATION branch carrying its `{p-xxxx}` token, and `close` then
+            // auto-recognises it as `shipped`. Minting a rule here would create a second,
+            // competing write path for the one record type that is deliberately edited as
+            // ordinary code and reviewed in the PR.
+            Err(KsError::gate(
+                "promote_spec_ships_in_code",
+                format!(
+                    "a spec rule is written on the branch that implements it, not minted \
+                     here — add the bullet with its {{{pid}}} token and `close` will \
+                     recognise {item} as shipped"
+                ),
+                fixes![
+                    fix!("add `- [<spec>.<rule>] … {{{pid}}}` in .kanspec/specs/"),
+                    fix!("{} rules --audit", ctx.invoked_as),
+                    fix!("{} close {pid}", ctx.invoked_as),
+                ],
+            ))
+        }
+        crate::cli::PromoteKind::Decision => {
+            let args = crate::cli::DecideArgs {
+                title: title.clone(),
+                from: Some(anchor.clone()),
+                scope: a.scope.clone(),
+            };
+            let f = crate::plan::Facts {
+                actor: ctx.actor.clone(),
+                at: ctx.now,
+                invocation: ctx.invocation(),
+            };
+            let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
+                let mut plan = crate::cmd::decision::plan_decide(sn, &f, &args, m)?;
+                let id = plan
+                    .minted
+                    .iter()
+                    .find_map(|e| match e {
+                        crate::plan::EntityRef::Decision(d) => Some(d.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        KsError::internal(anyhow::anyhow!("`promote` minted no decision"))
+                    })?;
+                let p = sn.proposals.get(&pid).ok_or_else(|| {
+                    KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
+                })?;
+                plan.push(ledger_op(p, format!("{item} promoted→{id}")));
+                Ok(plan)
+            })?;
+            let id = done
+                .minted
+                .iter()
+                .find_map(|e| match e {
+                    crate::plan::EntityRef::Decision(d) => Some(d.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| KsError::internal(anyhow::anyhow!("`promote` minted no decision")))?;
+            crate::project::regenerate(ctx)?;
+            Ok(PromoteReport {
+                item,
+                record: id.to_string(),
+                // Invariant 8: a promoted decision is PROPOSED. An agent running `promote`
+                // has not thereby accepted anything — a human does that on its own page.
+                status: "proposed".to_string(),
+                url: Some(format!("http://127.0.0.1:{}/d/{id}", ctx.cfg.port)),
+                next: vec![format!("{} accept {id}", ctx.invoked_as)],
+            })
+        }
+        crate::cli::PromoteKind::Quirk => {
+            let scope = a.scope.clone();
+            let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
+                let qid = m.quirk(&title)?;
+                let mut plan = Plan::of(vec![Op::CreateEntity {
+                    entity: crate::plan::EntityRef::Quirk(qid.clone()),
+                    // A quirk's `source:` is typed `Option<TicketId>` — it records the
+                    // TICKET where the landmine was learned, so a proposal anchor has no
+                    // slot in it. The ledger entry below is where this promotion's
+                    // provenance actually lives.
+                    contents: crate::cmd::quirk::scaffold(
+                        &qid,
+                        &title,
+                        &scope,
+                        crate::model::Severity::Landmine,
+                        None,
+                    ),
+                }]);
+                plan.mint(crate::plan::EntityRef::Quirk(qid.clone()));
+                let p = sn.proposals.get(&pid).ok_or_else(|| {
+                    KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
+                })?;
+                plan.push(ledger_op(p, format!("{item} promoted→{qid}")));
+                Ok(plan)
+            })?;
+            let id = done
+                .minted
+                .iter()
+                .find_map(|e| match e {
+                    crate::plan::EntityRef::Quirk(q) => Some(q.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| KsError::internal(anyhow::anyhow!("`promote` minted no quirk")))?;
+            crate::project::regenerate(ctx)?;
+            Ok(PromoteReport {
+                item,
+                record: id.to_string(),
+                status: "active".to_string(),
+                url: None,
+                next: vec![format!("{} quirks", ctx.invoked_as)],
+            })
+        }
+    }
 }
 
 impl Render for PromoteReport {
-    /// V2: `▸ D-8c1a created (proposed) · source p-7de2#p1 · accept: <url>`.
+    /// `▸ D-8c1a created (proposed) · source p-7de2#p1 · accept: <url>`.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+        let mut l = Line::new('▸', format!("{} created", self.record))
+            .dim(format!("({}) · source {}", self.status, self.item));
+        if let Some(u) = &self.url {
+            l = l.url(format!("accept: {u}"));
+        }
+        l.write(w, st)?;
         next_lines(&self.next, w, st)
     }
 }
@@ -162,19 +743,49 @@ pub struct ExpireReport {
     pub next: Vec<String>,
 }
 
-/// V2: record the expiry disposition; auto-suggested the moment a `(temp until t-x)` guard
-/// ticket lands.
+/// Record the expiry disposition — the `(temp until t-x)` half of expire-or-promote.
+///
+/// `close` auto-expires a temp whose guard ticket git says has landed, so this verb is for
+/// the other case: a prescription that stopped applying for a reason a human has to state.
 pub fn expire(ctx: &Ctx, a: &ExpireArgs) -> Result<ExpireReport> {
-    Err(not_yet_v02(
-        ctx,
-        "expire",
-        "an expiry is a disposition on a proposal item, and items land in v0.2",
-    ))
+    ctx.require_initialized()?;
+    let s = ctx.snapshot()?;
+    let (p, item, _) = prescription(ctx, &s, &a.item)?;
+    if crate::derive::dispositioned(&p.fm.ledger, &item) {
+        return Err(KsError::conflict(
+            format!("{item} is already dispositioned"),
+            fixes![fix!("{} close {}", ctx.invoked_as, item.proposal)],
+        ));
+    }
+    let reason = a.reason.trim().to_string();
+    if reason.is_empty() {
+        return Err(KsError::invalid(
+            format!("{item} needs a reason it no longer applies"),
+            fixes![fix!("{} expire {item} --reason \"...\"", ctx.invoked_as)],
+        ));
+    }
+    let entry = format!("{item} expired ({reason})");
+    let pid = item.proposal.clone();
+    Store::open(ctx).transact(None, &ctx.invocation(), |sn, _m| {
+        let p = sn.proposals.get(&pid).ok_or_else(|| {
+            KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
+        })?;
+        Ok(Plan::of(vec![ledger_op(p, entry.clone())]))
+    })?;
+    Ok(ExpireReport {
+        next: vec![format!("{} close {pid}", ctx.invoked_as)],
+        item,
+        reason,
+    })
 }
 
 impl Render for ExpireReport {
-    /// V2: `✕ p-7de2#p2 expired — <reason>`.
+    /// `✕ p-7de2#p2 expired — <reason>`.
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-        next_lines(&self.next, w, st)
+        Line::new(glyph::FAIL, "expired")
+            .id(self.item.to_string())
+            .dim(self.reason.clone())
+            .fix(self.next.first().cloned().unwrap_or_default())
+            .write(w, st)
     }
 }

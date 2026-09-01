@@ -141,7 +141,9 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
     })
 }
 
-fn scaffold(
+/// Shared with `promote --as quirk`, which mints the same record from a proposal
+/// prescription: one scaffold, so a promoted quirk and a hand-captured one cannot drift.
+pub(crate) fn scaffold(
     id: &QuirkId,
     title: &str,
     paths: &[String],

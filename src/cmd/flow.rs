@@ -1102,6 +1102,7 @@ mod tests {
             anchor: anchor.to_string(),
             text: "t".into(),
             provenance: Vec::new(),
+            items: Vec::new(),
             line: 1,
         }
     }

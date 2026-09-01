@@ -50,28 +50,33 @@ fn built() -> clap::Command {
 }
 
 #[test]
-fn the_v01_surface_is_visible_and_the_v02_surface_is_hidden() {
+fn every_built_verb_is_visible_and_only_the_two_hidden_arms_are_hidden() {
     let cmd = Cli::command();
     let hidden: Vec<&str> = cmd
         .get_subcommands()
         .filter(|s| s.is_hide_set())
         .map(|s| s.get_name())
         .collect();
-    for v02 in [
-        "propose",
-        "review",
-        "comments",
-        "comment",
-        "approve",
-        "close",
-        "abandon",
-        "promote",
-        "expire",
+    // Exactly two arms are hidden, for two different reasons. The review-loop verbs
+    // (`propose`/`review`/`comments`/`comment`/`approve`/`close`/`abandon`/`promote`/
+    // `expire`) ship and are asserted VISIBLE below.
+    for hidden_arm in [
+        // a hook entry point whose exit code is load-bearing, not a verb a human types
         "landcheck",
+        // genuinely partial: bare `ci` reports the provider, but the per-ticket reader
+        // (homerunner journal + SSE, gh fallback) is unbuilt, so `ci why` still refuses
         "ci",
     ] {
-        assert!(hidden.contains(&v02), "`{v02}` is v0.2 and must be hidden");
+        assert!(
+            hidden.contains(&hidden_arm),
+            "`{hidden_arm}` must stay hidden"
+        );
     }
+    assert_eq!(
+        hidden.len(),
+        2,
+        "the hidden set grew without a stated reason: {hidden:?}"
+    );
     for v01 in [
         "init",
         "setup",
@@ -106,6 +111,16 @@ fn the_v01_surface_is_visible_and_the_v02_surface_is_hidden() {
         "prime",
         "instructions",
         "completions",
+        // the review loop
+        "propose",
+        "review",
+        "comments",
+        "comment",
+        "approve",
+        "close",
+        "abandon",
+        "promote",
+        "expire",
     ] {
         assert!(
             !hidden.contains(&v01),

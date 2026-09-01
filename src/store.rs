@@ -301,6 +301,7 @@ fn parse_rules(body: &str) -> Vec<Rule> {
             continue;
         }
         let mut provenance = Vec::new();
+        let mut items = Vec::new();
         let mut text = String::new();
         let mut rest = tail.trim();
         while let Some(open) = rest.rfind('{') {
@@ -308,6 +309,15 @@ fn parse_rules(body: &str) -> Vec<Rule> {
                 break;
             };
             let token = &rest[open + 1..open + close];
+            // `{p-7de2#c1}` names the exact item this rule satisfies; `{p-7de2}` names only
+            // the proposal. An item token ALSO contributes its proposal, so every consumer
+            // that only knows about `provenance` keeps working unchanged.
+            if let Ok(item) = crate::ids::ItemRef::parse(token) {
+                provenance.push(item.proposal.clone());
+                items.push(item);
+                rest = rest[..open].trim_end();
+                continue;
+            }
             match ProposalId::parse(token) {
                 Ok(id) => {
                     provenance.push(id);
@@ -317,11 +327,13 @@ fn parse_rules(body: &str) -> Vec<Rule> {
             }
         }
         provenance.reverse();
+        items.reverse();
         text.push_str(rest);
         out.push(Rule {
             anchor: anchor.trim().to_string(),
             text,
             provenance,
+            items,
             line: i + 1,
         });
     }
@@ -590,6 +602,7 @@ impl<'c> Store<'c> {
                 .iter()
                 .find_map(|o| match o {
                     Op::Transition { id, .. } => Some(id.to_string()),
+                    Op::CreateProposal { id, .. } => Some(id.to_string()),
                     Op::StampRule { spec, .. } => Some(spec.to_string()),
                     _ => o.entity().map(EntityRef::id),
                 })
@@ -699,6 +712,17 @@ impl<'c> Store<'c> {
                         ));
                     }
                 }
+            }
+            Op::CreateProposal { id, slug, contents } => {
+                let path = l.proposal_md(&l.proposal_dir(id, slug));
+                let doc = fm::split(contents).map_err(|e| {
+                    KsError::invalid(
+                        format!("cannot create proposal {id}: {e}"),
+                        fixes![fix!("kanspec doctor")],
+                    )
+                })?;
+                writable_or_refuse(&doc, &path)?;
+                staged.push((path, Staged::Doc { doc, create: true }));
             }
             Op::StampRule { spec, anchor, line } => {
                 let path = l.spec(spec);

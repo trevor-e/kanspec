@@ -103,6 +103,23 @@ pub enum Op {
         id: TicketId,
         checks: Vec<(usize, bool)>,
     },
+    /// `propose`: create `proposals/<id>-<slug>/proposal.md`.
+    ///
+    /// Separate from [`Op::CreateEntity`] because a proposal is the one entity whose
+    /// DIRECTORY NAME carries human-readable text. `CreateEntity` resolves its path through
+    /// `Layout::path_for`, which has only the id, so it can only ever produce the
+    /// un-slugged `proposals/p-7de2/` — fine for the machine (`dir_proposal_id` reads both
+    /// forms) and useless for the teammate browsing the repo, who is exactly who the slug
+    /// is for.
+    ///
+    /// It errors if the directory exists, like `CreateEntity`: minting is the only way a
+    /// proposal id comes into being, and clobbering one would take its comment log with it.
+    CreateProposal {
+        id: ProposalId,
+        /// `ids::slug(title)` — derived, never free text
+        slug: String,
+        contents: String,
+    },
     /// `rules --adopt`: stamp the adoption token onto a pre-kanspec rule bullet.
     ///
     /// The ONLY op that rewrites a line inside an entity body, and deliberately the
@@ -273,6 +290,21 @@ impl Plan {
                         ));
                     }
                 }
+                Op::CreateProposal { id, .. } => {
+                    let e = EntityRef::Proposal(id.clone());
+                    if e.exists_in(snap) || snap.closed_ids.contains(id.as_str()) {
+                        return Err(KsError::conflict(
+                            format!("{e} already exists — refusing to overwrite it"),
+                            fixes![fix!("kanspec board")],
+                        ));
+                    }
+                    if !created.insert(e) {
+                        return Err(KsError::conflict(
+                            format!("plan creates proposal {id} twice"),
+                            fixes![fix!("kanspec doctor")],
+                        ));
+                    }
+                }
                 Op::StampRule { spec, .. } => {
                     if !snap.specs.contains_key(spec) {
                         return Err(KsError::not_found(
@@ -314,6 +346,9 @@ impl Plan {
                 | Op::CreateEntity { entity, .. }
                 | Op::AppendSection { entity, .. } => {
                     out.insert(layout.path_for(entity));
+                }
+                Op::CreateProposal { id, slug, .. } => {
+                    out.insert(layout.proposal_md(&layout.proposal_dir(id, slug)));
                 }
                 Op::StampRule { spec, .. } => {
                     out.insert(layout.spec(spec));
