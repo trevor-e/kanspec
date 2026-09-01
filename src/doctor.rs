@@ -594,14 +594,38 @@ fn check_dead_globs(s: &Snapshot) -> Vec<Finding> {
         if anchor.dead_globs.is_empty() {
             continue;
         }
+        // A spec that lost SOME globs still steers the files it kept; one that lost them
+        // ALL steers nothing at all — `prime` injects none of its rules for any path, and
+        // the staleness tripwire has nothing to count. That is indistinguishable from
+        // having deleted the spec, and a refactor is how it happens: rename the one file a
+        // spec names and its rules stop reaching the code they govern, silently.
+        //
+        // So the severity follows the damage. Warning while the spec is partially moored;
+        // Error once it is fully adrift, because at that point CI is the only thing left
+        // that will notice.
+        let total = s.specs.get(name).map_or(0, |sp| sp.fm.code.len());
+        let all_dead = total > 0 && anchor.dead_globs.len() >= total;
         out.push(Finding {
             check: "dead_globs",
-            severity: Severity::Warning,
+            severity: if all_dead {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
             subject: format!("spec {name}"),
-            message: format!(
-                "code globs match no files: {} — the staleness tripwire cannot fire for this spec",
-                anchor.dead_globs.join(", ")
-            ),
+            message: if all_dead {
+                format!(
+                    "EVERY code glob matches no files: {} — this spec now steers nothing, \
+                     and `prime` injects none of its rules for any path",
+                    anchor.dead_globs.join(", ")
+                )
+            } else {
+                format!(
+                    "code globs match no files: {} — the staleness tripwire cannot fire for \
+                     this spec",
+                    anchor.dead_globs.join(", ")
+                )
+            },
             fix: format!("kanspec spec show {name}"),
             fixable: false,
         });
@@ -1312,6 +1336,61 @@ mod tests {
             "a key a NEWER kanspec wrote is not a derived fact"
         );
         assert!(f[0].fix.contains(".kanspec/tickets/t-0001.md"));
+    }
+
+    /// Severity follows the damage. A spec that lost SOME globs still steers what it kept;
+    /// one that lost them ALL steers nothing, `prime` injects none of its rules for any
+    /// path, and CI is the only thing left that will notice — which it cannot do at
+    /// exit 0. A rename is how a spec goes fully adrift, so this is not hypothetical.
+    #[test]
+    fn a_spec_that_lost_every_glob_fails_ci_and_one_that_lost_some_does_not() {
+        let mk = |name: &str, code: Vec<String>| Spec {
+            name: SpecName::parse(name).unwrap(),
+            fm: SpecFm {
+                feature: "F".into(),
+                code,
+                stale_ack: None,
+                extra: BTreeMap::new(),
+            },
+            path: PathBuf::from(format!(".kanspec/specs/{name}.md")),
+            body: String::new(),
+            rules: vec![],
+        };
+        let mut s = snap();
+        // `partial` keeps one live glob; `adrift` keeps none.
+        for (name, code, dead) in [
+            ("partial", vec!["a/**".to_string(), "b/**".to_string()], vec!["a/**"]),
+            ("adrift", vec!["c/**".to_string()], vec!["c/**"]),
+        ] {
+            let sp = mk(name, code);
+            let n = sp.name.clone();
+            s.specs.insert(n.clone(), sp);
+            s.git.specs.insert(
+                n,
+                crate::cache::SpecAnchor {
+                    last_edit_sha: None,
+                    last_edit_at: None,
+                    merges_since: 0,
+                    dead_globs: dead.iter().map(ToString::to_string).collect(),
+                },
+            );
+        }
+        let f = check_dead_globs(&s);
+        let sev = |name: &str| {
+            f.iter()
+                .find(|x| x.subject.contains(name))
+                .unwrap_or_else(|| panic!("no finding for {name}"))
+                .severity
+        };
+        assert_eq!(sev("partial"), Severity::Warning);
+        assert_eq!(sev("adrift"), Severity::Error, "this one must fail CI");
+        // …and it says WHICH failure it is, because the two need different responses.
+        assert!(f
+            .iter()
+            .find(|x| x.subject.contains("adrift"))
+            .unwrap()
+            .message
+            .contains("steers nothing"));
     }
 
     #[test]

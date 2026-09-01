@@ -81,6 +81,13 @@ impl Pathspec {
     pub fn glob(g: &str) -> Pathspec {
         Pathspec(format!(":(glob,top){g}"))
     }
+    /// The same glob, subtracted. `features --uncovered` builds one `ls-files` from a
+    /// positive pathspec plus one of these per spec glob, so GIT does the matching — a
+    /// second globbing implementation here could disagree with the one `scan` uses, and
+    /// then "uncovered" would mean something different from "dead glob".
+    pub fn exclude_glob(g: &str) -> Pathspec {
+        Pathspec(format!(":(exclude,glob,top){g}"))
+    }
     pub fn as_str(&self) -> &str {
         &self.0
     }

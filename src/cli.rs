@@ -581,6 +581,9 @@ pub struct FeaturesArgs {
     /// The attestation stored in the spec's frontmatter alongside --confirm
     #[arg(long, value_name = "REASON", allow_hyphen_values = true)]
     pub why: Option<String>,
+    /// Tracked files under this pathspec that NO spec's `code:` globs claim
+    #[arg(long, value_name = "PATHSPEC")]
+    pub uncovered: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -612,6 +615,9 @@ pub enum SpecCommand {
         /// Text to search for across every spec's rule bullets
         #[arg(value_name = "PATTERN", allow_hyphen_values = true)]
         pattern: String,
+        /// Name the specs with NO matching rule instead of the rules that match
+        #[arg(long)]
+        missing: bool,
     },
 }
 

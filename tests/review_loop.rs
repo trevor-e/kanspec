@@ -386,3 +386,82 @@ fn abandon_records_a_why_without_claiming_a_disposition() {
     assert!(!repo.exists(&format!(".kanspec/proposals/closed/{p}/proposal.md")));
     assert_eq!(repo.ks(["abandon", id, "--why", "again"]).code, 1);
 }
+
+// ── the audit surfaces the migration needed ─────────────────────────────────
+
+/// `spec grep <p>` answers "which specs mention X" — a question you could answer by
+/// reading. `--missing` answers "which specs DO NOT", which you cannot: a spec is missing
+/// a rule silently, and nothing about the file looks wrong. That inversion is what turns
+/// grep into an audit.
+#[test]
+fn spec_grep_missing_names_the_specs_with_no_matching_rule() {
+    let repo = TestRepo::new();
+    for (name, rule) in [
+        ("auth", "- [auth.tenant] Another household's session is 404."),
+        ("appearance", "- [appearance.accent] The accent is cobalt."),
+    ] {
+        repo.ks(["spec", "new", name, "--feature", "F", "--code", "src/**"])
+            .ok();
+        let p = format!(".kanspec/specs/{name}.md");
+        let s = repo.read(&p);
+        repo.write(&p, &format!("{s}{rule}\n"));
+    }
+
+    let hit = repo.ks(["spec", "grep", "tenant"]).ok().stdout;
+    assert!(hit.contains("auth"), "{hit}");
+    assert!(!hit.contains("appearance"), "{hit}");
+
+    // The inverse names the OTHER one — and never the covered one.
+    let missing = repo.ks(["spec", "grep", "tenant", "--missing"]).ok().stdout;
+    assert!(missing.contains("appearance"), "{missing}");
+    assert!(!missing.contains("auth"), "a covered spec must not be listed: {missing}");
+    // A `--missing` row is about the SPEC, so it carries no rule anchor to render.
+    assert!(!missing.contains("[]"), "empty anchor leaked into the render: {missing}");
+}
+
+/// The reverse of the dead-glob check. `doctor` asks "does this glob match a file"; the
+/// question that actually loses you steering is "does this file match a spec" — new code
+/// is uncovered by default, `prime` injects nothing for it, and nothing says so.
+#[test]
+fn features_uncovered_names_tracked_files_no_spec_claims() {
+    let repo = TestRepo::new();
+    repo.write("src/covered.rs", "// covered\n");
+    repo.write("src/orphan.rs", "// nobody claims me\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("add sources");
+    repo.ks([
+        "spec", "new", "auth", "--feature", "F", "--code", "src/covered.rs",
+    ])
+    .ok();
+
+    let r = repo.ks(["features", "--uncovered", "src/**"]).ok();
+    assert!(r.stdout.contains("src/orphan.rs"), "{}", r.stdout);
+    assert!(
+        !r.stdout.contains("src/covered.rs"),
+        "a claimed file must not be listed: {}",
+        r.stdout
+    );
+
+    // Widen the spec to claim it, and the report goes clean rather than staying stale.
+    let p = ".kanspec/specs/auth.md";
+    let s = repo.read(p);
+    repo.write(p, &s.replace("code: [src/covered.rs]", "code: [src/**]"));
+    let after = repo.ks(["features", "--uncovered", "src/**"]).ok();
+    assert!(
+        after.stdout.contains("every tracked file there is claimed"),
+        "{}",
+        after.stdout
+    );
+}
+
+/// The ordinary `features` table must not be hijacked by the uncovered renderer — an empty
+/// result means "all claimed" only when `--uncovered` was the question.
+#[test]
+fn features_without_uncovered_still_renders_its_table() {
+    let repo = TestRepo::new();
+    repo.ks(["spec", "new", "auth", "--feature", "Login", "--code", "src/**"])
+        .ok();
+    let out = repo.ks(["features"]).ok().stdout;
+    assert!(out.contains("Login"), "{out}");
+    assert!(!out.contains("claimed by a spec"), "{out}");
+}

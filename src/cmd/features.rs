@@ -45,12 +45,23 @@ pub struct FeaturesReport {
     pub written: Option<String>,
     pub confirmed: Option<SpecName>,
     pub next: Vec<String>,
+    /// `--uncovered`: tracked files no spec's `code:` globs claim
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uncovered: Vec<String>,
+    /// whether `--uncovered` was the question. An empty `uncovered` means "everything is
+    /// claimed" only when it WAS asked; on the ordinary path it just means the field is
+    /// unused, and rendering "all clear" for a repo with no specs at all would be a lie.
+    #[serde(skip)]
+    uncovered_query: bool,
 }
 
 pub fn features(ctx: &Ctx, a: &FeaturesArgs) -> Result<FeaturesReport> {
     ctx.require_initialized()?;
     if let Some(raw) = a.confirm.as_deref() {
         return confirm(ctx, raw, a.why.as_deref().unwrap_or_default());
+    }
+    if let Some(pathspec) = a.uncovered.as_deref() {
+        return uncovered(ctx, pathspec);
     }
 
     let snap = ctx.snapshot()?;
@@ -66,6 +77,8 @@ pub fn features(ctx: &Ctx, a: &FeaturesArgs) -> Result<FeaturesReport> {
         .collect();
 
     Ok(FeaturesReport {
+        uncovered: Vec::new(),
+        uncovered_query: false,
         rows,
         written: None,
         confirmed: None,
@@ -74,6 +87,57 @@ pub fn features(ctx: &Ctx, a: &FeaturesArgs) -> Result<FeaturesReport> {
 }
 
 /// The tripwire's one-key resolution: "I looked, and nothing about this capability's
+/// `features --uncovered <pathspec>` — the reverse of the dead-glob check.
+///
+/// `doctor` answers "does this spec's glob match anything". The question it CANNOT answer
+/// is the one that actually loses you steering: **does this file match any spec?** A spec
+/// with a rotted glob is loud (its rules stop reaching code, and the check fires); a file
+/// no spec claims is silent — `prime` injects nothing for it and nothing anywhere says so.
+/// New code is uncovered by default, which is exactly when a rule would have helped.
+///
+/// The pathspec is required rather than defaulted, because only the human knows what
+/// counts as source here: defaulting to everything tracked would list the README, the
+/// lockfiles and every fixture, and a report that is mostly noise is one nobody reads.
+///
+/// Implemented as ONE `git ls-files` with every spec glob subtracted as an
+/// `:(exclude)` pathspec, so git does the matching with the same semantics the rest of
+/// the tool uses — not a second globbing implementation that could disagree with it.
+fn uncovered(ctx: &Ctx, pathspec: &str) -> Result<FeaturesReport> {
+    let snap = ctx.snapshot()?;
+    let mut specs: Vec<crate::git::Pathspec> = vec![crate::git::Pathspec::glob(pathspec)];
+    for spec in snap.specs.values() {
+        for g in &spec.fm.code {
+            specs.push(crate::git::Pathspec::exclude_glob(g));
+        }
+    }
+    let out = ctx
+        .git
+        .run_ps(&["ls-files", "-z"], &specs)
+        .map_err(|e| KsError::internal(anyhow::anyhow!("cannot list tracked files: {e}")))?;
+    let files: Vec<String> = out
+        .out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+
+    Ok(FeaturesReport {
+        rows: Vec::new(),
+        written: None,
+        confirmed: None,
+        uncovered_query: true,
+        next: if files.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "{} spec new <name> --code \"<glob>\"",
+                ctx.invoked_as
+            )]
+        },
+        uncovered: files,
+    })
+}
+
 /// behaviour changed."
 fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
     let name = SpecName::parse(raw)?;
@@ -138,6 +202,8 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
         written,
         confirmed: Some(name),
         next: vec![format!("{} features --stale", ctx.invoked_as)],
+        uncovered: Vec::new(),
+        uncovered_query: false,
     })
 }
 
@@ -162,6 +228,33 @@ fn dot(s: &Staleness) -> char {
 
 impl Render for FeaturesReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+        // `--uncovered` answers a different question from the feature map, so it prints a
+        // different thing and stops rather than also dumping the table.
+        if self.uncovered_query {
+            if self.uncovered.is_empty() {
+                Line::new(glyph::OK, "every tracked file there is claimed by a spec")
+                    .write(w, st)?;
+                return Ok(());
+            }
+            Line::new(
+                '⚠',
+                format!(
+                    "{} tracked file(s) no spec claims — `prime` injects nothing for them",
+                    self.uncovered.len()
+                ),
+            )
+            .write(w, st)?;
+            for f in self.uncovered.iter().take(40) {
+                writeln!(w, "   {f}")?;
+            }
+            if self.uncovered.len() > 40 {
+                writeln!(w, "   … {} more", self.uncovered.len() - 40)?;
+            }
+            for n in &self.next {
+                Line::new(glyph::FIX, "next").fix(n.as_str()).write(w, st)?;
+            }
+            return Ok(());
+        }
         if let Some(name) = &self.confirmed {
             Line::new(glyph::OK, format!("{name}: no behaviour change recorded"))
                 .dim("· stale_ack written to the spec frontmatter")

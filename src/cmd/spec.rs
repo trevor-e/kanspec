@@ -58,7 +58,7 @@ pub fn spec(ctx: &Ctx, a: &SpecArgs) -> Result<SpecReport> {
             code,
         } => new(ctx, name, feature.as_deref(), code),
         SpecCommand::Show { name } => show(ctx, name),
-        SpecCommand::Grep { pattern } => grep(ctx, pattern),
+        SpecCommand::Grep { pattern, missing } => grep(ctx, pattern, *missing),
     }
 }
 
@@ -132,9 +132,40 @@ pub fn stale_fix(ctx: &Ctx, name: &SpecName, s: &Staleness) -> String {
     }
 }
 
-fn grep(ctx: &Ctx, pattern: &str) -> Result<SpecReport> {
+/// `spec grep <pattern> [--missing]`.
+///
+/// `--missing` inverts the question, and the inversion is the one that audits. "Which
+/// specs mention tenancy" is answerable by reading; "which specs DO NOT" is the question
+/// that finds the gap, and it cannot be answered by reading — a spec is missing a rule
+/// silently, and nothing about the file looks wrong.
+///
+/// It is a capability-level answer, not a rule-level one: the unit of "covers this
+/// concern" is the spec, so a spec with zero matching rules is named once rather than its
+/// rules being listed as non-hits.
+fn grep(ctx: &Ctx, pattern: &str, missing: bool) -> Result<SpecReport> {
     let snap = ctx.snapshot()?;
     let needle = pattern.to_lowercase();
+    if missing {
+        let mut absent: Vec<GrepHit> = Vec::new();
+        for spec in snap.specs.values() {
+            let covered = spec.rules.iter().any(|r| {
+                r.text.to_lowercase().contains(&needle)
+                    || r.anchor.to_lowercase().contains(&needle)
+            });
+            if !covered {
+                absent.push(GrepHit {
+                    spec: spec.name.clone(),
+                    anchor: String::new(),
+                    text: format!("no rule mentions `{pattern}`"),
+                    line: 0,
+                });
+            }
+        }
+        return Ok(SpecReport::Grepped {
+            pattern: pattern.to_string(),
+            hits: absent,
+        });
+    }
     let mut hits = Vec::new();
     for spec in snap.specs.values() {
         for r in &spec.rules {
@@ -228,9 +259,14 @@ impl Render for SpecReport {
             }
             SpecReport::Grepped { pattern, hits } => {
                 for h in hits {
-                    Line::new('·', format!("[{}] {}", h.anchor, h.text))
-                        .id(&h.spec)
-                        .write(w, st)?;
+                    // A `--missing` row has no anchor — the answer is the SPEC, not a rule
+                    // inside it — so it renders without an empty `[]`.
+                    let text = if h.anchor.is_empty() {
+                        h.text.clone()
+                    } else {
+                        format!("[{}] {}", h.anchor, h.text)
+                    };
+                    Line::new('·', text).id(&h.spec).write(w, st)?;
                 }
                 if hits.is_empty() {
                     writeln!(w, " no rule mentions {pattern:?}")?;
