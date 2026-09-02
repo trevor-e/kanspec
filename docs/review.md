@@ -1,9 +1,17 @@
 # review — proposals, threads, and answering feedback
 
-A proposal is **one page, four sections**: Why (2–4 sentences), Changes (`[cN]` bullets),
-Prescriptions (`[pN]`, typed), Tickets (`[tN]`, minted at approve). There is no design.md,
-no tasks.md, no delta-spec files and no SHALL grammar. A one-line tweak is a five-line
-proposal.
+A proposal is **one page, five sections**: Why (2–4 sentences), Changes (`[cN]` bullets),
+Testing and verification (how anyone will know it works — the tests each ticket carries, a
+hand check, a metric if one is warranted), Prescriptions (`[pN]`, typed — the rules this
+proposal leaves behind), Tickets (`[tN]`, minted at approve). There is no design.md, no
+tasks.md, no delta-spec files and no SHALL grammar. A one-line tweak is a five-line
+proposal. Any other `## ` section you add (a repo's `Security impact`, say) is shown on the
+review page in file order; nothing an author writes is dropped.
+
+**Write the first sentence of every bullet as its headline.** The review page shows only
+that sentence and folds the rest behind a tap, so a reviewer reads the whole plan in a
+dozen lines and opens only what they doubt. "Record the move-in date on the household
+profile." then the column, the wire field, the validation.
 
 ```
 kanspec propose "Login rate limiting" --spec auth   # scaffolds proposals/p-7de2-.../proposal.md
@@ -14,7 +22,11 @@ The bracket ids are **visible text on purpose**. They are the comment anchors, t
 disposition keys at close, and the merge keys when two people edit the same page — an
 invisible HTML comment an LLM has to remember to preserve is not any of those things.
 
-## Prescriptions are typed
+## Prescriptions are the rules this proposal leaves behind
+
+A closed proposal binds nothing (Rule 1). So anything that should keep steering agents
+after close has to be named here and typed — the page labels the section "Rules this
+leaves behind" and says so.
 
 ```
 - [p1] (promote: decision) Rate-limit state lives in Redis only — never Postgres.

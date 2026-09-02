@@ -777,25 +777,36 @@ function renderReview() {
   if (p.why) {
     const why = el('section', 'review-sec');
     why.appendChild(el('h2', null, 'Why'));
-    why.appendChild(el('p', 'prose', p.why));
+    why.appendChild(renderFold(p.why_headline || p.why, p.why_detail || '', 'prose'));
     doc.appendChild(why);
   }
 
+  // Skimmable by construction: every section shows one headline per bullet and folds the
+  // rest. Reviewers read the plan in a dozen lines and open only what they doubt.
   const groups = [
-    ['c', 'Changes'],
-    ['p', 'Prescriptions'],
-    ['t', 'Tickets'],
+    ['c', 'Changes', null],
+    ['p', 'Rules this leaves behind',
+      'kanspec calls these prescriptions. A closed proposal binds nothing, so a rule that ' +
+      'should keep steering agents afterwards is named here and typed: promote → decision ' +
+      '(a human accepts it), promote → spec (it becomes a rule bullet), or temp until a ' +
+      'ticket lands (then it expires).'],
+    ['t', 'Tickets', null],
   ];
-  for (const [kind, label] of groups) {
+  const sections = p.sections || [];
+  for (const [kind, label, note] of groups) {
     const items = p.items.filter((i) => i.kind === kind);
     if (!items.length) continue;
     const sec = el('section', 'review-sec');
     sec.appendChild(el('h2', null, label));
+    if (note) sec.appendChild(el('p', 'sec-note', note));
     for (const item of items) sec.appendChild(renderItem(item));
     // DESIGN: the current spec text inlined under Changes, collapsible — so the delta is
     // reviewed against today's truth without opening a file.
     if (kind === 'c' && p.context.length) sec.appendChild(renderContext(p.context));
     doc.appendChild(sec);
+    // The author's own sections (Testing and verification, Security impact, …) sit
+    // between Changes and the rules, in file order — never dropped.
+    if (kind === 'c') for (const s of sections) doc.appendChild(renderSection(s));
   }
   wrap.appendChild(doc);
 
@@ -808,6 +819,48 @@ function anchorOf(item) {
   return item.id.proposal + '#' + item.kind + item.id.n;
 }
 
+// A headline with its detail folded under it. Click the headline or the chevron to open;
+// nothing is hidden, it is one tap away.
+function renderFold(headline, detail, cls) {
+  const box = el('div', 'fold' + (cls ? ' ' + cls : ''));
+  const head = el('span', 'fold-head', headline);
+  box.appendChild(head);
+  if (detail) {
+    const more = el('button', 'fold-more', '›');
+    more.type = 'button';
+    more.setAttribute('aria-expanded', 'false');
+    more.title = 'show the detail';
+    const body = el('div', 'fold-detail', detail);
+    body.hidden = true;
+    const toggle = () => {
+      body.hidden = !body.hidden;
+      more.setAttribute('aria-expanded', String(!body.hidden));
+      box.classList.toggle('open', !body.hidden);
+    };
+    more.onclick = toggle;
+    head.onclick = toggle;
+    head.classList.add('has-more');
+    box.appendChild(more);
+    box.appendChild(body);
+  }
+  return box;
+}
+
+function renderSection(s) {
+  const sec = el('section', 'review-sec');
+  sec.appendChild(el('h2', null, s.heading));
+  if (s.prose) sec.appendChild(el('p', 'prose', s.prose));
+  for (const b of s.bullets) {
+    const row = el('div', 'item plain');
+    row.appendChild(el('span', 'item-dot', '·'));
+    const body = el('div', 'item-body');
+    body.appendChild(renderFold(b.headline, b.detail));
+    row.appendChild(body);
+    sec.appendChild(row);
+  }
+  return sec;
+}
+
 function renderItem(item) {
   const row = el('div', 'item' + (item.dispositioned ? ' done' : ''));
   row.id = 'item-' + item.kind + item.id.n;
@@ -817,7 +870,7 @@ function renderItem(item) {
   row.appendChild(tag);
 
   const body = el('div', 'item-body');
-  body.appendChild(el('span', 'item-text', item.text));
+  body.appendChild(renderFold(item.headline || item.text, item.detail || '', 'item-text'));
   if (item.badge) {
     const cls = item.badge.startsWith('TEMP')
       ? 'badge temp'

@@ -432,7 +432,7 @@ t-31aa         auth           auth · p-7de2      auth               auth
 
 ## Spec proposals & review loop
 
-**Format:** one page, four sections — Why (2–4 sentences), Changes (`[cN]` bullets), Prescriptions (`[pN]`, typed), Tickets (`[tN]`, minted at approve). No design.md, no tasks.md, no delta-spec files, no SHALL grammar. A one-line tweak is a five-line proposal. Item IDs are visible text and are the comment anchors and disposition keys.
+**Format:** one page, five sections — Why (2–4 sentences), Changes (`[cN]` bullets), Testing and verification (how anyone will know it works), Prescriptions (`[pN]`, typed — the rules the proposal leaves behind; the page labels them that way), Tickets (`[tN]`, minted at approve). The first sentence of every bullet is its headline: the review page shows that line and folds the rest, so a plan reads in a dozen lines. Author-added sections are passed through to the page in file order. No design.md, no tasks.md, no delta-spec files, no SHALL grammar. A one-line tweak is a five-line proposal. Item IDs are visible text and are the comment anchors and disposition keys.
 
 **Lifecycle:** `draft → review → approved → closed` (or `abandoned`). "Settling" is a derived flag: the moment scan/done detects the last linked ticket terminal, the proposal surfaces in `status` and on the board as *settling — close me*, so close-out is prompted, never remembered.
 

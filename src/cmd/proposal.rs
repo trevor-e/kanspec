@@ -50,6 +50,7 @@ fn scaffold(
          created: {created}\n---\n\
          ## Why\n\n\
          ## Changes\n- [c1] \n\n\
+         ## Testing and verification\n\n\
          ## Prescriptions\n\n\
          ## Tickets\n",
         fm::emit(&Yv::s(title), false),
@@ -947,7 +948,15 @@ pub struct ProposalPage {
     pub created: String,
     /// the `## Why` prose, verbatim
     pub why: String,
+    /// `why` split at its first sentence — the page shows the headline and folds the rest
+    pub why_headline: String,
+    pub why_detail: String,
     pub items: Vec<PageItem>,
+    /// Every `## ` section that is not one of the four the machinery reads (Why, Changes,
+    /// Prescriptions, Tickets), in file order — `Testing and verification` from the
+    /// scaffold, a repo's own `Security impact`, the `Abandoned` note. Passed through so
+    /// a section an author wrote is never invisible on the page.
+    pub sections: Vec<PageSection>,
     /// threads whose target item is gone — shown, never dropped
     pub orphaned: Vec<crate::cmd::comment::Thread>,
     pub unresolved: usize,
@@ -958,12 +967,34 @@ pub struct ProposalPage {
     pub context: Vec<SpecContext>,
 }
 
+/// A free-form section, split for skimming: prose first, then each `- ` bullet as a
+/// headline + folded detail, exactly like an item.
+#[derive(Debug, Serialize)]
+pub struct PageSection {
+    pub heading: String,
+    pub prose: String,
+    pub bullets: Vec<Headline>,
+}
+
+/// A bullet or item as the page skims it: the first sentence stands for the whole, the
+/// rest is one tap away. Reviewers asked for this in so many words — "one or two
+/// sentences per bullet, and if I want to click in further I could" — and it costs the
+/// author nothing beyond writing the first sentence as the summary.
+#[derive(Debug, Serialize)]
+pub struct Headline {
+    pub headline: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PageItem {
     pub id: ItemRef,
     /// `c` | `p` | `t`
     pub kind: char,
     pub text: String,
+    /// `text` split at its first sentence
+    pub headline: String,
+    pub detail: String,
     /// `TEMP` / `PROMOTE → decision` — the badge the page draws
     pub badge: Option<String>,
     pub threads: Vec<crate::cmd::comment::Thread>,
@@ -1006,6 +1037,8 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
             // The `(promote: decision)` marker becomes the badge, so leaving it in the
             // text too would render it twice on the card.
             text: strip_marker(&i.text),
+            headline: split_headline(&strip_marker(&i.text)).0,
+            detail: split_headline(&strip_marker(&i.text)).1,
             badge: match &i.prescription {
                 Some(crate::model::Prescription::TempUntil(t)) => Some(format!("TEMP until {t}")),
                 Some(crate::model::Prescription::Promote(k)) => {
@@ -1039,13 +1072,18 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
             .collect();
 
     let open = unresolved(&s, p);
+    let why = section(&p.body, "## Why");
+    let (why_headline, why_detail) = split_headline(&why);
     Ok(ProposalPage {
+        why_headline,
+        why_detail,
+        sections: extra_sections(&p.body),
         title: p.fm.title.clone(),
         status: p.fm.status,
         specs: p.fm.specs.clone(),
         approved: p.fm.approved.clone(),
         created: p.fm.created.to_string(),
-        why: section(&p.body, "## Why"),
+        why,
         items,
         orphaned,
         unresolved: open,
@@ -1072,6 +1110,90 @@ fn strip_marker(text: &str) -> String {
     }
 }
 
+/// The four headings the machinery reads; everything else is an author's section.
+const KNOWN_SECTIONS: [&str; 4] = ["## Why", "## Changes", "## Prescriptions", "## Tickets"];
+
+/// Every author-written `## ` section, in file order, each split for skimming.
+fn extra_sections(body: &str) -> Vec<PageSection> {
+    let mut out = Vec::new();
+    let mut cur: Option<(String, Vec<String>)> = None;
+    for line in body.lines() {
+        if let Some(h) = line.strip_prefix("## ") {
+            if let Some((heading, lines)) = cur.take() {
+                out.push(page_section(heading, &lines));
+            }
+            cur = (!KNOWN_SECTIONS.contains(&line.trim_end()))
+                .then(|| (h.trim().to_string(), Vec::new()));
+            continue;
+        }
+        if let Some((_, lines)) = cur.as_mut() {
+            lines.push(line.to_string());
+        }
+    }
+    if let Some((heading, lines)) = cur {
+        out.push(page_section(heading, &lines));
+    }
+    out
+}
+
+fn page_section(heading: String, lines: &[String]) -> PageSection {
+    let mut prose = String::new();
+    let mut bullets = Vec::new();
+    for l in lines {
+        if let Some(b) = l.trim_start().strip_prefix("- ") {
+            let (headline, detail) = split_headline(b.trim());
+            bullets.push(Headline { headline, detail });
+        } else {
+            prose.push_str(l);
+            prose.push('\n');
+        }
+    }
+    PageSection {
+        heading,
+        prose: prose.trim().to_string(),
+        bullets,
+    }
+}
+
+/// `text` split at the end of its first sentence: the headline the page shows, and the
+/// detail it folds. A sentence ends at `.`, `!` or `?` followed by whitespace, ignoring
+/// anything inside backticks (`POST .../finish` is not three sentences) and a dotted
+/// abbreviation (`e.g.`, `vs.`) whose word is short. No sentence end means the whole text
+/// is the headline and the detail is empty.
+pub fn split_headline(text: &str) -> (String, String) {
+    let t = text.trim();
+    let bytes = t.as_bytes();
+    let mut in_code = false;
+    let mut word_start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'`' => in_code = !in_code,
+            b' ' | b'\n' if !in_code => word_start = i + 1,
+            b'.' | b'!' | b'?' if !in_code => {
+                let ends_here = bytes.get(i + 1).is_none_or(|n| n.is_ascii_whitespace());
+                if !ends_here {
+                    continue;
+                }
+                // `e.g.` / `vs.` / `i.e.` — a short dotted token is not a sentence end.
+                let word = &t[word_start..i];
+                if b == b'.'
+                    && word.len() <= 3
+                    && !word.is_empty()
+                    && word.chars().all(|c| c.is_ascii_alphabetic() || c == '.')
+                    && word.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                {
+                    continue;
+                }
+                let head = t[..=i].trim().to_string();
+                let rest = t[i + 1..].trim().to_string();
+                return (head, rest);
+            }
+            _ => {}
+        }
+    }
+    (t.to_string(), String::new())
+}
+
 /// The prose under one `## ` heading, up to the next one.
 fn section(body: &str, heading: &str) -> String {
     let mut out = String::new();
@@ -1090,4 +1212,80 @@ fn section(body: &str, heading: &str) -> String {
         }
     }
     out.trim().to_string()
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+
+    #[test]
+    fn the_headline_is_the_first_sentence_and_backticks_do_not_end_one() {
+        let (h, d) = split_headline(
+            "Finishing onboarding activates that playbook. `POST .../onboarding/finish` goes through the existing path.",
+        );
+        assert_eq!(h, "Finishing onboarding activates that playbook.");
+        assert_eq!(
+            d,
+            "`POST .../onboarding/finish` goes through the existing path."
+        );
+
+        let (h, d) = split_headline(
+            "Add a `new-home-catchup` playbook with eight one-time items. Dryer vent first.",
+        );
+        assert_eq!(
+            h,
+            "Add a `new-home-catchup` playbook with eight one-time items."
+        );
+        assert_eq!(d, "Dryer vent first.");
+
+        let (h, d) = split_headline("Out of scope: the affiliate toolkit and an MCP surface.");
+        assert_eq!(h, "Out of scope: the affiliate toolkit and an MCP surface.");
+        assert_eq!(d, "", "one sentence is all headline");
+
+        let (h, _) =
+            split_headline("Use a date, e.g. 2026-09-01, never a boolean. Recency is computed.");
+        assert_eq!(
+            h, "Use a date, e.g. 2026-09-01, never a boolean.",
+            "`e.g.` is not a sentence end"
+        );
+
+        let (h, d) = split_headline("A future date is a 400 (validation). Nothing derives it");
+        assert_eq!(h, "A future date is a 400 (validation).");
+        assert_eq!(d, "Nothing derives it");
+    }
+
+    #[test]
+    fn author_sections_pass_through_in_order_and_the_four_known_ones_do_not() {
+        let body = "## Why\nbecause.\n\n## Changes\n- [c1] x\n\n## Security impact\nnone: no new surface.\n\n## Testing and verification\n- Backend tests: a future date is 400. Owner-only activation.\n- Hand check on the dev stack.\n\n## Prescriptions\n\n## Tickets\n- [t1] y\n\n## Abandoned\nsuperseded by p-1\n";
+        let s = extra_sections(body);
+        let heads: Vec<&str> = s.iter().map(|x| x.heading.as_str()).collect();
+        assert_eq!(
+            heads,
+            ["Security impact", "Testing and verification", "Abandoned"]
+        );
+        assert_eq!(s[0].prose, "none: no new surface.");
+        assert!(s[0].bullets.is_empty());
+        assert_eq!(s[1].bullets.len(), 2);
+        assert_eq!(
+            s[1].bullets[0].headline,
+            "Backend tests: a future date is 400."
+        );
+        assert_eq!(s[1].bullets[0].detail, "Owner-only activation.");
+        assert_eq!(s[1].bullets[1].detail, "");
+        assert_eq!(s[2].prose, "superseded by p-1");
+    }
+
+    #[test]
+    fn the_scaffold_carries_testing_and_verification_between_changes_and_prescriptions() {
+        let s = scaffold(
+            &ProposalId::parse("p-1c51").unwrap(),
+            "t",
+            &[],
+            chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+        );
+        let c = s.find("## Changes").unwrap();
+        let v = s.find("## Testing and verification").unwrap();
+        let p = s.find("## Prescriptions").unwrap();
+        assert!(c < v && v < p, "{s}");
+    }
 }

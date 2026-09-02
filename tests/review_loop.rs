@@ -48,7 +48,13 @@ fn propose_scaffolds_the_one_page_format_and_nothing_else() {
     seed(&repo);
     let p = only_proposal(&repo);
     let src = repo.read(&format!(".kanspec/proposals/{p}/proposal.md"));
-    for section in ["## Why", "## Changes", "## Prescriptions", "## Tickets"] {
+    for section in [
+        "## Why",
+        "## Changes",
+        "## Testing and verification",
+        "## Prescriptions",
+        "## Tickets",
+    ] {
         assert!(src.contains(section), "{src}");
     }
     // The things OpenSpec had and kanspec dropped, asserted as absences.
