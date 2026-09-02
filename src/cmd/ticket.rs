@@ -22,7 +22,7 @@ use crate::logentry::{LogEntry, LOG_HEADING, STEPS_HEADING};
 use crate::model::{Snapshot, Step, Ticket};
 use crate::out::{glyph, Color, Line, Render, Style, Table};
 use crate::plan::{EntityRef, Facts, Op, Plan};
-use crate::store::Store;
+use crate::store::{Committed, Store};
 use crate::transitions::{self, State, Verb};
 use crate::{fix, fixes};
 
@@ -52,23 +52,15 @@ pub fn new(ctx: &Ctx, a: &NewArgs) -> Result<NewReport> {
     // anything.
     let discovered_in = resolve_discovered_in(ctx, &snap, a)?;
 
-    let f = Facts {
-        actor: ctx.actor.clone(),
-        at: ctx.now,
-        invocation: ctx.invocation(),
-    };
+    let f = facts(ctx);
     let committed = Store::open(ctx).transact(Some(Verb::New), &ctx.invocation(), |s, m| {
         plan_new(s, &f, a, m, discovered_in.as_ref())
     })?;
 
-    let id = committed
-        .minted
-        .iter()
-        .find_map(|e| match e {
-            EntityRef::Ticket(id) => Some(id.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| KsError::internal(anyhow::anyhow!("`new` minted no ticket")))?;
+    let id = first_minted(&committed, "ticket", |e| match e {
+        EntityRef::Ticket(id) => Some(id.clone()),
+        _ => None,
+    })?;
     let t = committed.snapshot.ticket(&id)?;
 
     Ok(NewReport {
@@ -250,7 +242,7 @@ fn resolve_discovered_in(ctx: &Ctx, snap: &Snapshot, a: &NewArgs) -> Result<Opti
     if a.followup_of.is_some() {
         return Ok(None);
     }
-    Ok(claimed_ticket(ctx, snap).map(|c| c.id))
+    Ok(claimed_ticket(ctx, snap))
 }
 
 // ── show ─────────────────────────────────────────────────────────────────────
@@ -286,12 +278,13 @@ pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowReport> {
     let id = TicketId::parse(&a.id)?;
     let snap = ctx.snapshot()?;
     let t = snap.ticket(&id)?;
+    let badge = derive::badge(&snap, t);
     Ok(ShowReport {
         title: t.fm.title.clone(),
         state: t.fm.state,
         column: derive::column(&snap, t),
-        badge_text: derive::badge(&snap, t).text(snap.now),
-        badge: derive::badge(&snap, t),
+        badge_text: badge.text(snap.now),
+        badge,
         spec: t.fm.spec.clone(),
         proposal: t.fm.proposal.clone(),
         deps: t.fm.deps.clone(),
@@ -316,7 +309,7 @@ impl Render for ShowReport {
             .dim(format!("· {}", self.badge_text))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)?;
-        let mut chips: Vec<String> = vec![self.column_label().to_string()];
+        let mut chips: Vec<String> = vec![column_label(self.column).to_string()];
         if let Some(s) = &self.spec {
             chips.push(format!("spec {s}"));
         }
@@ -341,16 +334,14 @@ impl Render for ShowReport {
         writeln!(w, "   {}", chips.join(" · "))?;
 
         if !self.deps.is_empty() {
-            let open: Vec<String> = self.blocked_by.iter().map(ToString::to_string).collect();
-            let all: Vec<String> = self.deps.iter().map(ToString::to_string).collect();
             writeln!(
                 w,
                 "   deps {}{}",
-                all.join(", "),
-                if open.is_empty() {
+                join(&self.deps, ", "),
+                if self.blocked_by.is_empty() {
                     " (all satisfied)".to_string()
                 } else {
-                    format!(" · blocked by {}", open.join(", "))
+                    format!(" · blocked by {}", join(&self.blocked_by, ", "))
                 }
             )?;
         }
@@ -374,12 +365,6 @@ impl Render for ShowReport {
             writeln!(w, "   {} {n}", glyph::FIX)?;
         }
         Ok(())
-    }
-}
-
-impl ShowReport {
-    fn column_label(&self) -> &'static str {
-        column_label(self.column)
     }
 }
 
@@ -459,14 +444,15 @@ pub fn ls(ctx: &Ctx, a: &LsArgs) -> Result<LsReport> {
         if a.unmerged && derive::in_main(&snap, t).is_some() {
             continue;
         }
+        let badge = derive::badge(&snap, t);
         rows.push(LsRow {
             id: t.fm.id.clone(),
             state: t.fm.state,
             title: t.fm.title.clone(),
             spec: t.fm.spec.clone(),
             claimed_by: t.fm.claimed_by.clone(),
-            badge_text: derive::badge(&snap, t).text(snap.now),
-            badge: derive::badge(&snap, t),
+            badge_text: badge.text(snap.now),
+            badge,
             updated_secs: updated_secs(&snap, t),
             discovered_in: t.fm.discovered_in.clone(),
         });
@@ -508,7 +494,10 @@ impl Render for LsReport {
             } else {
                 format!("no tickets match {}", self.filtered.join(" + "))
             };
-            return Line::new('·', what).fix("kanspec new \"...\"").write(w, st);
+            // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
+            return Line::new('·', what)
+                .fix(crate::out::spoken("kanspec new \"...\""))
+                .write(w, st);
         }
         let mut table = Table::new(&["", "id", "title", "spec", "claimed", "merge", "age"], st);
         for r in &self.rows {
@@ -652,7 +641,7 @@ pub fn where_is(ctx: &Ctx, a: &WhereArgs) -> Result<WhereReport> {
     };
     let found = match &branch {
         Some(b) => ticket_for_branch(ctx, &snap, b),
-        None => claimed_ticket(ctx, &snap).map(|c| c.id),
+        None => claimed_ticket(ctx, &snap),
     };
     let t = found.as_ref().and_then(|id| snap.tickets.get(id));
 
@@ -713,12 +702,6 @@ impl Render for WhereReport {
 }
 
 // ── the shared session lookups ───────────────────────────────────────────────
-
-/// The ticket this session is standing on, and how that was decided.
-pub struct Claimed {
-    pub id: TicketId,
-    pub via: &'static str,
-}
 
 /// The branch checked out where the USER stands — not where the store lives.
 ///
@@ -782,11 +765,9 @@ pub fn ticket_for_branch(ctx: &Ctx, snap: &Snapshot, branch: &str) -> Option<Tic
 
 /// What this session already claims: the branch it stands on, else the one ticket in `doing`
 /// this actor holds. Ambiguity answers `None` — a wrong `discovered_in` is worse than none.
-pub fn claimed_ticket(ctx: &Ctx, snap: &Snapshot) -> Option<Claimed> {
-    if let Some(b) = here_branch(ctx) {
-        if let Some(id) = ticket_for_branch(ctx, snap, &b) {
-            return Some(Claimed { id, via: "branch" });
-        }
+pub fn claimed_ticket(ctx: &Ctx, snap: &Snapshot) -> Option<TicketId> {
+    if let Some(id) = here_branch(ctx).and_then(|b| ticket_for_branch(ctx, snap, &b)) {
+        return Some(id);
     }
     let me = ctx.actor.label();
     let mut mine = snap
@@ -794,13 +775,7 @@ pub fn claimed_ticket(ctx: &Ctx, snap: &Snapshot) -> Option<Claimed> {
         .values()
         .filter(|t| t.fm.state == State::Doing && t.fm.claimed_by.as_deref() == Some(me.as_str()));
     let first = mine.next()?;
-    match mine.next() {
-        None => Some(Claimed {
-            id: first.fm.id.clone(),
-            via: "claim",
-        }),
-        Some(_) => None,
-    }
+    mine.next().is_none().then(|| first.fm.id.clone())
 }
 
 /// The ONE owed verb, spelled out. Invariant 9, per ticket.
@@ -834,6 +809,71 @@ pub fn rel_to(ctx: &Ctx, p: &Path) -> String {
         .to_string()
 }
 
+// ── the helpers every handler in `cmd/` shares ───────────────────────────────
+//
+// They live here rather than in `out.rs`/`plan.rs`/`ctx.rs` because those files are frozen
+// foundation and this one already exports the shared session lookups above. NOTE: this
+// file must never name the decision, quirk or spec `EntityRef` variants, even in a comment —
+// the structural test in `tests/invariants_rules.rs` greps every `cmd/*.rs` for those
+// tokens, treats a match as a handler that writes a projected entity, and demands a
+// `project::regenerate` call from it. The minted-id helpers are generic over a
+// caller-supplied `pick` for exactly that reason.
+
+/// The `Facts` every planner is handed — who, when, and the invocation — read from `Ctx`
+/// ONCE, before the lock, and never inside a planner (§2.16).
+pub(crate) fn facts(ctx: &Ctx) -> Facts {
+    Facts {
+        actor: ctx.actor.clone(),
+        at: ctx.now,
+        invocation: ctx.invocation(),
+    }
+}
+
+/// `a, b, c` — the ONE spelling of a joined list in human output.
+pub(crate) fn join<T: std::fmt::Display>(v: impl IntoIterator<Item = T>, sep: &str) -> String {
+    v.into_iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The `  → next` lines under a knowledge verb's report: two-space indent, painted cyan.
+/// (The ticket verbs use a three-space, unpainted variant on purpose — DESIGN.md's
+/// transcripts — so this is not for them.)
+pub(crate) fn write_next(
+    w: &mut dyn std::io::Write,
+    st: &Style,
+    next: &[String],
+) -> std::io::Result<()> {
+    for n in next {
+        writeln!(
+            w,
+            "  {} {}",
+            glyph::FIX,
+            crate::out::paint(n, Color::Cyan, st.color)
+        )?;
+    }
+    Ok(())
+}
+
+/// The ids a committed plan minted, of the kind `pick` selects, in the order the planner
+/// pushed them.
+pub(crate) fn minted<T>(c: &Committed, pick: impl Fn(&EntityRef) -> Option<T>) -> Vec<T> {
+    c.minted.iter().filter_map(pick).collect()
+}
+
+/// The ONE id a plan was expected to mint; a plan that minted none is an internal error.
+pub(crate) fn first_minted<T>(
+    c: &Committed,
+    what: &str,
+    pick: impl Fn(&EntityRef) -> Option<T>,
+) -> Result<T> {
+    minted(c, pick)
+        .into_iter()
+        .next()
+        .ok_or_else(|| KsError::internal(anyhow::anyhow!("the plan minted no {what}")))
+}
+
 impl Render for NewReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, &self.title)
@@ -848,14 +888,7 @@ impl Render for NewReport {
             chips.push(format!("proposal {p}"));
         }
         if !self.deps.is_empty() {
-            chips.push(format!(
-                "deps {}",
-                self.deps
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
+            chips.push(format!("deps {}", join(&self.deps, ", ")));
         }
         writeln!(w, "   {}", chips.join(" · "))?;
         // The capture stays visible: a discovered ticket says where it came from, on the

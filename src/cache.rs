@@ -114,23 +114,6 @@ impl Default for GitState {
     }
 }
 
-impl MergeFact {
-    /// How long ago this ticket's ladder last ran. `None` never happens for a fact that
-    /// came out of `scan`; it exists so a clock skewed backwards reads as "unknown age"
-    /// rather than as a negative duration.
-    pub fn age(&self, now: DateTime<Utc>) -> Option<Duration> {
-        (now - self.checked_at).to_std().ok()
-    }
-    /// Past the badge's freshness window. The gate NEVER consults this — `done` re-runs
-    /// the ladder, because a 60s-old `merged` is not a proof (J-8).
-    pub fn is_stale(&self, now: DateTime<Utc>, max_age: Duration) -> bool {
-        match self.age(now) {
-            Some(a) => a > max_age,
-            None => false,
-        }
-    }
-}
-
 impl GitState {
     /// True when nothing has ever been scanned — the `NeverScanned` badge.
     pub fn is_empty(&self) -> bool {
@@ -325,21 +308,5 @@ mod tests {
 
         fresh.scanned_at = Some(now - chrono::Duration::seconds(3600));
         assert!(fresh.is_stale(now, window));
-
-        // A per-ticket fact carries its own clock, so one stale ticket does not condemn
-        // the whole cache.
-        let f = MergeFact {
-            status: MergeStatus::Merged,
-            sha: None,
-            method: Method::Ancestry,
-            pr: None,
-            why: None,
-            checked_at: now - chrono::Duration::seconds(30),
-            changed: vec![],
-        };
-        assert!(!f.is_stale(now, window));
-        assert!(f.is_stale(now, Duration::from_secs(10)));
-        // A clock that ran backwards must not read as "stale by a negative amount".
-        assert!(!f.is_stale(now - chrono::Duration::hours(1), window));
     }
 }

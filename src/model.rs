@@ -333,6 +333,7 @@ pub enum CommentOpKind {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Everything on disk, loaded once, plus the disposable cache.
+#[derive(Default)]
 pub struct Snapshot {
     pub tickets: BTreeMap<TicketId, Ticket>,
     /// OPEN proposals ONLY. Closed proposal BODIES are never read from disk, so there is
@@ -417,17 +418,9 @@ impl Snapshot {
     /// An empty snapshot — the base every pure planner unit test builds on.
     pub fn empty(cfg: Config, now: DateTime<Utc>) -> Snapshot {
         Snapshot {
-            tickets: BTreeMap::new(),
-            proposals: BTreeMap::new(),
-            closed_ids: HashSet::new(),
-            specs: BTreeMap::new(),
-            decisions: BTreeMap::new(),
-            quirks: BTreeMap::new(),
-            comments: BTreeMap::new(),
-            git: GitState::default(),
             cfg,
             now,
-            rev: 0,
+            ..Snapshot::default()
         }
     }
 }

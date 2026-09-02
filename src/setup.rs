@@ -15,7 +15,7 @@
 //! kanspec displaced, and leaves a settings file that held only our hooks gone rather than
 //! empty.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
@@ -23,7 +23,7 @@ use serde_json::{json, Map, Value};
 use crate::cli::Agent;
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
-use crate::hooks::Edit;
+use crate::hooks::{read, Edit};
 use crate::{fix, fixes};
 
 /// The exact snippet DESIGN.md specifies. Delimited so `--remove` can excise precisely
@@ -54,12 +54,6 @@ pub const AGENT_HOOKS: &[(&str, &str, &str)] = &[
 
 /// The tool names whose writes can step on a landmine. Anything that edits a file.
 const EDIT_TOOLS: &str = "Edit|Write|MultiEdit|NotebookEdit";
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SetupReport {
-    pub agent: &'static str,
-    pub files: Vec<SetupChange>,
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SetupChange {
@@ -112,13 +106,23 @@ pub fn snippet(invoked_as: &str) -> String {
     )
 }
 
-pub fn install(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
+/// Install — or, with `remove`, symmetrically uninstall — the snippet, the agent hooks and
+/// the git hooks. One function for both directions, because the two must agree on exactly
+/// which files they touch or `--remove` cannot be the inverse of `setup`.
+///
+/// Paths are reported repo-relative: every other surface in the product does, and an
+/// absolute tempdir path is unreadable in a terminal and unstable in a snapshot.
+pub fn run(ctx: &Ctx, agent: Agent, remove: bool) -> Result<Vec<SetupChange>> {
     let files = agent_files(ctx, agent);
     let mut edits = Vec::new();
     let mut changes = Vec::new();
 
     let before = read(&files.context);
-    let after = insert_snippet(&before, &snippet(ctx.invoked_as));
+    let after = if remove {
+        before.as_deref().map(excise_snippet)
+    } else {
+        insert_snippet(&before, &snippet(ctx.invoked_as))
+    };
     changes.push(plan_text(
         &mut edits,
         files.context,
@@ -129,81 +133,43 @@ pub fn install(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
 
     if let Some(path) = files.settings {
         let before = read(&path);
-        let entries = hook_entries(ctx.invoked_as, ctx.cfg.hooks.landcheck);
-        let after = merge_settings(before.as_deref(), &entries)?;
-        changes.push(plan_text(
-            &mut edits,
-            path,
-            "agent hooks",
-            before,
-            Some(after),
-        ));
+        let after = if remove {
+            before.as_deref().map(strip_settings).transpose()?.flatten()
+        } else {
+            let entries = hook_entries(ctx.invoked_as, ctx.cfg.hooks.landcheck);
+            Some(merge_settings(before.as_deref(), &entries)?)
+        };
+        // A settings directory that held nothing but our file goes with it. `PruneDir`
+        // refuses a populated directory, so a user's own `.claude/` is safe.
+        let prune = (remove && after.is_none())
+            .then(|| path.parent().map(Path::to_path_buf))
+            .flatten();
+        changes.push(plan_text(&mut edits, path, "agent hooks", before, after));
+        if let Some(p) = prune {
+            edits.push(Edit::PruneDir { path: p });
+        }
     }
 
     crate::cmd::init::apply(&edits)?;
     // The git hooks are part of "setup installs everything": merge badges and the
     // squash-surviving trailer are what make the agent contract's "never state whether
     // something is merged" answerable at all.
-    for h in crate::hooks::install(ctx, false)? {
-        changes.push(SetupChange {
-            path: h.path,
-            what: "git hook",
-            changed: h.action.changed(),
-        });
-    }
-    Ok(report(ctx, agent, changes))
-}
+    let hooks = if remove {
+        crate::hooks::remove(ctx)?
+    } else {
+        crate::hooks::install(ctx, false)?
+    };
+    changes.extend(hooks.into_iter().map(|h| SetupChange {
+        path: h.path,
+        what: "git hook",
+        changed: h.action.changed(),
+    }));
 
-pub fn remove(ctx: &Ctx, agent: Agent) -> Result<SetupReport> {
-    let files = agent_files(ctx, agent);
-    let mut edits = Vec::new();
-    let mut changes = Vec::new();
-
-    let before = read(&files.context);
-    let after = before.as_deref().map(excise_snippet);
-    changes.push(plan_text(
-        &mut edits,
-        files.context,
-        "agent context",
-        before,
-        after,
-    ));
-
-    if let Some(path) = files.settings {
-        let before = read(&path);
-        let after = before.as_deref().map(strip_settings).transpose()?.flatten();
-        let gone = after.is_none();
-        let parent = path.parent().map(std::path::Path::to_path_buf);
-        changes.push(plan_text(&mut edits, path, "agent hooks", before, after));
-        // A settings directory that held nothing but our file goes with it. `PruneDir`
-        // refuses a populated directory, so a user's own `.claude/` is safe.
-        if let (true, Some(p)) = (gone, parent) {
-            edits.push(Edit::PruneDir { path: p });
-        }
-    }
-
-    crate::cmd::init::apply(&edits)?;
-    for h in crate::hooks::remove(ctx)? {
-        changes.push(SetupChange {
-            path: h.path,
-            what: "git hook",
-            changed: h.action.changed(),
-        });
-    }
-    Ok(report(ctx, agent, changes))
-}
-
-/// Report repo-relative paths: every other surface in the product does, and an absolute
-/// tempdir path is unreadable in a terminal and unstable in a snapshot.
-fn report(ctx: &Ctx, agent: Agent, mut files: Vec<SetupChange>) -> SetupReport {
     let root = ctx.repo.primary_root();
-    for c in &mut files {
+    for c in &mut changes {
         c.path = crate::hooks::relative_to(root, &c.path);
     }
-    SetupReport {
-        agent: agent_name(agent),
-        files,
-    }
+    Ok(changes)
 }
 
 /// Turn a before/after pair into an [`Edit`] — or into nothing at all when they agree,
@@ -232,10 +198,6 @@ fn plan_text(
         what,
         changed,
     }
-}
-
-fn read(p: &std::path::Path) -> Option<String> {
-    std::fs::read_to_string(p).ok()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,11 +290,16 @@ fn is_our_event(event: &str) -> bool {
 }
 
 /// Is this a hook entry kanspec owns? Matched on the command, because a settings file has
-/// nowhere to hang a marker that the agent would not have to understand.
+/// nowhere to hang a marker that the agent would not have to understand. Both shipped bin
+/// names count, and so does whatever name this process was invoked under — otherwise a
+/// symlinked binary would stack a fresh entry on every `setup` and `--remove` would strip
+/// none of them.
 fn is_kanspec_command(cmd: &str) -> bool {
-    ["prime", "quirks --touch", "landcheck"]
-        .iter()
-        .any(|verb| ["kanspec", "ks"].iter().any(|bin| word(cmd, bin, verb)))
+    ["prime", "quirks --touch", "landcheck"].iter().any(|verb| {
+        [crate::cli::invoked_as(), "kanspec", "ks"]
+            .iter()
+            .any(|bin| word(cmd, bin, verb))
+    })
 }
 
 /// `bin verb` at a word boundary, so `works prime` and `/opt/ks-tools prime` do not count.

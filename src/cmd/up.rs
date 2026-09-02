@@ -42,7 +42,7 @@ pub fn up(ctx: &Ctx, a: &UpArgs) -> Result<UpReport> {
 
     // The server owns its `Ctx`: `Arc<Ctx>` must outlive this call frame's borrow, and
     // `server::request_ctx` is the same constructor every request uses.
-    let anchor = Arc::new(crate::server::request_ctx(ctx)?);
+    let anchor = Arc::new(crate::server::request_ctx(ctx, "up")?);
 
     if a.open {
         let target = url.clone();

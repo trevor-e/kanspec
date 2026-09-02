@@ -8,6 +8,7 @@
 use serde::Serialize;
 
 use crate::cli::{SpecArgs, SpecCommand};
+use crate::cmd::ticket::{rel_to, write_next};
 use crate::ctx::Ctx;
 use crate::derive::{self, Staleness};
 use crate::error::Result;
@@ -81,7 +82,7 @@ fn new(ctx: &Ctx, raw: &str, feature: Option<&str>, code: &[String]) -> Result<S
     project::regenerate(ctx)?;
 
     Ok(SpecReport::Created {
-        path: rel(ctx, &ctx.layout.spec(&name)),
+        path: rel_to(ctx, &ctx.layout.spec(&name)),
         next: vec![
             format!("{} spec show {name}", ctx.invoked_as),
             format!("{} rules --path <file>", ctx.invoked_as),
@@ -145,13 +146,13 @@ pub fn stale_fix(ctx: &Ctx, name: &SpecName, s: &Staleness) -> String {
 fn grep(ctx: &Ctx, pattern: &str, missing: bool) -> Result<SpecReport> {
     let snap = ctx.snapshot()?;
     let needle = pattern.to_lowercase();
+    let hit = |r: &Rule| {
+        r.text.to_lowercase().contains(&needle) || r.anchor.to_lowercase().contains(&needle)
+    };
     if missing {
         let mut absent: Vec<GrepHit> = Vec::new();
         for spec in snap.specs.values() {
-            let covered = spec.rules.iter().any(|r| {
-                r.text.to_lowercase().contains(&needle) || r.anchor.to_lowercase().contains(&needle)
-            });
-            if !covered {
+            if !spec.rules.iter().any(hit) {
                 absent.push(GrepHit {
                     spec: spec.name.clone(),
                     anchor: String::new(),
@@ -167,29 +168,19 @@ fn grep(ctx: &Ctx, pattern: &str, missing: bool) -> Result<SpecReport> {
     }
     let mut hits = Vec::new();
     for spec in snap.specs.values() {
-        for r in &spec.rules {
-            if r.text.to_lowercase().contains(&needle) || r.anchor.to_lowercase().contains(&needle)
-            {
-                hits.push(GrepHit {
-                    spec: spec.name.clone(),
-                    anchor: r.anchor.clone(),
-                    text: r.text.clone(),
-                    line: r.line,
-                });
-            }
+        for r in spec.rules.iter().filter(|r| hit(r)) {
+            hits.push(GrepHit {
+                spec: spec.name.clone(),
+                anchor: r.anchor.clone(),
+                text: r.text.clone(),
+                line: r.line,
+            });
         }
     }
     Ok(SpecReport::Grepped {
         pattern: pattern.to_string(),
         hits,
     })
-}
-
-fn rel(ctx: &Ctx, p: &std::path::Path) -> String {
-    p.strip_prefix(ctx.repo.primary_root())
-        .unwrap_or(p)
-        .display()
-        .to_string()
 }
 
 impl Render for SpecReport {
@@ -199,14 +190,7 @@ impl Render for SpecReport {
                 Line::new('▸', format!("spec {name} created"))
                     .dim(format!("· {path}"))
                     .write(w, st)?;
-                for n in next {
-                    writeln!(
-                        w,
-                        "  {} {}",
-                        glyph::FIX,
-                        crate::out::paint(n, Color::Cyan, st.color)
-                    )?;
-                }
+                write_next(w, st, next)?;
             }
             SpecReport::Shown {
                 name,

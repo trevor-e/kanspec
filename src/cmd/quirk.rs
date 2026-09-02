@@ -9,6 +9,7 @@
 use serde::Serialize;
 
 use crate::cli::{QuirkArgs, QuirkCommand, QuirksArgs, SeverityArg};
+use crate::cmd::ticket::{first_minted, write_next};
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
 use crate::fm::{self, Yv};
@@ -90,11 +91,18 @@ fn add(
         Ok(plan)
     })?;
 
-    let id = minted_quirk(&done)?;
+    let id = first_minted(&done, "quirk", |e| match e {
+        EntityRef::Quirk(id) => Some(id.clone()),
+        _ => None,
+    })?;
     project::regenerate(ctx)?;
     Ok(QuirkReport::Added {
         next: vec![
-            format!("{} quirks --paths \"{}\"", ctx.invoked_as, first(paths)),
+            format!(
+                "{} quirks --paths \"{}\"",
+                ctx.invoked_as,
+                paths.first().map_or("**", String::as_str)
+            ),
             format!("{} quirk fix {id} --by <ticket>", ctx.invoked_as),
         ],
         id,
@@ -108,10 +116,7 @@ fn add(
 fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
     let id = QuirkId::parse(raw)?;
     let by = TicketId::parse(by)?;
-    let snap = ctx.snapshot()?;
-    let title = snap.quirk(&id)?.fm.title.clone();
-
-    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         let q = s.quirk(&id)?;
         // "Retired only by evidence": the ticket that claims the fix must exist, and a
         // quirk already retired is not evidence of anything new.
@@ -134,9 +139,10 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
     project::regenerate(ctx)?;
 
     Ok(QuirkReport::Fixed {
+        // `Committed::snapshot` is the post-write reload; the title did not move.
+        title: done.snapshot.quirk(&id)?.fm.title.clone(),
         next: vec![format!("{} quirks", ctx.invoked_as)],
         id,
-        title,
         by,
     })
 }
@@ -158,20 +164,6 @@ pub(crate) fn scaffold(
         severity_word(severity),
         fm::emit(&Yv::opt_s(source.map(|t| t.to_string())), false),
     )
-}
-
-fn minted_quirk(done: &crate::store::Committed) -> Result<QuirkId> {
-    done.minted
-        .iter()
-        .find_map(|e| match e {
-            EntityRef::Quirk(id) => Some(id.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| KsError::internal(anyhow::anyhow!("the quirk plan minted no quirk id")))
-}
-
-fn first(paths: &[String]) -> String {
-    paths.first().cloned().unwrap_or_else(|| "**".to_string())
 }
 
 fn severity_of(s: SeverityArg) -> Severity {
@@ -213,15 +205,7 @@ impl Render for QuirkReport {
             ),
         };
         line.write(w, st)?;
-        for n in next {
-            writeln!(
-                w,
-                "  {} {}",
-                glyph::FIX,
-                crate::out::paint(n, Color::Cyan, st.color)
-            )?;
-        }
-        Ok(())
+        write_next(w, st, next)
     }
 }
 
@@ -267,11 +251,15 @@ pub fn quirks(ctx: &Ctx, a: &QuirksArgs) -> Result<QuirksReport> {
         None => Scope::of(&a.paths)?,
     };
 
+    // `reaches`, not `touches`, exactly as `rulesdoc::build` filters quirks: an active quirk
+    // with no `paths:` bounds nothing, so `prime` injects it everywhere — and the hook that
+    // re-warns at the moment of the write must agree, or the landmine `prime` warned about
+    // is the one the write never hears of.
     let mut rows: Vec<QuirkRow> = snap
         .quirks
         .values()
         .filter(|q| q.fm.status == QuirkStatus::Active)
-        .filter(|q| scope.is_unscoped() || scope.touches(&q.fm.paths))
+        .filter(|q| scope.is_unscoped() || scope.reaches(&q.fm.paths))
         .map(|q| QuirkRow {
             id: q.fm.id.clone(),
             title: q.fm.title.clone(),

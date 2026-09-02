@@ -220,7 +220,7 @@ fn idle_secs(snap: &Snapshot, t: &Ticket) -> Option<u64> {
     (snap.now - last).to_std().ok().map(|d| d.as_secs())
 }
 
-fn card<'s>(snap: &'s Snapshot, t: &'s Ticket) -> Card {
+fn card(snap: &Snapshot, t: &Ticket) -> Card {
     let badge = derive::badge(snap, t);
     let blocked_by: Vec<TicketId> = derive::blocked_by(snap, t).into_iter().cloned().collect();
     Card {
@@ -319,16 +319,10 @@ fn worktrees(ctx: &Ctx, snap: &Snapshot) -> Vec<WorktreeRowModel> {
         let fact = ticket.and_then(|t| snap.git.branches.get(&t.fm.id));
         let rev = row.branch.clone().or_else(|| row.head.clone());
 
-        let (ahead, behind) = match fact.and_then(|f| f.ahead.zip(f.behind)) {
-            Some((a, b)) => (Some(a), Some(b)),
-            None => match (main.as_deref(), rev.as_deref()) {
-                (Some(m), Some(r)) => match ctx.git.ahead_behind(m, r) {
-                    Some((a, b)) => (Some(a), Some(b)),
-                    None => (None, None),
-                },
-                _ => (None, None),
-            },
-        };
+        let (ahead, behind) = fact
+            .and_then(|f| f.ahead.zip(f.behind))
+            .or_else(|| ctx.git.ahead_behind(main.as_deref()?, rev.as_deref()?))
+            .map_or((None, None), |(a, b)| (Some(a), Some(b)));
 
         let last_commit_at = fact
             .and_then(|f| f.last_commit_at)
@@ -402,7 +396,7 @@ pub fn render_markdown(m: &BoardModel) -> String {
         for card in &c.cards {
             s.push_str(&format!(
                 "| {} `{}` | {} | {} | {} | {} | {} | {} |\n",
-                chips(card),
+                chip(card),
                 card.id,
                 md_escape(&card.title),
                 opt(card.spec.as_ref().map(|x| x.to_string())),
@@ -471,61 +465,62 @@ pub fn render_markdown(m: &BoardModel) -> String {
 /// terminal renders the same `BoardModel` as one section per column in the `out::Line`
 /// grammar the rest of the CLI already uses, and keeps `out::Table` for the Worktrees
 /// strip, which genuinely is a table.
-pub fn render_terminal(m: &BoardModel, st: &Style) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    let w: &mut dyn std::io::Write = &mut buf;
-
+pub fn render_terminal(
+    m: &BoardModel,
+    w: &mut dyn std::io::Write,
+    st: &Style,
+) -> std::io::Result<()> {
     // Pinned strip, top: the `kanspec status` attention list.
     if !m.attention.is_empty() {
-        let _ = writeln!(
+        writeln!(
             w,
             " {}",
             crate::out::paint("ATTENTION", Color::Bold, st.color)
-        );
+        )?;
         for a in &m.attention {
             let mut line = Line::new(a.glyph, a.line.as_str());
             if !a.subject.is_empty() {
                 line = line.id(&a.subject);
             }
-            let _ = line.fix(a.fix.as_str()).write(w, st);
+            line.fix(a.fix.as_str()).write(w, st)?;
         }
-        let _ = writeln!(w);
+        writeln!(w)?;
     }
 
     for c in &m.columns {
-        let _ = writeln!(
+        writeln!(
             w,
             " {} {}",
             crate::out::paint(c.title, Color::Bold, st.color),
             crate::out::paint(&format!("({})", c.cards.len()), Color::Dim, st.color)
-        );
+        )?;
         if c.cards.is_empty() {
-            let _ = writeln!(w, "   {}", crate::out::paint("—", Color::Dim, st.color));
+            writeln!(w, "   {}", crate::out::paint("—", Color::Dim, st.color))?;
         }
         for card in &c.cards {
             let mut line = Line::new(card_glyph(card), card.title.as_str()).id(&card.id);
             if let Some(f) = &card.fix {
                 line = line.fix(f.as_str());
             }
-            let _ = line.write(w, st);
+            line.write(w, st)?;
             let detail = card_detail(card);
             if !detail.is_empty() {
-                let _ = writeln!(
+                writeln!(
                     w,
                     "             {}",
                     crate::out::paint(&detail, Color::Dim, st.color)
-                );
+                )?;
             }
         }
-        let _ = writeln!(w);
+        writeln!(w)?;
     }
 
     if !m.worktrees.is_empty() {
-        let _ = writeln!(
+        writeln!(
             w,
             " {}",
             crate::out::paint("WORKTREES", Color::Bold, st.color)
-        );
+        )?;
         let mut t = crate::out::Table::new(
             &[
                 "path", "branch", "ticket", "agent", "commit", "±main", "merge",
@@ -543,25 +538,24 @@ pub fn render_terminal(m: &BoardModel, st: &Style) -> String {
                 row.badge_text.clone(),
             ]);
         }
-        let _ = writeln!(w, "{t}");
+        writeln!(w, "{t}")?;
     }
 
     // Pinned strip, bottom: the feature map with its staleness dots.
     if !m.features.is_empty() {
-        let _ = writeln!(
+        writeln!(
             w,
             " {}",
             crate::out::paint("FEATURES", Color::Bold, st.color)
-        );
+        )?;
         for f in &m.features {
-            let _ = Line::new(staleness_glyph(&f.staleness), f.feature.as_str())
+            Line::new(staleness_glyph(&f.staleness), f.feature.as_str())
                 .id(&f.spec)
                 .dim(f.note.as_str())
-                .write(w, st);
+                .write(w, st)?;
         }
     }
-
-    String::from_utf8(buf).unwrap_or_default()
+    Ok(())
 }
 
 /// The IN-MAIN overlay outranks the stored glyph: a review ticket git says has landed is
@@ -636,14 +630,13 @@ pub fn cache_age_line(m: &BoardModel) -> String {
     }
 }
 
-fn chips(c: &Card) -> String {
-    let mut s = String::new();
+/// The one glyph the export table gets per card: the ◇ discovered chip wins over the state.
+fn chip(c: &Card) -> char {
     if c.discovered_in.is_some() {
-        s.push(glyph::DISCOVERED);
+        glyph::DISCOVERED
     } else {
-        s.push(card_glyph(c));
+        card_glyph(c)
     }
-    s
 }
 
 fn ahead_behind(w: &WorktreeRowModel) -> String {
@@ -774,7 +767,9 @@ mod tests {
     #[test]
     fn the_terminal_board_carries_the_badge_and_the_cache_age() {
         let m = a_model();
-        let out = render_terminal(&m, &Style::plain());
+        let mut buf: Vec<u8> = Vec::new();
+        render_terminal(&m, &mut buf, &Style::plain()).unwrap();
+        let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("DOING"), "{out}");
         assert!(out.contains("t-9c41"), "{out}");
         assert!(out.contains("unpushed"), "{out}");
@@ -835,7 +830,7 @@ mod tests {
         let mut c = a_card("t-66d1");
         c.discovered_in = Some(TicketId::parse("t-9c41").unwrap());
         assert!(card_detail(&c).contains("◇ discovered in t-9c41"), "{c:?}");
-        assert_eq!(chips(&c), "◇");
+        assert_eq!(chip(&c), '◇');
     }
 
     #[test]

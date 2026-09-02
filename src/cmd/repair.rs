@@ -57,11 +57,7 @@ pub fn repair(ctx: &Ctx, a: &RepairArgs) -> Result<RepairReport> {
     // it necessarily replays clean.
     let was = transitions::replay(&t.log).ok().map(|s| s.to_string());
 
-    let f = Facts {
-        actor: ctx.actor.clone(),
-        at: ctx.now,
-        invocation: ctx.invocation(),
-    };
+    let f = crate::cmd::ticket::facts(ctx);
     let done = Store::open(ctx).transact(Some(Verb::Repair), &ctx.invocation(), |s, m| {
         plan_repair(s, &f, a, m)
     })?;
@@ -151,13 +147,16 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
     // are interleaved out of order — or an attestation dated before the last entry — is
     // still beyond this verb. Saying so HERE, naming the violation and the file, beats
     // letting `transact` refuse the write from three layers down with a message about a
-    // plan the user never wrote.
+    // plan the user never wrote. The note is the state a human vouched for, and why — read
+    // by a person and by `doctor`, never by a planner: `replay` takes the state from the
+    // entry's own column.
+    let detail = format!("attested {} — {why}", t.fm.state);
     let entry = LogEntry {
         at: f.at,
         state: t.fm.state,
         actor: f.actor.label(),
         verb: Verb::Repair,
-        note: Some(detail(t.fm.state, why)),
+        note: Some(detail.clone()),
     };
     let mut replayed = t.log.clone();
     replayed.push(entry);
@@ -181,15 +180,9 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
         verb: Verb::Repair,
         actor: f.actor.clone(),
         at: f.at,
-        detail: detail(t.fm.state, why),
+        detail,
         also: Vec::new(),
     }]))
-}
-
-/// The `## Log` note: the state a human vouched for, and why. Read by a person and by
-/// `doctor`, never by a planner — `replay` takes the state from the entry's own column.
-fn detail(state: State, why: &str) -> String {
-    format!("attested {state} — {why}")
 }
 
 impl Render for RepairReport {

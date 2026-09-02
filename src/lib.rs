@@ -92,14 +92,9 @@ pub fn run(invoked_as: &'static str) -> ExitCode {
         }
     };
 
-    let color = out::apply_color_policy(cli.color);
-    let mode = if cli.json {
-        OutMode::Json
-    } else {
-        OutMode::Human { color }
-    };
-
-    let ctx = match Ctx::open(&cli, &cwd()) {
+    let mode = OutMode::from_cli(&cli);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let ctx = match Ctx::open(&cli, &cwd) {
         Ok(c) => c,
         Err(e) => {
             e.render(&mode);
@@ -114,10 +109,6 @@ pub fn run(invoked_as: &'static str) -> ExitCode {
             ExitCode::from(e.exit_code())
         }
     }
-}
-
-fn cwd() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Returns `Result<u8>` rather than `Result<()>` so a **successful** run can still exit

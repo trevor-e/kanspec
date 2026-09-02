@@ -53,7 +53,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::git::Git;
+use crate::git::{Git, GitOut};
 
 /// The `[git] gh` policy. Aliased here so `Gh::detect(git, cfg: &GhCfg)` reads exactly as
 /// the contract writes it while there is still only one definition of the enum.
@@ -92,24 +92,43 @@ pub struct Gh {
     authed: OnceLock<bool>,
 }
 
-/// Never an error type: a `gh` failure is inconclusive, never "not merged" (invariant 2).
-#[derive(Debug, Clone, Serialize)]
+/// Never one of the crate's error shapes: a `gh` failure is inconclusive, never "not
+/// merged" (invariant 2).
+#[derive(Debug, Clone, Serialize, thiserror::Error)]
+#[error("{0}")]
 pub struct GhUnavailable(pub String);
 
-impl std::fmt::Display for GhUnavailable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
+/// Read straight off what `gh --json` prints. `gh` speaks camelCase and wraps the merge
+/// commit in an object (`"mergeCommit": {"oid": "…"}` or `null`) — verified against real
+/// `gh pr view`/`gh pr list` output, recorded in `tests/fixtures/gh/`. Unknown fields are
+/// tolerated on purpose: `gh pr list` adds `headRefName`, and a future `gh` may add more.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PrInfo {
     pub number: u64,
     pub state: PrState,
+    #[serde(default)]
     pub merged_at: Option<DateTime<Utc>>,
+    #[serde(default, deserialize_with = "oid")]
     pub merge_commit: Option<String>,
+    #[serde(default)]
     pub head_ref_oid: String,
+    #[serde(default)]
     pub url: String,
+}
+
+/// `{"oid": "…"}` -> the oid. An empty `oid` is not a SHA: old PRs really do come back
+/// with one, and a blank string would sail straight into `Sha::mint` as a `None` nobody
+/// expected — better to say "gh knows of no merge commit" here.
+fn oid<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    struct Oid {
+        #[serde(default)]
+        oid: String,
+    }
+    Ok(Option::<Oid>::deserialize(d)?
+        .map(|o| o.oid)
+        .filter(|s| !s.trim().is_empty()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,54 +137,6 @@ pub enum PrState {
     Open,
     Closed,
     Merged,
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// The wire shapes — what `gh --json` actually prints
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// `gh` speaks camelCase and wraps the merge commit in an object (`"mergeCommit":
-/// {"oid": "…"}` or `null`) — verified against real `gh pr view`/`gh pr list` output,
-/// recorded in `tests/fixtures/gh/`. Unknown fields are tolerated on purpose: `gh pr list`
-/// adds `headRefName`, and a future `gh` may add more.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PrWire {
-    number: u64,
-    state: PrState,
-    #[serde(default)]
-    merged_at: Option<DateTime<Utc>>,
-    #[serde(default)]
-    merge_commit: Option<OidWire>,
-    #[serde(default)]
-    head_ref_oid: String,
-    #[serde(default)]
-    url: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OidWire {
-    #[serde(default)]
-    oid: String,
-}
-
-impl PrWire {
-    fn into_info(self) -> PrInfo {
-        PrInfo {
-            number: self.number,
-            state: self.state,
-            merged_at: self.merged_at,
-            // An empty `oid` is not a SHA. Old PRs really do come back with one, and a
-            // blank string would sail straight into `Sha::mint` as a `None` nobody
-            // expected — better to say "gh knows of no merge commit" here.
-            merge_commit: self
-                .merge_commit
-                .map(|c| c.oid)
-                .filter(|s| !s.trim().is_empty()),
-            head_ref_oid: self.head_ref_oid,
-            url: self.url,
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -250,17 +221,11 @@ impl Gh {
     }
 
     pub fn pr_view(&self, n: u64) -> std::result::Result<PrInfo, GhUnavailable> {
-        // The gate comes first even on the fixture path, so `gh = "never"` means never —
-        // including in a suite that has recordings on disk for other tickets.
-        self.gate()?;
-        let wire: PrWire = match &self.fixtures {
-            Some(dir) => read_fixture(dir, &fixture_name_pr(n))?,
-            None => {
-                let num = n.to_string();
-                self.json(&["pr", "view", &num, "--json", PR_FIELDS])?
-            }
-        };
-        Ok(wire.into_info())
+        let num = n.to_string();
+        self.query(
+            &fixture_name_pr(n),
+            &["pr", "view", &num, "--json", PR_FIELDS],
+        )
     }
 
     /// REQUIRED, not optional: a squash-merged ticket with `pr: null` would otherwise skip
@@ -274,17 +239,13 @@ impl Gh {
     /// An empty `Vec` is a real, successful answer meaning "GitHub knows of no PR for this
     /// branch" — inconclusive at the ladder, never a negative.
     pub fn pr_for_head(&self, branch: &str) -> std::result::Result<Vec<PrInfo>, GhUnavailable> {
-        self.gate()?;
-        let mut list: Vec<PrInfo> = match &self.fixtures {
-            Some(dir) => read_fixture::<Vec<PrWire>>(dir, &fixture_name_head(branch))?,
-            None => self.json::<Vec<PrWire>>(&[
+        let mut list: Vec<PrInfo> = self.query(
+            &fixture_name_head(branch),
+            &[
                 "pr", "list", "--head", branch, "--state", "all", "--limit", LIST_LIMIT, "--json",
                 PR_FIELDS,
-            ])?,
-        }
-        .into_iter()
-        .map(PrWire::into_info)
-        .collect();
+            ],
+        )?;
         // Merged first, newest merge first; everything GitHub never merged sorts last.
         list.sort_by(|a, b| {
             let key = |p: &PrInfo| (p.state == PrState::Merged, p.merged_at, p.number);
@@ -294,6 +255,21 @@ impl Gh {
     }
 
     // ── internals ────────────────────────────────────────────────────────────
+
+    /// Every query: the gate, then the recording when the seam is on, else live `gh`. The
+    /// gate comes first even on the fixture path, so `gh = "never"` means never — including
+    /// in a suite that has recordings on disk for other tickets.
+    fn query<T: DeserializeOwned>(
+        &self,
+        stem: &str,
+        args: &[&str],
+    ) -> std::result::Result<T, GhUnavailable> {
+        self.gate()?;
+        match &self.fixtures {
+            Some(dir) => read_fixture(dir, stem),
+            None => self.json(args),
+        }
+    }
 
     /// The refusal every live query starts with, so a disabled or absent `gh` can never
     /// reach the network — and so its reason reaches the badge instead of an empty result.
@@ -423,16 +399,11 @@ fn read_fixture<T: DeserializeOwned>(
 // never answers
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Captured {
-    code: i32,
-    out: String,
-    err: String,
-}
-
 /// Spawn, drain both pipes on their own threads (so a large answer cannot deadlock on a
 /// full pipe buffer), and kill the child if it outlives `limit`. `Err` is a one-clause
-/// reason, ready to be appended to the command that produced it.
-fn run_capped(mut cmd: Command, limit: Duration) -> std::result::Result<Captured, String> {
+/// reason, ready to be appended to the command that produced it. The capture has the same
+/// shape as a `git` run, so it borrows `GitOut` rather than minting a twin.
+fn run_capped(mut cmd: Command, limit: Duration) -> std::result::Result<GitOut, String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -454,7 +425,7 @@ fn run_capped(mut cmd: Command, limit: Duration) -> std::result::Result<Captured
         }
         std::thread::sleep(POLL);
     };
-    Ok(Captured {
+    Ok(GitOut {
         code: status.code().unwrap_or(-1),
         // The child has exited, so both pipes are closed and both reads have finished.
         out: out_t.join().unwrap_or_default(),
@@ -483,25 +454,26 @@ fn detail(s: &str) -> String {
 }
 
 /// `git@github.com:owner/repo.git` · `https://github.com/owner/repo(.git)` ·
-/// `ssh://git@github.com/owner/repo.git` · `github.com/owner/repo`.
+/// `ssh://git@github.com/owner/repo.git` · `ssh://git@ssh.github.com:443/owner/repo.git` ·
+/// `github.com/owner/repo`.
 ///
 /// `None` for anything `gh` cannot speak for — a bare local path (every `TestRepo`), a
 /// non-GitHub host, or a URL with no `owner/name` in it.
 fn parse_slug(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
-    let rest = match url.split_once("://") {
-        // scheme://[user@]host/owner/repo
-        Some((_scheme, after)) => after,
-        None => url,
-    };
-    // scp-like `git@host:owner/repo` — the only form where the separator is a colon.
-    let (host, path) = match rest.split_once('@') {
-        Some((_user, after)) => match after.split_once(':') {
-            Some((h, p)) => (h, p),
-            None => after.split_once('/')?,
-        },
-        None => rest.split_once('/')?,
+    let (host, path) = match url.split_once("://") {
+        // scheme://[user[:token]@]host[:port]/owner/repo — a colon here is a PORT, which
+        // is what GitHub's documented SSH-over-443 remote carries.
+        Some((_scheme, after)) => {
+            let after = after.rsplit_once('@').map_or(after, |(_, a)| a);
+            after.split_once('/')?
+        }
+        // scp-like `git@host:owner/repo` — the only form where the separator is a colon.
+        None => {
+            let rest = url.rsplit_once('@').map_or(url, |(_, a)| a);
+            rest.split_once(':').or_else(|| rest.split_once('/'))?
+        }
     };
     // A port, if the URL carried one, is not part of the host name.
     let host = host.split(':').next().unwrap_or(host);
@@ -584,12 +556,18 @@ mod tests {
     #[test]
     fn pr_json_from_gh_deserializes() {
         let p: PrInfo = serde_json::from_str(
-            r#"{"number":142,"state":"MERGED","merged_at":"2026-08-30T16:02:00Z",
-                "merge_commit":"a1b9c3d","head_ref_oid":"deadbee","url":"https://x/pull/142"}"#,
+            r#"{"number":142,"state":"MERGED","mergedAt":"2026-08-30T16:02:00Z",
+                "mergeCommit":{"oid":"a1b9c3d"},"headRefOid":"deadbee","url":"https://x/pull/142"}"#,
         )
         .unwrap();
         assert_eq!(p.state, PrState::Merged);
         assert_eq!(p.number, 142);
+        assert_eq!(p.merge_commit.as_deref(), Some("a1b9c3d"));
+        // A blank oid is "no merge commit", never a SHA.
+        let p: PrInfo =
+            serde_json::from_str(r#"{"number":1,"state":"MERGED","mergeCommit":{"oid":""}}"#)
+                .unwrap();
+        assert_eq!(p.merge_commit, None);
     }
 
     // ── the recorded shapes ──────────────────────────────────────────────────
@@ -824,6 +802,8 @@ mod tests {
             "https://github.com/cli/cli",
             "https://github.com/cli/cli/",
             "ssh://git@github.com/cli/cli.git",
+            // GitHub's documented SSH-over-HTTPS-port remote: the colon is a port here.
+            "ssh://git@ssh.github.com:443/cli/cli.git",
             "https://user:token@github.com/cli/cli.git",
             "github.com/cli/cli",
             "https://www.github.com/cli/cli",
@@ -932,7 +912,7 @@ mod tests {
             }
         }
         fn recorded(json: &str) -> PrInfo {
-            serde_json::from_str::<PrWire>(json).unwrap().into_info()
+            serde_json::from_str(json).unwrap()
         }
         #[track_caller]
         fn same(live: &PrInfo, rec: &PrInfo) {
@@ -966,11 +946,7 @@ mod tests {
         );
 
         // …and the rung that exists because `pr:` is so often null.
-        let rec_list: Vec<PrInfo> = serde_json::from_str::<Vec<PrWire>>(LIST_MERGED)
-            .unwrap()
-            .into_iter()
-            .map(PrWire::into_info)
-            .collect();
+        let rec_list: Vec<PrInfo> = serde_json::from_str(LIST_MERGED).unwrap();
         let list = deno.pr_for_head(RECORDED_BRANCH).unwrap();
         same(
             merged_pr(&list).expect("that branch really did land"),

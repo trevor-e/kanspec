@@ -52,7 +52,7 @@ impl Repo {
         let primary_root = if !linked {
             // Not `common_dir.parent()`: `--separate-git-dir` puts the git dir anywhere.
             if toplevel.is_empty() {
-                return Err(env_err(
+                return Err(KsError::environment(
                     EnvCode::NotARepo,
                     "git reported no working tree (bare repository?)",
                     fixes![fix!("cd into a checkout of the repository")],
@@ -69,7 +69,7 @@ impl Repo {
             .ok()
             .and_then(|o| o.lines().next().map(|l| canon(Path::new(l.trim()))));
         if primary_git_dir.as_deref() != Some(common_dir.as_path()) {
-            return Err(env_err(
+            return Err(KsError::environment(
                 EnvCode::AmbiguousWorktree,
                 format!(
                     "cannot tell which worktree owns .kanspec/: {} resolves to {}, not {}",
@@ -115,31 +115,39 @@ impl Repo {
     }
 }
 
-fn rev_parse(dir: &Path) -> Result<String> {
-    let out = Command::new("git")
+/// The one `git` spawn in this file. `Git` needs a root, so discovery cannot use it.
+fn git_out(dir: &Path, args: &[&str]) -> Result<std::process::Output> {
+    Command::new("git")
         .arg("-C")
         .arg(dir)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-            "--git-dir",
-            "--show-toplevel",
-        ])
+        .args(args)
         // git sets GIT_DIR when running hooks, and env beats `-C`.
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
         .output()
         .map_err(|e| {
-            env_err(
+            KsError::environment(
                 EnvCode::GitMissing,
                 format!("cannot run `git`: {e}"),
                 fixes![fix!("install git and re-run")],
             )
-        })?;
+        })
+}
+
+fn rev_parse(dir: &Path) -> Result<String> {
+    let out = git_out(
+        dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+            "--git-dir",
+            "--show-toplevel",
+        ],
+    )?;
     if !out.status.success() {
-        return Err(env_err(
+        return Err(KsError::environment(
             EnvCode::NotARepo,
             format!("{} is not inside a git repository", dir.display()),
             fixes![fix!("git init"), fix!("cd into your repository")],
@@ -150,36 +158,18 @@ fn rev_parse(dir: &Path) -> Result<String> {
 
 /// The FIRST stanza of `git worktree list --porcelain` is always the primary worktree.
 fn first_worktree(dir: &Path) -> Result<PathBuf> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .map_err(|e| {
-            env_err(
-                EnvCode::GitMissing,
-                format!("cannot run `git`: {e}"),
-                fixes![fix!("install git and re-run")],
-            )
-        })?;
+    let out = git_out(dir, &["worktree", "list", "--porcelain", "-z"])?;
     let text = String::from_utf8_lossy(&out.stdout);
     text.split('\0')
         .find_map(|rec| rec.strip_prefix("worktree "))
         .map(|p| canon(Path::new(p)))
         .ok_or_else(|| {
-            env_err(
+            KsError::environment(
                 EnvCode::AmbiguousWorktree,
                 "git worktree list named no primary worktree",
                 fixes![fix!("git worktree list"), fix!("git worktree repair")],
             )
         })
-}
-
-fn env_err(code: EnvCode, message: impl Into<String>, fix: crate::error::Fixes) -> KsError {
-    KsError::environment(code, message, fix)
 }
 
 /// `canonicalize` when the path exists (macOS `/tmp` -> `/private/tmp` matters for the

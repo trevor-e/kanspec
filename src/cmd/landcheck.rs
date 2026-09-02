@@ -29,16 +29,6 @@ pub enum Status {
     Block(BlockToken),
 }
 
-impl Status {
-    pub fn code(self) -> u8 {
-        match self {
-            Status::Ok => 0,
-            Status::Violation => 1,
-            Status::Block(_) => 2,
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct LandcheckReport {
     pub blocked: bool,
@@ -50,8 +40,8 @@ pub struct LandcheckReport {
 }
 
 impl LandcheckReport {
-    /// Borrowing, unlike `Status::code`, because `dispatch` needs the code without
-    /// consuming the report it still has to emit.
+    /// Borrowing, because `dispatch` needs the code without consuming the report it still
+    /// has to emit.
     pub fn exit_code(&self) -> u8 {
         match self.status {
             Status::Ok => crate::error::code::OK,
@@ -95,18 +85,16 @@ pub fn landcheck(ctx: &Ctx, a: &LandcheckArgs) -> Result<LandcheckReport> {
     let s = ctx.snapshot()?;
     let mut reasons = Vec::new();
 
-    // 1 — git says it landed; the ticket says otherwise.
     for t in s.tickets.values() {
+        // 1 — git says it landed; the ticket says otherwise. (`in_main` is `None` for a
+        // terminal ticket, so a closed one never lands here.)
         if crate::derive::in_main(&s, t).is_some() {
             reasons.push(format!(
                 "{} is in main and still open → {} done {}",
                 t.fm.id, ctx.invoked_as, t.fm.id
             ));
         }
-    }
-
-    // 2 — review feedback nobody answered, on a proposal this session is implementing.
-    for t in s.tickets.values() {
+        // 2 — review feedback nobody answered, on a proposal this session is implementing.
         if t.fm.state.terminal() {
             continue;
         }
@@ -117,8 +105,8 @@ pub fn landcheck(ctx: &Ctx, a: &LandcheckArgs) -> Result<LandcheckReport> {
         let open = crate::cmd::proposal::unresolved(&s, p);
         if open > 0 {
             reasons.push(format!(
-                "{pid} has {open} unresolved review thread{} → {} comments {pid} --unresolved",
-                if open == 1 { "" } else { "s" },
+                "{pid} has {} → {} comments {pid} --unresolved",
+                crate::cmd::proposal::plural(open, "unresolved review thread"),
                 ctx.invoked_as
             ));
         }

@@ -19,22 +19,20 @@ pub struct SetupReport {
 }
 
 pub fn setup(ctx: &Ctx, a: &SetupArgs) -> Result<SetupReport> {
-    let r = if a.remove {
-        crate::setup::remove(ctx, a.agent)?
-    } else {
-        // Installing the snippet into a repo with no store would point an agent at verbs
-        // that all refuse. `--remove` deliberately does not require one: cleaning up after
-        // a deleted store must always work.
+    // Installing the snippet into a repo with no store would point an agent at verbs that
+    // all refuse. `--remove` deliberately does not require one: cleaning up after a deleted
+    // store must always work.
+    if !a.remove {
         ctx.require_initialized()?;
-        crate::setup::install(ctx, a.agent)?
-    };
+    }
+    let agent = crate::setup::agent_name(a.agent);
     Ok(SetupReport {
-        agent: r.agent,
+        agent,
         removed: a.remove,
-        changes: r.files,
+        changes: crate::setup::run(ctx, a.agent, a.remove)?,
         next: if a.remove {
             vec![
-                format!("{} setup {}", ctx.invoked_as, r.agent),
+                format!("{} setup {agent}", ctx.invoked_as),
                 // The git hooks went with it; this is how they come back without
                 // re-scaffolding.
                 format!("{} init --refresh-hooks", ctx.invoked_as),
@@ -80,18 +78,15 @@ pub struct InstructionsReport {
 }
 
 pub fn instructions(_ctx: &Ctx, a: &InstructionsArgs) -> Result<InstructionsReport> {
-    match &a.topic {
-        Some(t) => Ok(InstructionsReport {
-            text: Some(crate::instructions::render(t)?),
-            topic: Some(t.clone()),
-            topics: crate::instructions::topics(),
-        }),
-        None => Ok(InstructionsReport {
-            topic: None,
-            text: None,
-            topics: crate::instructions::topics(),
-        }),
-    }
+    Ok(InstructionsReport {
+        text: a
+            .topic
+            .as_deref()
+            .map(crate::instructions::render)
+            .transpose()?,
+        topic: a.topic.clone(),
+        topics: crate::instructions::topics(),
+    })
 }
 
 impl Render for InstructionsReport {

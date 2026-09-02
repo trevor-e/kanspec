@@ -37,8 +37,9 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor, GITSTATE_VERSION};
+use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor};
 use crate::ctx::{Actor, Ctx};
+use crate::derive::note_sha;
 use crate::error::{GateDetail, KsError, Result};
 use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
@@ -49,15 +50,10 @@ use crate::plan::{EntityRef, Op, Plan};
 use crate::transitions::Verb;
 use crate::{fix, fixes};
 
-/// Past this, a verdict reached by *elimination* is stamped with the fetch age instead:
-/// "nothing on main mentions you" is only as true as the last fetch. Mirrors the default
-/// of `[windows] fetch_max_age_secs`; the ladder takes no config, so the constant lives
-/// beside the rung that reads it.
-const FETCH_MAX_SECS: u64 = 300;
-
 /// The `## Log` note `scan --confirm` writes and [`confirmed_proof`] reads back. It is a
 /// stable prefix rather than free prose, because this line **is** the attestation's
-/// storage — the cache is not.
+/// storage — the cache is not. `derive::PROOF_NOTE` mirrors it (that file may import
+/// nothing from here), and [`note_sha`] is the one parser both sides read it back through.
 const CONFIRM_NOTE: &str = "in main";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,23 +237,6 @@ pub struct ScanToken(());
 // The ladder's value types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Three-state per rung. Ancestry-NEGATIVE is `Inconclusive`, not `NotMerged`: a
-/// squash-merged branch is genuinely not an ancestor of main. **Only rungs that can PROVE
-/// absence may say No.**
-pub enum Rung {
-    Merged(Evidence),
-    NotMerged(Evidence),
-    Inconclusive(Unknown),
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct Evidence {
-    pub method: Method,
-    pub saw: String,
-    pub sha: Option<Sha>,
-    pub pr: Option<u64>,
-}
-
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "verdict", rename_all = "snake_case")]
 pub enum Verdict {
@@ -296,46 +275,40 @@ impl Detection {
     pub fn checked_at(&self) -> DateTime<Utc> {
         self.checked_at
     }
-    pub fn fetch_age_secs(&self) -> Option<u64> {
-        self.fetch_age_secs
-    }
     pub fn explain(&self) -> &[RungTrace] {
         &self.rungs
     }
     /// Down-converts the sealed, in-process value to the plain cache DTO. The cache is
     /// badge-grade; the gate is proof-grade. **There is deliberately no inverse.**
     pub fn to_fact(&self, changed: Vec<String>) -> MergeFact {
-        match &self.verdict {
-            Verdict::Landed { sha, method, pr } => MergeFact {
-                status: MergeStatus::Merged,
-                sha: Some(sha.as_str().to_string()),
-                method: *method,
-                pr: *pr,
-                why: None,
-                checked_at: self.checked_at,
-                changed,
-            },
-            Verdict::NotLanded => MergeFact {
-                status: MergeStatus::NotMerged,
-                sha: None,
-                // No method concluded, so none is claimed. The rung table lives in
-                // `Detection`, which is where `--explain` reads it from.
-                method: Method::None,
-                pr: None,
-                why: None,
-                checked_at: self.checked_at,
-                changed,
-            },
-            Verdict::Unknown(u) => MergeFact {
-                status: MergeStatus::Unknown,
-                sha: None,
-                method: Method::None,
-                // The badge explains itself without re-running anything.
-                why: Some(u.badge()),
-                pr: None,
-                checked_at: self.checked_at,
-                changed,
-            },
+        let (status, sha, method, pr, why) = match &self.verdict {
+            Verdict::Landed { sha, method, pr } => (
+                MergeStatus::Merged,
+                Some(sha.as_str().to_string()),
+                *method,
+                *pr,
+                None,
+            ),
+            // No method concluded, so none is claimed. The rung table lives in
+            // `Detection`, which is where `--explain` reads it from.
+            Verdict::NotLanded => (MergeStatus::NotMerged, None, Method::None, None, None),
+            // The badge explains itself without re-running anything.
+            Verdict::Unknown(u) => (
+                MergeStatus::Unknown,
+                None,
+                Method::None,
+                None,
+                Some(u.badge()),
+            ),
+        };
+        MergeFact {
+            status,
+            sha,
+            method,
+            pr,
+            why,
+            checked_at: self.checked_at,
+            changed,
         }
     }
 }
@@ -347,7 +320,7 @@ impl Detection {
 /// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
 /// [`ladder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeadOrigin {
+pub(crate) enum HeadOrigin {
     /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
     /// is proof the branch carried commits of its own.
     Recorded,
@@ -360,31 +333,13 @@ enum HeadOrigin {
 /// resolved *through git*, because [`Sha`] has no public constructor: a SHA in this crate
 /// is provably something git printed, never something an agent typed.
 fn head_of(git: &Git, t: &Ticket) -> std::result::Result<(Sha, HeadOrigin), Unknown> {
-    let recorded =
-        t.fm.head
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "null");
-    if let Some(h) = recorded {
-        return match git.head_sha(h) {
-            Ok(hs) => Ok((hs.sha().clone(), HeadOrigin::Recorded)),
-            // gc'd after reflog expiry (D-8), or a rewritten history. Never "not merged".
-            Err(_) => Err(Unknown::HeadNotInObjectStore { sha: h.to_string() }),
-        };
-    }
-    let branch =
-        t.fm.branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-    let Some(b) = branch else {
-        return Err(Unknown::NoHead);
-    };
-    match git.head_sha(b) {
-        Ok(hs) => Ok((hs.sha().clone(), HeadOrigin::BranchTip)),
-        // The branch was deleted after the merge and no `head:` was ever recorded, so
-        // there is nothing left to ask git about.
-        Err(_) => Err(Unknown::HeadNotInObjectStore { sha: b.to_string() }),
+    let (rev, origin) = ticket_rev(t).ok_or(Unknown::NoHead)?;
+    match git.head_sha(&rev) {
+        Ok(hs) => Ok((hs.sha().clone(), origin)),
+        // A recorded head gc'd after reflog expiry (D-8) or rewritten away, or a branch
+        // deleted after the merge with no `head:` ever recorded: nothing left to ask git
+        // about. Never "not merged".
+        Err(_) => Err(Unknown::HeadNotInObjectStore { sha: rev }),
     }
 }
 
@@ -697,15 +652,11 @@ pub fn ladder(
             tr.push(trace(Method::PatchId, &cmd, 128, &saw, "unknown"));
             done!(Verdict::Unknown(u))
         }
-        Tri::No => {}
+        // `cherry` never answers `No` — a `+` line is Unknown by policy (above) — so this
+        // arm is the type's exhaustiveness, not a rung: the ladder alone never reaches
+        // `NotLanded`, which is R-4 stated as control flow.
+        Tri::No => done!(Verdict::NotLanded),
     }
-
-    // Every rung declined without even a suspicion. Stale fetch is the most actionable
-    // reason to name.
-    if let Some(a) = age.filter(|a| *a > FETCH_MAX_SECS) {
-        done!(Verdict::Unknown(Unknown::FetchStale { age_secs: a }))
-    }
-    done!(Verdict::NotLanded)
 }
 
 /// The `done` gate. **RE-RUNS the ladder** rather than trusting the cache — "a 60s-old
@@ -747,7 +698,6 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
 pub struct ScanOpts {
     pub fetch: bool,
     pub only: Option<TicketId>,
-    pub quiet: bool,
 }
 
 /// Runs the ladder across every non-terminal ticket + spec anchors + branch facts. The
@@ -778,14 +728,19 @@ pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<S
     let main = ctx.git.resolve_main(&ctx.cfg.main)?;
     let fetch_age = ctx.git.fetch_age();
 
-    // A TARGETED scan must not discard the facts it did not recompute; a full scan starts
-    // clean so a deleted ticket's fact cannot outlive it. Facts computed against a
-    // different `main` are discarded either way — mixing them would answer "merged into
-    // what?" with two different branches.
+    // A TARGETED scan must not discard the per-ticket facts it did not recompute; a full
+    // scan starts clean so a deleted ticket's fact cannot outlive it. ONLY the per-ticket
+    // maps carry over: spec anchors and glob rot are recomputed whole below, and keeping the
+    // old maps would let a deleted spec's anchor, or a revoked decision's rot row, outlive
+    // the record until the next full scan. Facts computed against a different `main` are
+    // discarded either way — mixing them would answer "merged into what?" with two
+    // different branches. (`cache::load` already discards any other `version`.)
     let mut state = match &opts.only {
-        Some(_) if snap.git.main == main && snap.git.version == GITSTATE_VERSION => {
-            snap.git.clone()
-        }
+        Some(_) if snap.git.main == main => GitState {
+            tickets: snap.git.tickets.clone(),
+            branches: snap.git.branches.clone(),
+            ..GitState::default()
+        },
         _ => GitState::default(),
     };
     state.main = main.clone();
@@ -885,7 +840,7 @@ const TRAILER_DIFF_MAX: usize = 20;
 /// caller reaching for `Git::changed_paths` directly would silently reacquire the three-dot
 /// hole this function exists to close.
 pub fn touched_paths(git: &Git, t: &Ticket, main: &str) -> Vec<String> {
-    let Some(rev) = ticket_rev(t) else {
+    let Some((rev, _)) = ticket_rev(t) else {
         return Vec::new();
     };
     let mut out = added_or_modified(git.changed_paths(main, &rev));
@@ -917,26 +872,25 @@ fn added_or_modified(paths: Tri<Vec<crate::git::ChangedPath>>) -> Vec<String> {
     }
 }
 
-/// `head:` if recorded, else the branch — the same "head-or-tip" [`head_of`] resolves,
-/// as a rev string for the git calls that take one.
-fn ticket_rev(t: &Ticket) -> Option<String> {
-    t.fm.head
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "null")
-        .or_else(|| {
-            t.fm.branch
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .map(str::to_string)
+/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip" — as a rev string for
+/// the git calls that take one, tagged with where it came from (load-bearing for guard 0b).
+/// The ONE definition: `cmd/scan.rs` resolves the SHA a confirmation attests to through it.
+pub(crate) fn ticket_rev(t: &Ticket) -> Option<(String, HeadOrigin)> {
+    let named = |v: &Option<String>| {
+        v.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(str::to_string)
+    };
+    named(&t.fm.head)
+        .map(|h| (h, HeadOrigin::Recorded))
+        .or_else(|| named(&t.fm.branch).map(|b| (b, HeadOrigin::BranchTip)))
 }
 
 /// The Worktrees tab's row and the STALLED tripwire's input.
 fn branch_fact(git: &Git, t: &Ticket, main: &str) -> Option<BranchFact> {
     let branch = t.fm.branch.clone();
-    let rev = ticket_rev(t)?;
+    let (rev, _) = ticket_rev(t)?;
     let (ahead, behind) = match git.ahead_behind(main, &rev) {
         Some((a, b)) => (Some(a), Some(b)),
         None => (None, None),
@@ -1084,7 +1038,7 @@ pub fn confirmed_proof(git: &Git, t: &Ticket) -> Option<MergedProof> {
                 .as_deref()
                 .is_some_and(|n| n.trim().starts_with(CONFIRM_NOTE))
     })?;
-    let rev = confirm_note_sha(entry.note.as_deref()?)
+    let rev = note_sha(entry.note.as_deref()?)
         .map(str::to_string)
         .or_else(|| t.fm.head.clone())?;
     let sha = git.head_sha(&rev).ok()?.sha().clone();
@@ -1096,17 +1050,6 @@ pub fn confirmed_proof(git: &Git, t: &Ticket) -> Option<MergedProof> {
         // The moment a human looked, not the moment we read the line back.
         checked_at: entry.at,
     })
-}
-
-fn confirm_note_sha(note: &str) -> Option<&str> {
-    let rest = note.trim().strip_prefix(CONFIRM_NOTE)?.trim_start();
-    let tok = rest.split_whitespace().next()?;
-    let hex = tok.len() >= 7
-        && tok.len() <= 64
-        && tok
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
-    hex.then_some(tok)
 }
 
 #[cfg(test)]
@@ -1251,7 +1194,7 @@ mod tests {
         .format();
         let back = LogEntry::parse(&line).expect("the confirm line is a legal log entry");
         assert_eq!(
-            confirm_note_sha(back.note.as_deref().unwrap()),
+            note_sha(back.note.as_deref().unwrap()),
             Some("a1b9c3d5f00"),
             "the attested SHA must survive the log grammar: {line}"
         );
@@ -1356,11 +1299,11 @@ mod tests {
 
     #[test]
     fn a_note_that_is_not_an_attestation_yields_no_sha() {
-        assert_eq!(confirm_note_sha("in main a1b9c3d — why"), Some("a1b9c3d"));
-        assert_eq!(confirm_note_sha("in main — why"), None, "no SHA named");
-        assert_eq!(confirm_note_sha("in main NOTHEX0 — why"), None);
-        assert_eq!(confirm_note_sha("in main a1b9c3 — too short"), None);
-        assert_eq!(confirm_note_sha("rework, see #12"), None);
+        assert_eq!(note_sha("in main a1b9c3d — why"), Some("a1b9c3d"));
+        assert_eq!(note_sha("in main — why"), None, "no SHA named");
+        assert_eq!(note_sha("in main NOTHEX0 — why"), None);
+        assert_eq!(note_sha("in main a1b9c3 — too short"), None);
+        assert_eq!(note_sha("rework, see #12"), None);
     }
 
     // ── the no-code waiver ───────────────────────────────────────────────────

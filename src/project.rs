@@ -205,14 +205,15 @@ pub fn render_architecture(s: &Snapshot) -> String {
     o
 }
 
-/// Both projections as ops, so regeneration rides the ordinary write path.
+/// Both projections as ops, so regeneration rides the ordinary write path. Pure over the
+/// snapshot and infallible: rendering cannot fail.
 ///
-/// D-20: every caller that changes a spec, a decision or a quirk pushes these into its OWN
-/// plan, so the projections are rewritten inside the same lock that changed their source.
-/// No caller may regenerate in a second transaction — that is the window in which the two
-/// disagree.
-pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
-    Ok(vec![
+/// D-20 asked for these to ride in the mutating verb's OWN plan. Every caller instead goes
+/// through [`regenerate`], a short transaction of its own immediately after the write — see
+/// there for why a planner's pre-plan snapshot would make the in-plan form permanently one
+/// write stale.
+pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Vec<Op> {
+    vec![
         Op::WriteGenerated {
             path: layout.features_md().to_path_buf(),
             contents: render_features(&feature_rows(s)),
@@ -221,7 +222,7 @@ pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
             path: layout.architecture_md().to_path_buf(),
             contents: render_architecture(s),
         },
-    ])
+    ]
 }
 
 /// Rewrite both projections from whatever is on disk **now**. `Ok(false)` means they
@@ -253,7 +254,7 @@ pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Result<Vec<Op>> {
 /// would take the advisory lock, bump `Snapshot::rev` and push an SSE frame at every open
 /// browser tab, for no change anyone can see.
 pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<bool> {
-    let want = plan_regenerate(&ctx.snapshot()?, &ctx.layout)?;
+    let want = plan_regenerate(&ctx.snapshot()?, &ctx.layout);
     if want.iter().all(unchanged) {
         return Ok(false);
     }
@@ -267,7 +268,7 @@ pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<bool> {
         // Re-planned against the FRESH in-lock snapshot, never against the one read above:
         // that read happened without exclusivity, and trusting it is the TOCTOU
         // `Store::transact` reloads to avoid.
-        |s, _m| Ok(crate::plan::Plan::of(plan_regenerate(s, &ctx.layout)?)),
+        |s, _m| Ok(crate::plan::Plan::of(plan_regenerate(s, &ctx.layout))),
     )?;
     Ok(true)
 }

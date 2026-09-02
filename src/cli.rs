@@ -66,14 +66,8 @@ pub struct Cli {
     pub command: Command,
 }
 
-impl Cli {
-    /// `"kanspec"` or `"ks"` — set once by `run()`, because the log note and every fix
-    /// line should name the binary the user actually typed.
-    pub fn invoked_as(&self) -> &'static str {
-        invoked_as()
-    }
-}
-
+/// `"kanspec"` or `"ks"` — set once by `run()`, because the log note and every fix line
+/// should name the binary the user actually typed.
 static INVOKED_AS: OnceLock<&'static str> = OnceLock::new();
 
 pub fn set_invoked_as(name: &'static str) {

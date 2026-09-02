@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::cache::GitState;
 use crate::ctx::Actor;
-use crate::error::{KsError, Result};
+use crate::error::{Fix, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::{DecisionId, ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::{Key, TicketKey};
@@ -236,35 +236,25 @@ impl Plan {
 
         for op in &self.ops {
             match op {
-                Op::Transition { id, verb, .. } => {
+                Op::Transition { id, .. } => {
                     if !transitioned.insert(id) {
                         return Err(KsError::conflict(
                             format!("plan transitions {id} twice — a ticket has one owed verb"),
                             fixes![fix!("kanspec show {id}")],
                         ));
                     }
-                    if !snap.tickets.contains_key(id) {
-                        return Err(KsError::not_found(
-                            "ticket",
-                            id.to_string(),
-                            fixes![fix!("kanspec ls --all")],
-                        ));
-                    }
-                    let _ = verb;
+                    require_ticket(snap, id)?;
                 }
+                Op::MarkSteps { id, .. } => require_ticket(snap, id)?,
                 Op::CreateEntity { entity, .. } => {
-                    if entity.exists_in(snap) {
-                        return Err(KsError::conflict(
-                            format!("{entity} already exists — refusing to overwrite it"),
-                            fixes![fix!("kanspec show {}", entity.id())],
-                        ));
-                    }
-                    if !created.insert(entity.clone()) {
-                        return Err(KsError::conflict(
-                            format!("plan creates {entity} twice"),
-                            fixes![fix!("kanspec doctor")],
-                        ));
-                    }
+                    let fix = fix!("kanspec show {}", entity.id());
+                    require_fresh(snap, &mut created, entity.clone(), false, fix)?;
+                }
+                // A closed proposal is not in `snap.proposals`, but its id is still taken.
+                Op::CreateProposal { id, .. } => {
+                    let taken = snap.closed_ids.contains(id.as_str());
+                    let e = EntityRef::Proposal(id.clone());
+                    require_fresh(snap, &mut created, e, taken, fix!("kanspec board"))?;
                 }
                 Op::SetFields { entity, sets } => {
                     require_present(entity, snap, &created)?;
@@ -281,30 +271,6 @@ impl Plan {
                     }
                 }
                 Op::AppendSection { entity, .. } => require_present(entity, snap, &created)?,
-                Op::MarkSteps { id, .. } => {
-                    if !snap.tickets.contains_key(id) {
-                        return Err(KsError::not_found(
-                            "ticket",
-                            id.to_string(),
-                            fixes![fix!("kanspec ls --all")],
-                        ));
-                    }
-                }
-                Op::CreateProposal { id, .. } => {
-                    let e = EntityRef::Proposal(id.clone());
-                    if e.exists_in(snap) || snap.closed_ids.contains(id.as_str()) {
-                        return Err(KsError::conflict(
-                            format!("{e} already exists — refusing to overwrite it"),
-                            fixes![fix!("kanspec board")],
-                        ));
-                    }
-                    if !created.insert(e) {
-                        return Err(KsError::conflict(
-                            format!("plan creates proposal {id} twice"),
-                            fixes![fix!("kanspec doctor")],
-                        ));
-                    }
-                }
                 Op::StampRule { spec, .. } => {
                     if !snap.specs.contains_key(spec) {
                         return Err(KsError::not_found(
@@ -419,6 +385,42 @@ fn require_present(
         entity.id(),
         fixes![fix!("kanspec status")],
     ))
+}
+
+fn require_ticket(snap: &Snapshot, id: &TicketId) -> Result<()> {
+    if snap.tickets.contains_key(id) {
+        return Ok(());
+    }
+    Err(KsError::not_found(
+        "ticket",
+        id.to_string(),
+        fixes![fix!("kanspec ls --all")],
+    ))
+}
+
+/// A create refuses to overwrite (`also_taken` covers ids the snapshot holds only as
+/// `closed_ids`) and refuses to create the same entity twice in one plan.
+fn require_fresh(
+    snap: &Snapshot,
+    created: &mut HashSet<EntityRef>,
+    e: EntityRef,
+    also_taken: bool,
+    fix: Fix,
+) -> Result<()> {
+    if also_taken || e.exists_in(snap) {
+        return Err(KsError::conflict(
+            format!("{e} already exists — refusing to overwrite it"),
+            fixes![fix],
+        ));
+    }
+    if created.contains(&e) {
+        return Err(KsError::conflict(
+            format!("plan creates {e} twice"),
+            fixes![fix!("kanspec doctor")],
+        ));
+    }
+    created.insert(e);
+    Ok(())
 }
 
 #[cfg(test)]

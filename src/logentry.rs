@@ -94,15 +94,10 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 
 /// Actors never contain whitespace: the column grammar is parsed by splitting.
 fn sanitize_actor(a: &str) -> String {
-    let a: String = a
-        .chars()
+    a.chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
-        .collect();
-    if a.len() > 20 {
-        a.chars().take(20).collect()
-    } else {
-        a
-    }
+        .take(20)
+        .collect()
 }
 
 /// A note is delimited by `(` … `)` at end of line; an unbalanced paren would break

@@ -11,7 +11,6 @@
 //! Owner: **F** (foundation). Frozen after wave 0.
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use unicode_width::UnicodeWidthStr;
@@ -24,7 +23,6 @@ use crate::error::{KsError, Result};
 pub struct Style {
     pub color: bool,
     pub width: usize,
-    pub quiet: bool,
 }
 
 impl Style {
@@ -32,7 +30,6 @@ impl Style {
         Style {
             color: false,
             width: 100,
-            quiet: false,
         }
     }
 }
@@ -55,7 +52,6 @@ pub fn emit<R: Render>(r: &R, mode: &OutMode) -> Result<()> {
             let st = Style {
                 color: *color,
                 width: term_width(),
-                quiet: false,
             };
             r.human(&mut w, &st).and_then(|()| w.flush())
         }
@@ -94,19 +90,6 @@ pub mod glyph {
 /// drift.
 pub fn state_glyph(s: crate::transitions::State) -> char {
     s.glyph().chars().next().unwrap_or('?')
-}
-
-/// The ONE colour policy for a state. Terminal states are quiet; the two that can go
-/// wrong are the two that are loud.
-pub fn state_color(s: crate::transitions::State) -> Color {
-    use crate::transitions::State as S;
-    match s {
-        S::Todo => Color::Dim,
-        S::Doing => Color::Yellow,
-        S::Review => Color::Blue,
-        S::Done => Color::Green,
-        S::Dropped => Color::Dim,
-    }
 }
 
 /// The shared human primitive: most output is a list of these.
@@ -339,20 +322,17 @@ impl Table {
     // A factory over a FOREIGN type, deliberately: `out::Table` is a namespace for the
     // one table style in the product, not a value anyone constructs.
     #[allow(clippy::new_ret_no_self)]
-    pub fn new(headers: &[&str], st: &Style) -> comfy_table::Table {
-        let mut t = comfy_table::Table::new();
-        Table::kanspec_preset(&mut t, st);
-        t.set_header(headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
-        t
-    }
-
+    ///
     /// NOTE for slices: comfy-table **8.0** replaced 7.x's `load_preset(&str)` with
     /// `load_style(TableStyle)`. `presets::NOTHING` is the borderless style kanspec uses —
     /// aligned columns, no box drawing, because the board's glyphs are the visual grammar.
-    pub fn kanspec_preset(t: &mut comfy_table::Table, st: &Style) {
+    pub fn new(headers: &[&str], st: &Style) -> comfy_table::Table {
+        let mut t = comfy_table::Table::new();
         t.load_style(comfy_table::presets::NOTHING)
             .set_content_arrangement(comfy_table::ContentArrangement::Dynamic)
-            .set_width(st.width.min(u16::MAX as usize) as u16);
+            .set_width(st.width.min(u16::MAX as usize) as u16)
+            .set_header(headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
+        t
     }
 }
 
@@ -400,13 +380,11 @@ pub fn paint(s: &str, c: Color, on: bool) -> String {
     }
 }
 
-static COLOR: AtomicBool = AtomicBool::new(false);
-
-/// Set ONCE in `run()` from `--color`, never from the env dance: recon proved
-/// `CLICOLOR_FORCE` beats `NO_COLOR` in owo-colors' supports-color, which is the opposite
-/// of what the no-color.org convention says, so kanspec decides the policy itself.
+/// Decided from `--color` alone (via `OutMode::from_cli`), never from the env dance: recon
+/// proved `CLICOLOR_FORCE` beats `NO_COLOR` in owo-colors' supports-color, which is the
+/// opposite of what the no-color.org convention says, so kanspec decides the policy itself.
 pub fn apply_color_policy(choice: ColorChoice) -> bool {
-    let on = match choice {
+    match choice {
         ColorChoice::Always => true,
         ColorChoice::Never => false,
         ColorChoice::Auto => {
@@ -418,14 +396,7 @@ pub fn apply_color_policy(choice: ColorChoice) -> bool {
                 std::io::stdout().is_terminal()
             }
         }
-    };
-    COLOR.store(on, Ordering::Relaxed);
-    on
-}
-
-/// The policy `run()` already decided. `Ctx::open` reads it; nothing else should.
-pub fn color_enabled() -> bool {
-    COLOR.load(Ordering::Relaxed)
+    }
 }
 
 pub fn term_width() -> usize {
@@ -707,7 +678,6 @@ mod tests {
         // only conversion of it anywhere in the crate.
         for &s in ALL_STATES {
             assert_eq!(state_glyph(s).to_string(), s.glyph(), "{s}");
-            let _ = state_color(s);
         }
         // DESIGN.md's legend, verbatim: `○ todo ◐ doing ◈ review ⇂ in-main ● done ✕ dropped`
         assert_eq!(state_glyph(State::Todo), '○');

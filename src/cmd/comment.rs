@@ -13,24 +13,16 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::cli::{CommentArgs, CommentCommand, CommentsArgs, ExpireArgs, PromoteArgs};
+use crate::cmd::proposal::{live, next_lines, proposal_or_refuse};
+use crate::cmd::ticket::facts;
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
 use crate::ids::{CommentId, ItemRef, ProposalId};
 use crate::model::{CommentOp, CommentOpKind, Proposal, Snapshot};
 use crate::out::{glyph, Color, Line, Render, Style};
-use crate::plan::{Op, Plan};
+use crate::plan::{EntityRef, Op, Plan};
 use crate::store::Store;
 use crate::{fix, fixes};
-
-/// The shared `→ next` tail every report in this module ends with.
-fn next_lines(next: &[String], w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
-    for n in next {
-        crate::out::Line::new(crate::out::glyph::FIX, "next")
-            .fix(n.as_str())
-            .write(w, st)?;
-    }
-    Ok(())
-}
 
 #[derive(Debug, Serialize)]
 pub struct CommentsReport {
@@ -73,22 +65,9 @@ fn scope_of(ctx: &Ctx, s: &Snapshot, id: Option<&str>) -> Result<Vec<ProposalId>
         return Ok(s.proposals.keys().cloned().collect());
     };
     if let Ok(pid) = ProposalId::parse(raw) {
-        if !s.proposals.contains_key(&pid) {
-            // A CLOSED proposal is a different refusal from a missing one: its threads are
-            // real history, they are just not reachable — closed proposals bind nothing.
-            if s.closed_ids.contains(pid.as_str()) {
-                return Err(KsError::gate(
-                    "proposal_closed",
-                    format!("{pid} is closed — closed proposals bind nothing"),
-                    fixes![fix!("{} rules", ctx.invoked_as)],
-                ));
-            }
-            return Err(KsError::not_found(
-                "proposal",
-                pid.to_string(),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            ));
-        }
+        // A CLOSED proposal is a different refusal from a missing one: its threads are
+        // real history, they are just not reachable — closed proposals bind nothing.
+        proposal_or_refuse(ctx, s, &pid)?;
         return Ok(vec![pid]);
     }
     let tid = crate::ids::TicketId::parse(raw)?;
@@ -217,7 +196,12 @@ pub fn comments(ctx: &Ctx, a: &CommentsArgs) -> Result<CommentsReport> {
         orphaned.retain(|t| t.resolved.is_none());
     }
 
-    let open = threads.iter().filter(|t| t.resolved.is_none()).count();
+    // The same count `approve` gates on — orphans included, so a tray full of unanswered
+    // objections is never reported as nothing left to do.
+    let open: usize = scope
+        .iter()
+        .map(|pid| crate::derive::unresolved(&s, pid))
+        .sum();
     let next = if open > 0 {
         vec![format!(
             "{} comment resolve <cm-id> --note \"...\"",
@@ -340,41 +324,21 @@ struct Prepared {
     pid: ProposalId,
     path: std::path::PathBuf,
     kind: CommentOpKind,
-    /// present on `add` — the anchor and the quote captured at comment time
-    target: Option<String>,
+    /// the thread's item anchor — written into the row on `add`, shown on every op
+    target: String,
+    /// present on `add` — the quote captured at comment time
     quote: Option<String>,
     body: Option<String>,
     note: Option<String>,
     /// present on `reply`/`resolve` — the thread being appended to
     existing: Option<CommentId>,
-    /// what the report shows as the thread's target, for every op kind
-    shown_target: Option<String>,
 }
 
 fn prepare(ctx: &Ctx, s: &Snapshot, a: &CommentArgs) -> Result<Prepared> {
-    let missing_proposal = |pid: &ProposalId| {
-        if s.closed_ids.contains(pid.as_str()) {
-            KsError::gate(
-                "proposal_closed",
-                format!("{pid} is closed — closed proposals bind nothing"),
-                fixes![fix!("{} rules", ctx.invoked_as)],
-            )
-        } else {
-            KsError::not_found(
-                "proposal",
-                pid.to_string(),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            )
-        }
-    };
-
     match &a.cmd {
         CommentCommand::Add { target, body } => {
             let item = ItemRef::parse(target)?;
-            let p = s
-                .proposals
-                .get(&item.proposal)
-                .ok_or_else(|| missing_proposal(&item.proposal))?;
+            let p = proposal_or_refuse(ctx, s, &item.proposal)?;
             // A thread on an item that does not exist would be born orphaned. Refusing
             // here is what keeps the orphan tray meaningful: everything in it USED to
             // point at something.
@@ -389,14 +353,13 @@ fn prepare(ctx: &Ctx, s: &Snapshot, a: &CommentArgs) -> Result<Prepared> {
                 pid: item.proposal.clone(),
                 path: ctx.layout.comments_jsonl(&p.dir),
                 kind: CommentOpKind::Comment,
-                target: Some(item.to_string()),
+                target: item.to_string(),
                 // Invariant 5: the item's text AT COMMENT TIME. This is the whole
                 // mechanism behind "edited since" and the orphan tray.
                 quote: Some(found.text.clone()),
                 body: Some(body.clone()),
                 note: None,
                 existing: None,
-                shown_target: Some(item.to_string()),
             })
         }
         CommentCommand::Reply { id, body } => {
@@ -406,12 +369,11 @@ fn prepare(ctx: &Ctx, s: &Snapshot, a: &CommentArgs) -> Result<Prepared> {
                 pid: p.fm.id.clone(),
                 path: ctx.layout.comments_jsonl(&p.dir),
                 kind: CommentOpKind::Reply,
-                target: None,
+                target,
                 quote: None,
                 body: Some(body.clone()),
                 note: None,
                 existing: Some(cm),
-                shown_target: Some(target),
             })
         }
         CommentCommand::Resolve { id, note } => {
@@ -429,12 +391,11 @@ fn prepare(ctx: &Ctx, s: &Snapshot, a: &CommentArgs) -> Result<Prepared> {
                 pid: p.fm.id.clone(),
                 path: ctx.layout.comments_jsonl(&p.dir),
                 kind: CommentOpKind::Resolve,
-                target: None,
+                target,
                 quote: None,
                 body: None,
                 note: Some(note.clone()),
                 existing: Some(cm),
-                shown_target: Some(target),
             })
         }
     }
@@ -449,8 +410,12 @@ pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
     let s = ctx.snapshot()?;
     let prep = prepare(ctx, &s, a)?;
 
+    // A `comment` row seeds a thread; a `reply`/`resolve` row acts on one. The seed carries
+    // the target and the `author`; a later act carries `by` — the two roles the DESIGN.md
+    // JSONL keeps apart.
+    let seeds = matches!(prep.kind, CommentOpKind::Comment);
     let mut minted: Option<CommentId> = None;
-    Store::open(ctx).transact(None, &ctx.invocation(), |_s, m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |_s, m| {
         let id = match &prep.existing {
             Some(cm) => cm.clone(),
             None => m.comment(prep.body.as_deref().unwrap_or_default())?,
@@ -458,14 +423,12 @@ pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
         let row = CommentOp {
             id: id.clone(),
             op: prep.kind,
-            target: prep.target.clone(),
+            target: seeds.then(|| prep.target.clone()),
             quote: prep.quote.clone(),
             body: prep.body.clone(),
             note: prep.note.clone(),
-            // `author` seeds a thread, `by` marks a later act on it — the two roles the
-            // DESIGN.md JSONL keeps apart.
-            author: matches!(prep.kind, CommentOpKind::Comment).then(|| ctx.actor.label()),
-            by: (!matches!(prep.kind, CommentOpKind::Comment)).then(|| ctx.actor.label()),
+            author: seeds.then(|| ctx.actor.label()),
+            by: (!seeds).then(|| ctx.actor.label()),
             at: ctx.now,
         };
         let line = serde_json::to_string(&row).map_err(|e| {
@@ -480,21 +443,10 @@ pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
     let id = minted
         .ok_or_else(|| KsError::internal(anyhow::anyhow!("`comment` minted no thread id")))?;
 
-    // Re-read so the open count describes the file as it now is.
-    let after = ctx.snapshot()?;
+    // The open count describes the file as it now is — `Committed` carries the post-write
+    // snapshot — and it is the same count `approve` gates on, orphans included.
     let pid = prep.pid;
-    let open = after
-        .proposals
-        .get(&pid)
-        .map(|p| {
-            let ops = after.comments.get(&pid).map(Vec::as_slice).unwrap_or(&[]);
-            let (live, orphan) = fold_threads(p, ops);
-            live.iter()
-                .chain(orphan.iter())
-                .filter(|t| t.resolved.is_none())
-                .count()
-        })
-        .unwrap_or(0);
+    let open = crate::derive::unresolved(&done.snapshot, &pid);
 
     Ok(CommentReport {
         id,
@@ -503,7 +455,7 @@ pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
             CommentOpKind::Reply => "reply",
             CommentOpKind::Resolve => "resolve",
         },
-        target: prep.shown_target,
+        target: Some(prep.target),
         next: if open > 0 {
             vec![format!("{} comments {pid} --unresolved", ctx.invoked_as)]
         } else {
@@ -547,24 +499,7 @@ fn prescription<'a>(
     raw: &str,
 ) -> Result<(&'a Proposal, ItemRef, String)> {
     let item = ItemRef::parse(raw)?;
-    let p = s.proposals.get(&item.proposal).ok_or_else(|| {
-        if s.closed_ids.contains(item.proposal.as_str()) {
-            KsError::gate(
-                "proposal_closed",
-                format!(
-                    "{} is closed — closed proposals bind nothing",
-                    item.proposal
-                ),
-                fixes![fix!("{} rules", ctx.invoked_as)],
-            )
-        } else {
-            KsError::not_found(
-                "proposal",
-                item.proposal.to_string(),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            )
-        }
-    })?;
+    let p = proposal_or_refuse(ctx, s, &item.proposal)?;
     let found = p.items.iter().find(|i| i.id == item).ok_or_else(|| {
         KsError::not_found(
             "item",
@@ -584,12 +519,23 @@ fn ledger_op(p: &Proposal, entry: String) -> Op {
     let mut ledger = p.fm.ledger.clone();
     ledger.push(entry);
     Op::SetFields {
-        entity: crate::plan::EntityRef::Proposal(p.fm.id.clone()),
+        entity: EntityRef::Proposal(p.fm.id.clone()),
         sets: vec![(
             crate::keys::Key::Proposal(crate::keys::ProposalKey::Ledger),
             crate::fm::Yv::list(ledger),
         )],
     }
+}
+
+/// The standing record a promotion minted — whichever of decision or quirk the plan made.
+/// Read back off the plan rather than trusted from the arm that built it, so the ledger
+/// line and the report can never name different ids.
+fn minted_record(minted: &[EntityRef]) -> Result<String> {
+    minted
+        .iter()
+        .find(|e| matches!(e, EntityRef::Decision(_) | EntityRef::Quirk(_)))
+        .map(EntityRef::id)
+        .ok_or_else(|| KsError::internal(anyhow::anyhow!("`promote` minted no record")))
 }
 
 /// Mint the standing record with `source:` pre-filled from the item anchor; a decision
@@ -619,14 +565,14 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
         ));
     }
 
-    match a.as_kind {
+    let (record, status, url, next) = match a.as_kind {
         crate::cli::PromoteKind::Spec => {
             // NOT a gap. DESIGN.md's spec workflow is that a rule bullet is written on the
             // IMPLEMENTATION branch carrying its `{p-xxxx}` token, and `close` then
             // auto-recognises it as `shipped`. Minting a rule here would create a second,
             // competing write path for the one record type that is deliberately edited as
             // ordinary code and reviewed in the PR.
-            Err(KsError::gate(
+            return Err(KsError::gate(
                 "promote_spec_ships_in_code",
                 format!(
                     "a spec rule is written on the branch that implements it, not minted \
@@ -639,7 +585,7 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                     fix!("{} rules --audit", ctx.invoked_as),
                     fix!("{} close {pid}", ctx.invoked_as),
                 ],
-            ))
+            ));
         }
         crate::cli::PromoteKind::Decision => {
             let args = crate::cli::DecideArgs {
@@ -647,56 +593,29 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                 from: Some(anchor.clone()),
                 scope: a.scope.clone(),
             };
-            let f = crate::plan::Facts {
-                actor: ctx.actor.clone(),
-                at: ctx.now,
-                invocation: ctx.invocation(),
-            };
+            let f = facts(ctx);
             let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
                 let mut plan = crate::cmd::decision::plan_decide(sn, &f, &args, m)?;
-                let id = plan
-                    .minted
-                    .iter()
-                    .find_map(|e| match e {
-                        crate::plan::EntityRef::Decision(d) => Some(d.clone()),
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        KsError::internal(anyhow::anyhow!("`promote` minted no decision"))
-                    })?;
-                let p = sn.proposals.get(&pid).ok_or_else(|| {
-                    KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
-                })?;
-                plan.push(ledger_op(p, format!("{item} promoted→{id}")));
+                let id = minted_record(&plan.minted)?;
+                plan.push(ledger_op(live(sn, &pid)?, format!("{item} promoted→{id}")));
                 Ok(plan)
             })?;
-            let id = done
-                .minted
-                .iter()
-                .find_map(|e| match e {
-                    crate::plan::EntityRef::Decision(d) => Some(d.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    KsError::internal(anyhow::anyhow!("`promote` minted no decision"))
-                })?;
-            crate::project::regenerate(ctx)?;
-            Ok(PromoteReport {
-                item,
-                record: id.to_string(),
-                // Invariant 8: a promoted decision is PROPOSED. An agent running `promote`
-                // has not thereby accepted anything — a human does that on its own page.
-                status: "proposed".to_string(),
-                url: Some(format!("http://127.0.0.1:{}/d/{id}", ctx.cfg.port)),
-                next: vec![format!("{} accept {id}", ctx.invoked_as)],
-            })
+            let id = minted_record(&done.minted)?;
+            // Invariant 8: a promoted decision is PROPOSED. An agent running `promote`
+            // has not thereby accepted anything — a human does that on its own page.
+            (
+                id.clone(),
+                "proposed",
+                Some(format!("http://127.0.0.1:{}/d/{id}", ctx.cfg.port)),
+                format!("{} accept {id}", ctx.invoked_as),
+            )
         }
         crate::cli::PromoteKind::Quirk => {
             let scope = a.scope.clone();
             let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
                 let qid = m.quirk(&title)?;
                 let mut plan = Plan::of(vec![Op::CreateEntity {
-                    entity: crate::plan::EntityRef::Quirk(qid.clone()),
+                    entity: EntityRef::Quirk(qid.clone()),
                     // A quirk's `source:` is typed `Option<TicketId>` — it records the
                     // TICKET where the landmine was learned, so a proposal anchor has no
                     // slot in it. The ledger entry below is where this promotion's
@@ -709,31 +628,26 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                         None,
                     ),
                 }]);
-                plan.mint(crate::plan::EntityRef::Quirk(qid.clone()));
-                let p = sn.proposals.get(&pid).ok_or_else(|| {
-                    KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
-                })?;
-                plan.push(ledger_op(p, format!("{item} promoted→{qid}")));
+                plan.mint(EntityRef::Quirk(qid.clone()));
+                plan.push(ledger_op(live(sn, &pid)?, format!("{item} promoted→{qid}")));
                 Ok(plan)
             })?;
-            let id = done
-                .minted
-                .iter()
-                .find_map(|e| match e {
-                    crate::plan::EntityRef::Quirk(q) => Some(q.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| KsError::internal(anyhow::anyhow!("`promote` minted no quirk")))?;
-            crate::project::regenerate(ctx)?;
-            Ok(PromoteReport {
-                item,
-                record: id.to_string(),
-                status: "active".to_string(),
-                url: None,
-                next: vec![format!("{} quirks", ctx.invoked_as)],
-            })
+            (
+                minted_record(&done.minted)?,
+                "active",
+                None,
+                format!("{} quirks", ctx.invoked_as),
+            )
         }
-    }
+    };
+    crate::project::regenerate(ctx)?;
+    Ok(PromoteReport {
+        item,
+        record,
+        status: status.to_string(),
+        url,
+        next: vec![next],
+    })
 }
 
 impl Render for PromoteReport {
@@ -780,10 +694,7 @@ pub fn expire(ctx: &Ctx, a: &ExpireArgs) -> Result<ExpireReport> {
     let entry = format!("{item} expired ({reason})");
     let pid = item.proposal.clone();
     Store::open(ctx).transact(None, &ctx.invocation(), |sn, _m| {
-        let p = sn.proposals.get(&pid).ok_or_else(|| {
-            KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
-        })?;
-        Ok(Plan::of(vec![ledger_op(p, entry.clone())]))
+        Ok(Plan::of(vec![ledger_op(live(sn, &pid)?, entry.clone())]))
     })?;
     Ok(ExpireReport {
         next: vec![format!("{} close {pid}", ctx.invoked_as)],

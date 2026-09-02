@@ -349,13 +349,6 @@ spec_budget_tokens = {spec_budget}   # spec rules `prime` injects, in tokens; 0 
             spec_budget = d.prime.spec_budget_tokens,
         )
     }
-
-    /// The serialized form of *this* config — used by `doctor --fix` when it needs to
-    /// rewrite a config it repaired. Not the same as [`Config::render_default`], which is
-    /// hand-commented prose for humans.
-    pub fn render(&self) -> Result<String> {
-        toml::to_string_pretty(self).map_err(KsError::internal)
-    }
 }
 
 #[cfg(test)]
@@ -437,20 +430,5 @@ mod tests {
             text.contains("[prime]") && text.contains("spec_budget_tokens"),
             "the scaffold must carry the budget knob, or nobody finds it:\n{text}"
         );
-    }
-
-    #[test]
-    fn a_config_round_trips_through_its_own_serializer() {
-        let c = Config {
-            port: 4242,
-            windows: Windows {
-                stale_merges: 9,
-                ..Windows::default()
-            },
-            ..Config::default()
-        };
-        let back = Config::parse(&c.render().unwrap(), "<render>").unwrap();
-        assert_eq!(back.port, 4242);
-        assert_eq!(back.windows.stale_merges, 9);
     }
 }

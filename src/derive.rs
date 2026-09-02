@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::cache::{MergeFact, MergeStatus};
 use crate::git::Method;
-use crate::ids::{CommentId, ItemRef, ProposalId, SpecName, TicketId};
+use crate::ids::{ItemRef, ProposalId, SpecName, TicketId};
 use crate::logentry::LogEntry;
 use crate::model::{
     CommentOpKind, DecisionStatus, Proposal, ProposalStatus, Snapshot, Spec, Ticket,
@@ -221,9 +221,10 @@ pub fn logged_close(t: &Ticket) -> bool {
 /// `in main a1b9c3d — squash merged by hand`. Both open with the same two words and both
 /// name a commit, because neither value can be minted without a SHA git resolved.
 ///
-/// MIRRORED rather than shared: `scan::CONFIRM_NOTE` and `scan::confirm_note_sha` are both
-/// private, and `scan.rs` is S5's file. `the_note_grammar_mirrors_the_gates_own_spelling`
-/// below is what keeps the mirror honest.
+/// The prefix is MIRRORED from `scan::CONFIRM_NOTE` rather than imported — this file may
+/// import nothing from `scan` (`tests/purity.rs`) — so the sharing runs the other way:
+/// `scan::confirmed_proof` reads its own notes back through [`note_sha`] below, and
+/// `the_note_grammar_mirrors_the_gates_own_spelling` keeps the prefix honest.
 const PROOF_NOTE: &str = "in main";
 
 /// The durable half of a `--no-code` close. `scan::NoCodeWaiver::record` appends
@@ -233,7 +234,7 @@ const PROOF_NOTE: &str = "in main";
 const NO_CODE_WAIVER: &str = "no-code waiver by ";
 
 /// The commit a close's own log entry names, when the gate recorded one.
-fn note_sha(note: &str) -> Option<&str> {
+pub fn note_sha(note: &str) -> Option<&str> {
     let rest = note.trim().strip_prefix(PROOF_NOTE)?.trim_start();
     let tok = rest.split_whitespace().next()?;
     // git's own shape: 7 to 64 lowercase hex. A `via`/`—` that arrived where a SHA should
@@ -449,24 +450,24 @@ pub fn stalled(s: &Snapshot, t: &Ticket) -> Option<Duration> {
 pub fn dwell(s: &Snapshot, t: &Ticket) -> Option<Tripwire> {
     let w = s.cfg.windows;
     let idle = idle(s, t);
+    let over =
+        |armed: bool, d: Option<Duration>, window: u64| d.filter(|d| armed && *d > secs(window));
 
     // In-main-but-not-closed outranks everything: it is the one tripwire whose fix is a
     // single verb (`done`), and a review-dwelling ticket that has ALSO landed is the same
     // ticket.
-    if in_main(s, t).is_some() {
-        if let Some(d) = idle.filter(|d| *d > secs(w.in_main_dwell_secs)) {
-            return Some(Tripwire::InMainNotClosed(d));
-        }
+    if let Some(d) = over(in_main(s, t).is_some(), idle, w.in_main_dwell_secs) {
+        return Some(Tripwire::InMainNotClosed(d));
     }
-    if t.fm.state == State::Review {
-        if let Some(d) = idle.filter(|d| *d > secs(w.review_dwell_secs)) {
-            return Some(Tripwire::ReviewDwell(d));
-        }
+    if let Some(d) = over(t.fm.state == State::Review, idle, w.review_dwell_secs) {
+        return Some(Tripwire::ReviewDwell(d));
     }
-    if untriaged_discovery(t) {
-        if let Some(d) = since(s, t.fm.created).filter(|d| *d > secs(w.discovered_dwell_secs)) {
-            return Some(Tripwire::DiscoveredUntriaged(d));
-        }
+    if let Some(d) = over(
+        untriaged_discovery(t),
+        since(s, t.fm.created),
+        w.discovered_dwell_secs,
+    ) {
+        return Some(Tripwire::DiscoveredUntriaged(d));
     }
     None
 }
@@ -522,42 +523,30 @@ pub fn settling(s: &Snapshot, p: &Proposal) -> bool {
     any
 }
 
-/// v0.2 — unresolved comment threads on a proposal. Rows are already deduped on
-/// `(id, op, at)` by the store (D-19); a thread is open until a `resolve` row carries its
-/// id.
-pub fn unresolved(s: &Snapshot, p: &ProposalId) -> usize {
+/// Threads of one kind on a proposal that no `resolve` row has closed. Rows are already
+/// deduped on `(id, op, at)` by the store (D-19); a thread is open until a `resolve` row
+/// carries its id.
+fn open_threads(s: &Snapshot, p: &ProposalId, kind: CommentOpKind) -> usize {
     let Some(ops) = s.comments.get(p) else {
         return 0;
     };
-    let resolved: BTreeSet<&CommentId> = ops
-        .iter()
-        .filter(|o| o.op == CommentOpKind::Resolve)
-        .map(|o| &o.id)
-        .collect();
-    ops.iter()
-        .filter(|o| o.op == CommentOpKind::Comment)
-        .map(|o| &o.id)
-        .collect::<BTreeSet<_>>()
-        .difference(&resolved)
-        .count()
+    let ids = |k: CommentOpKind| {
+        ops.iter()
+            .filter(|o| o.op == k)
+            .map(|o| &o.id)
+            .collect::<BTreeSet<_>>()
+    };
+    ids(kind).difference(&ids(CommentOpKind::Resolve)).count()
+}
+
+/// v0.2 — unresolved comment threads on a proposal: the human's owed verb.
+pub fn unresolved(s: &Snapshot, p: &ProposalId) -> usize {
+    open_threads(s, p, CommentOpKind::Comment)
 }
 
 /// v0.2 — threads someone has already answered but nobody resolved: the AGENT's owed verb.
 pub fn answered(s: &Snapshot, p: &ProposalId) -> usize {
-    let Some(ops) = s.comments.get(p) else {
-        return 0;
-    };
-    let resolved: BTreeSet<&CommentId> = ops
-        .iter()
-        .filter(|o| o.op == CommentOpKind::Resolve)
-        .map(|o| &o.id)
-        .collect();
-    ops.iter()
-        .filter(|o| o.op == CommentOpKind::Reply)
-        .map(|o| &o.id)
-        .collect::<BTreeSet<_>>()
-        .difference(&resolved)
-        .count()
+    open_threads(s, p, CommentOpKind::Reply)
 }
 
 /// Two actors that both hold the same claim (R-8). Cross-machine `start` is eventually
@@ -781,35 +770,33 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
             .unwrap_or_default();
         you.push((
             YOU_IN_MAIN,
-            Attention {
-                owner: Owner::You,
-                glyph: glyph::IN_MAIN,
-                subject: id.to_string(),
-                line: format!(
+            att(
+                Owner::You,
+                glyph::IN_MAIN,
+                id,
+                format!(
                     "in main{landed} ({}{pr} · checked {}), not closed",
                     fact.method,
                     rel_time(fact.checked_at, s.now)
                 ),
-                fix: format!("kanspec done {id}"),
-                url: None,
-            },
+                format!("kanspec done {id}"),
+            ),
         ));
     }
 
     for (id, holders) in double_claims(s) {
         you.push((
             YOU_DOUBLE_CLAIM,
-            Attention {
-                owner: Owner::You,
-                glyph: glyph::FAIL,
-                subject: id.to_string(),
-                line: format!(
+            att(
+                Owner::You,
+                glyph::FAIL,
+                &id,
+                format!(
                     "double claim after sync: {} both hold it",
                     holders.join(" and ")
                 ),
-                fix: format!("kanspec show {id}"),
-                url: None,
-            },
+                format!("kanspec show {id}"),
+            ),
         ));
     }
 
@@ -831,30 +818,31 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
             };
             you.push((
                 YOU_SETTLING,
-                Attention {
-                    owner: Owner::You,
-                    glyph: state_glyph(State::Done),
-                    subject: id.to_string(),
-                    line: format!("settling{dwelt}: last ticket landed{tail}"),
-                    fix: format!("kanspec close {id}"),
-                    url: None,
-                },
+                att(
+                    Owner::You,
+                    state_glyph(State::Done),
+                    id,
+                    format!("settling{dwelt}: last ticket landed{tail}"),
+                    format!("kanspec close {id}"),
+                ),
             ));
         }
         let open = unresolved(s, id);
         if open > 0 {
+            // The review page IS the next command here: threads are answered in the
+            // browser, not on the command line.
             let url = review_url(s, id);
             you.push((
                 YOU_THREADS,
                 Attention {
-                    owner: Owner::You,
-                    glyph: state_glyph(State::Review),
-                    subject: id.to_string(),
-                    line: format!("{open} unresolved review threads await you"),
-                    // The review page IS the next command here: threads are answered in the
-                    // browser, not on the command line.
-                    fix: url.clone(),
-                    url: Some(url),
+                    url: Some(url.clone()),
+                    ..att(
+                        Owner::You,
+                        state_glyph(State::Review),
+                        id,
+                        format!("{open} unresolved review threads await you"),
+                        url,
+                    )
                 },
             ));
         }
@@ -867,14 +855,13 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
         let id = &d.fm.id;
         you.push((
             YOU_PROPOSED_DECISION,
-            Attention {
-                owner: Owner::You,
-                glyph: state_glyph(State::Review),
-                subject: id.to_string(),
-                line: format!("proposed decision awaits a human: {}", d.fm.title),
-                fix: format!("kanspec accept {id}"),
-                url: None,
-            },
+            att(
+                Owner::You,
+                state_glyph(State::Review),
+                id,
+                format!("proposed decision awaits a human: {}", d.fm.title),
+                format!("kanspec accept {id}"),
+            ),
         ));
     }
 
@@ -900,27 +887,25 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
             .unwrap_or_default();
         agent.push((
             AGENT_READY,
-            Attention {
-                owner: Owner::Agent,
-                glyph: state_glyph(State::Todo),
-                subject: id.to_string(),
-                line: format!("ready{spec}{tail}"),
-                fix: format!("kanspec start {id}"),
-                url: None,
-            },
+            att(
+                Owner::Agent,
+                state_glyph(State::Todo),
+                id,
+                format!("ready{spec}{tail}"),
+                format!("kanspec start {id}"),
+            ),
         ));
     }
     if queue.len() > shown {
         agent.push((
             AGENT_MORE,
-            Attention {
-                owner: Owner::Agent,
-                glyph: state_glyph(State::Todo),
-                subject: String::new(),
-                line: format!("+{} more ready", queue.len() - shown),
-                fix: "kanspec ready".to_string(),
-                url: None,
-            },
+            att(
+                Owner::Agent,
+                state_glyph(State::Todo),
+                "",
+                format!("+{} more ready", queue.len() - shown),
+                "kanspec ready".to_string(),
+            ),
         ));
     }
 
@@ -931,12 +916,14 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
             agent.push((
                 AGENT_THREADS,
                 Attention {
-                    owner: Owner::Agent,
-                    glyph: state_glyph(State::Review),
-                    subject: id.to_string(),
-                    line: format!("{n} answered threads await your resolve"),
-                    fix: format!("kanspec comments {id} --unresolved"),
                     url: Some(review_url(s, id)),
+                    ..att(
+                        Owner::Agent,
+                        state_glyph(State::Review),
+                        id,
+                        format!("{n} answered threads await your resolve"),
+                        format!("kanspec comments {id} --unresolved"),
+                    )
                 },
             ));
         }
@@ -948,14 +935,13 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
         if let Some(idle) = stalled(s, t) {
             watching.push((
                 WATCH_STALLED,
-                Attention {
-                    owner: Owner::Watching,
-                    glyph: state_glyph(State::Doing),
-                    subject: id.to_string(),
-                    line: format!("STALLED: doing, no commits or updates for {}", short(idle)),
-                    fix: format!("kanspec park {id} --why \"...\""),
-                    url: None,
-                },
+                att(
+                    Owner::Watching,
+                    state_glyph(State::Doing),
+                    id,
+                    format!("STALLED: doing, no commits or updates for {}", short(idle)),
+                    format!("kanspec park {id} --why \"...\""),
+                ),
             ));
         }
         match dwell(s, t) {
@@ -963,28 +949,26 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
             Some(Tripwire::InMainNotClosed(_)) | None => {}
             Some(Tripwire::ReviewDwell(d)) => watching.push((
                 WATCH_REVIEW,
-                Attention {
-                    owner: Owner::Watching,
-                    glyph: state_glyph(State::Review),
-                    subject: id.to_string(),
-                    line: format!("in review {}, no movement", short(d)),
-                    fix: format!("kanspec show {id}"),
-                    url: None,
-                },
+                att(
+                    Owner::Watching,
+                    state_glyph(State::Review),
+                    id,
+                    format!("in review {}, no movement", short(d)),
+                    format!("kanspec show {id}"),
+                ),
             )),
             Some(Tripwire::DiscoveredUntriaged(d)) => watching.push((
                 WATCH_DISCOVERED,
-                Attention {
-                    owner: Owner::Watching,
-                    glyph: glyph::DISCOVERED,
-                    subject: id.to_string(),
-                    line: format!(
+                att(
+                    Owner::Watching,
+                    glyph::DISCOVERED,
+                    id,
+                    format!(
                         "discovered {} ago, still untriaged — give it a spec, a dep, or a drop",
                         short(d)
                     ),
-                    fix: format!("kanspec show {id}"),
-                    url: None,
-                },
+                    format!("kanspec show {id}"),
+                ),
             )),
             // Proposals, not tickets, settle — `dwell` never returns this for a ticket.
             Some(Tripwire::SettlingDwell(_)) => {}
@@ -995,28 +979,26 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
         match staleness(s, spec) {
             Staleness::Stale { merges, .. } => watching.push((
                 WATCH_STALE_SPEC,
-                Attention {
-                    owner: Owner::Watching,
-                    glyph: '⚠',
-                    subject: spec.name.to_string(),
-                    line: format!(
+                att(
+                    Owner::Watching,
+                    '⚠',
+                    &spec.name,
+                    format!(
                         "{merges} merges touched {} since spec last edited",
                         spec.fm.code.join(", ")
                     ),
-                    fix: "kanspec features --stale".to_string(),
-                    url: None,
-                },
+                    "kanspec features --stale".to_string(),
+                ),
             )),
             Staleness::DeadGlobs { globs } => watching.push((
                 WATCH_DEAD_GLOBS,
-                Attention {
-                    owner: Owner::Watching,
-                    glyph: '⚠',
-                    subject: spec.name.to_string(),
-                    line: format!("spec globs match no files: {}", globs.join(", ")),
-                    fix: format!("kanspec spec show {}", spec.name),
-                    url: None,
-                },
+                att(
+                    Owner::Watching,
+                    '⚠',
+                    &spec.name,
+                    format!("spec globs match no files: {}", globs.join(", ")),
+                    format!("kanspec spec show {}", spec.name),
+                ),
             )),
             Staleness::Ok | Staleness::NeverScanned => {}
         }
@@ -1032,6 +1014,19 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
         out.extend(group.drain(..).map(|(_, a)| a));
     }
     out
+}
+
+/// One attention line without a `url` — the shape every entry but the two review-thread
+/// ones has, so each push above reads as (rank, owner, glyph, subject, line, fix).
+fn att(owner: Owner, glyph: char, subject: impl ToString, line: String, fix: String) -> Attention {
+    Attention {
+        owner,
+        glyph,
+        subject: subject.to_string(),
+        line,
+        fix,
+        url: None,
+    }
 }
 
 /// How many ready tickets `status` names before it collapses the rest into one line.

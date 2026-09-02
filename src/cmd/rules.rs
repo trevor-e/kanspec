@@ -38,8 +38,53 @@ pub struct RulesReport {
 
 pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
     ctx.require_initialized()?;
-    let snap = ctx.snapshot()?;
     let scope = Scope::of(&a.paths)?;
+
+    // Adoption is what a MIGRATED corpus needs: an imported rule has no proposal to point
+    // at, and without a way to answer that, `rules --audit` warns about every one of them
+    // forever and a human learns to stop reading it.
+    //
+    // The planner is PURE (§2.16): it stamps whatever `rulesdoc::adoptable` finds in the
+    // snapshot reloaded inside the lock. What was adopted is then MEASURED — the bullets
+    // that were adoptable before and are not after — rather than recorded by the planner as
+    // a side effect, so the summary and the `--json` body describe the same corpus.
+    let before = a
+        .adopt
+        .then(|| ctx.snapshot().map(|s| adoptable_names(&s)))
+        .transpose()?;
+    if a.adopt {
+        Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
+            // An empty plan is a success that writes nothing (`Store::transact` short-
+            // circuits it), which is exactly right for a second `--adopt`.
+            Ok(Plan::of(
+                rulesdoc::adoptable(s)
+                    .into_iter()
+                    .map(|x| Op::StampRule {
+                        spec: x.spec,
+                        anchor: x.anchor,
+                        line: x.line,
+                    })
+                    .collect(),
+            ))
+        })?;
+        // D-20: a spec body was rewritten, so the committed projections are republished
+        // from the state this write produced. No projection renders rule TEXT today — the
+        // feature map's `last_shipped` reads `{p-xxxx}` provenance, which `{pre-kanspec}`
+        // deliberately is not — so this rewrites the same bytes. It is here anyway, because
+        // the invariant is "a handler that writes a projected entity republishes", and
+        // resting on a fact about today's renderers is how the committed page comes to rot.
+        project::regenerate(ctx)?;
+    }
+
+    // Read AFTER any stamps: the report must describe the corpus as it is now, or `--json`
+    // consumers see the standing set as it was a moment ago.
+    let snap = ctx.snapshot()?;
+    let adopted = before
+        .map(|b| {
+            let after = adoptable_names(&snap);
+            b.into_iter().filter(|n| !after.contains(n)).collect()
+        })
+        .unwrap_or_default();
     let data = if a.full {
         rulesdoc::build_full(&snap, &scope)
     } else {
@@ -50,63 +95,22 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
     } else {
         Vec::new()
     };
-
-    if a.adopt {
-        // Adoption is what a MIGRATED corpus needs: an imported rule has no proposal to
-        // point at, and without a way to answer that, `rules --audit` warns about every one
-        // of them forever and a human learns to stop reading it.
-        //
-        // The planner runs against the snapshot reloaded inside the lock, so the bullets it
-        // stamps are the bullets that are there — not the ones the pre-lock `warnings` above
-        // saw. Those two lists agree in practice because both come from `rulesdoc::adoptable`.
-        let mut adopted = Vec::new();
-        Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
-            let ops: Vec<Op> = rulesdoc::adoptable(s)
-                .into_iter()
-                .map(|x| {
-                    adopted.push(format!("{} [{}]", x.spec, x.anchor));
-                    Op::StampRule {
-                        spec: x.spec,
-                        anchor: x.anchor,
-                        line: x.line,
-                    }
-                })
-                .collect();
-            // An empty plan is a success that writes nothing (`Store::transact` short-
-            // circuits it), which is exactly right for a second `--adopt`.
-            Ok(Plan::of(ops))
-        })?;
-        // D-20: a spec body was rewritten, so the committed projections are republished
-        // from the state this write produced. No projection renders rule TEXT today — the
-        // feature map's `last_shipped` reads `{p-xxxx}` provenance, which `{pre-kanspec}`
-        // deliberately is not — so this rewrites the same bytes. It is here anyway, because
-        // the invariant is "a handler that writes a projected entity republishes", and
-        // resting on a fact about today's renderers is how the committed page comes to rot.
-        project::regenerate(ctx)?;
-
-        // Re-read: the report must describe the corpus AFTER the stamps, or `--json`
-        // consumers see the standing set as it was a moment ago.
-        let snap = ctx.snapshot()?;
-        let data = rulesdoc::build(&snap, &scope);
-        let warnings = rulesdoc::audit(&snap, &data);
-        return Ok(RulesReport {
-            data,
-            scope: a.paths.clone(),
-            warnings,
-            adopted,
-            audit: false,
-            adopt: true,
-        });
-    }
-
     Ok(RulesReport {
         data,
         scope: a.paths.clone(),
         warnings,
-        adopted: Vec::new(),
+        adopted,
         audit: a.audit,
-        adopt: false,
+        adopt: a.adopt,
     })
+}
+
+/// `spec [anchor]` for every adoptable bullet — the spelling the `--adopt` summary prints.
+fn adoptable_names(s: &crate::model::Snapshot) -> Vec<String> {
+    rulesdoc::adoptable(s)
+        .iter()
+        .map(|x| format!("{} [{}]", x.spec, x.anchor))
+        .collect()
 }
 
 impl Render for RulesReport {

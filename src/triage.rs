@@ -225,14 +225,7 @@ impl Triage {
 
         let steps = steps_from_args(t, a)?;
         let quirks = quirks_from_args(t, a)?;
-        let decisions = a
-            .decision
-            .iter()
-            .map(|title| NewDecision {
-                title: title.trim().to_string(),
-                scope: default_scope(touched, s),
-            })
-            .collect();
+        let decisions = decisions_from_args(a, touched, s);
         let spec = spec_check(t, a.spec_unchanged.as_deref(), touched, s, a)?;
         assemble(t, steps, quirks, decisions, spec, a)
     }
@@ -285,7 +278,6 @@ impl Triage {
 
         // ── the knowledge checkpoint ─────────────────────────────────────────
         let matched = specs_matching(touched, s);
-        let edited = specs_edited(touched, s);
         let spec = match spec_check(t, a.spec_unchanged.as_deref(), touched, s, a) {
             Ok(c) => {
                 if let SpecCheck::EditedOnBranch { specs } = &c {
@@ -310,7 +302,6 @@ impl Triage {
                 if why.trim().is_empty() {
                     return Err(e);
                 }
-                let _ = &edited;
                 SpecCheck::Unchanged {
                     why: why.trim().to_string(),
                 }
@@ -318,57 +309,31 @@ impl Triage {
         };
 
         // ── one-key capture, while the burn is fresh ─────────────────────────
+        let default = default_scope(touched, s);
         let mut quirks = quirks_from_args(t, a)?;
         if quirks.is_empty() && !a.no_quirks {
-            let title = io.ask("Quirks discovered? [enter = none]: ")?;
-            if !title.trim().is_empty() {
-                let default = default_scope(touched, s);
-                let hint = if default.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [enter = {}]", default.join(", "))
-                };
-                let raw = io.ask(&format!("  paths (comma-separated globs){hint}: "))?;
-                let paths = split_globs(&raw, &default);
+            if let Some((title, paths)) =
+                ask_capture(io, "Quirks discovered? [enter = none]: ", "paths", &default)?
+            {
+                // `quirk add`'s own default grade — see `quirks_from_args`.
                 quirks.push(NewQuirk {
-                    title: title.trim().to_string(),
+                    title,
                     paths,
                     severity: Severity::Gotcha,
                 });
             }
         }
 
-        let mut decisions: Vec<NewDecision> = a
-            .decision
-            .iter()
-            .map(|title| NewDecision {
-                title: title.trim().to_string(),
-                scope: default_scope(touched, s),
-            })
-            .collect();
+        let mut decisions = decisions_from_args(a, touched, s);
         if decisions.is_empty() && !a.no_decisions {
-            let title = io.ask("Decisions made? [enter = none]: ")?;
-            if !title.trim().is_empty() {
-                let default = default_scope(touched, s);
-                let hint = if default.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [enter = {}]", default.join(", "))
-                };
-                let raw = io.ask(&format!("  scope (comma-separated globs){hint}: "))?;
-                decisions.push(NewDecision {
-                    title: title.trim().to_string(),
-                    scope: split_globs(&raw, &default),
-                });
+            if let Some((title, scope)) =
+                ask_capture(io, "Decisions made? [enter = none]: ", "scope", &default)?
+            {
+                decisions.push(NewDecision { title, scope });
             }
         }
 
         assemble(t, steps, quirks, decisions, spec, a)
-    }
-
-    /// Which specs the branch's changed paths belong to — the input to both front doors.
-    pub fn specs_touched(touched: &[ChangedPath], s: &Snapshot) -> Vec<SpecName> {
-        specs_matching(touched, s)
     }
 
     /// The followup titles this triage spawns, in step order — what `plan_done` mints.
@@ -677,6 +642,17 @@ fn quirks_from_args(t: &Ticket, a: &DoneArgs) -> Result<Vec<NewQuirk>> {
         .collect())
 }
 
+/// `--decision "…"` × N, each steering the specs this branch actually touched.
+fn decisions_from_args(a: &DoneArgs, touched: &[ChangedPath], s: &Snapshot) -> Vec<NewDecision> {
+    a.decision
+        .iter()
+        .map(|title| NewDecision {
+            title: title.trim().to_string(),
+            scope: default_scope(touched, s),
+        })
+        .collect()
+}
+
 /// DESIGN's anti-rot gear 2: the branch touched a spec's `code:` globs, so either the spec
 /// moved with it or somebody said out loud why it did not.
 fn spec_check(
@@ -701,18 +677,22 @@ fn spec_check(
     if matched.is_empty() && edited.is_empty() {
         return Ok(SpecCheck::NotApplicable);
     }
-    let unedited: Vec<&SpecName> = matched.iter().filter(|n| !edited.contains(n)).collect();
+    let unedited: Vec<SpecName> = matched
+        .iter()
+        .filter(|n| !edited.contains(n))
+        .cloned()
+        .collect();
     if unedited.is_empty() {
         return Ok(SpecCheck::EditedOnBranch { specs: edited });
     }
 
-    let first = unedited[0];
+    let first = &unedited[0];
     Err(KsError::gate(
         "spec_unchanged_unrecorded",
         format!(
             "{id}: the branch touched {}'s code but {} was not edited on it",
             names(&matched),
-            names_of(&unedited)
+            names(&unedited)
         ),
         fixes![
             fix!("edit .kanspec/specs/{}.md on this branch", first.as_str()),
@@ -725,8 +705,9 @@ fn spec_check(
     ))
 }
 
-/// Specs whose `code:` globs the branch's changed paths fall inside.
-fn specs_matching(touched: &[ChangedPath], s: &Snapshot) -> Vec<SpecName> {
+/// Specs whose `code:` globs the branch's changed paths fall inside — the input to both
+/// front doors, and what `done` reports as the checkpoint's globs.
+pub(crate) fn specs_matching(touched: &[ChangedPath], s: &Snapshot) -> Vec<SpecName> {
     let mut out: Vec<SpecName> = Vec::new();
     for (name, spec) in &s.specs {
         let Some(set) = compile(&spec.fm.code) else {
@@ -793,10 +774,6 @@ fn names(v: &[SpecName]) -> String {
         return "no spec".to_string();
     }
     v.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
-}
-
-fn names_of(v: &[&SpecName]) -> String {
-    names(&v.iter().map(|n| (*n).clone()).collect::<Vec<_>>())
 }
 
 fn split_globs(raw: &str, default: &[String]) -> Vec<String> {
@@ -903,6 +880,28 @@ fn ask_step(io: &mut Prompter<'_>, st: &Step) -> Result<StepDisposition> {
             fix!("kanspec instructions done"),
         ],
     ))
+}
+
+/// One capture — a quirk or a decision: its title (enter = none), then the globs it steers
+/// by, defaulting to the `code:` globs of the specs this branch touched. `None` when the
+/// human said nothing, which is a claim a prompt CAN make (see the module header).
+fn ask_capture(
+    io: &mut Prompter<'_>,
+    question: &str,
+    what: &str,
+    default: &[String],
+) -> Result<Option<(String, Vec<String>)>> {
+    let title = io.ask(question)?;
+    if title.trim().is_empty() {
+        return Ok(None);
+    }
+    let hint = if default.is_empty() {
+        String::new()
+    } else {
+        format!(" [enter = {}]", default.join(", "))
+    };
+    let raw = io.ask(&format!("  {what} (comma-separated globs){hint}: "))?;
+    Ok(Some((title.trim().to_string(), split_globs(&raw, default))))
 }
 
 #[cfg(test)]
@@ -1309,15 +1308,15 @@ mod tests {
     }
 
     #[test]
-    fn specs_touched_is_the_input_both_doors_share() {
+    fn specs_matching_is_the_input_both_doors_share() {
         let s = snap_with_spec();
-        let hit = Triage::specs_touched(&changed(&["src/auth/login.ts"]), &s);
+        let hit = specs_matching(&changed(&["src/auth/login.ts"]), &s);
         assert_eq!(hit.iter().map(|n| n.as_str()).collect::<Vec<_>>(), ["auth"]);
-        assert!(Triage::specs_touched(&changed(&["src/billing/x.ts"]), &s).is_empty());
+        assert!(specs_matching(&changed(&["src/billing/x.ts"]), &s).is_empty());
         // `literal_separator`: `src/auth/**` crosses directories exactly like git's
         // `:(glob)`, which is what makes this agree with `scan`.
         assert_eq!(
-            Triage::specs_touched(&changed(&["src/auth/deep/nested.ts"]), &s).len(),
+            specs_matching(&changed(&["src/auth/deep/nested.ts"]), &s).len(),
             1
         );
         let _ = TicketId::parse("t-9c41").unwrap();

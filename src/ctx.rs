@@ -104,9 +104,10 @@ fn git_user_email() -> Option<String> {
 
 /// Invariant 8, mechanically (D-18). Private field; the ONLY constructor refuses an
 /// `Actor::Agent`, and `plan_accept`/`plan_revoke` take `&HumanActor`. An agent session
-/// literally cannot call them.
+/// literally cannot call them. It is a proof token, not a wrapper: the planners never read
+/// the actor back (they take it from `Facts`), so nothing is stored.
 #[derive(Debug)]
-pub struct HumanActor(Actor);
+pub struct HumanActor(());
 
 impl HumanActor {
     pub fn require(a: &Actor, verb: &'static str) -> Result<HumanActor> {
@@ -120,10 +121,7 @@ impl HumanActor {
                 ],
             ));
         }
-        Ok(HumanActor(a.clone()))
-    }
-    pub fn actor(&self) -> &Actor {
-        &self.0
+        Ok(HumanActor(()))
     }
 }
 
@@ -134,8 +132,17 @@ pub enum OutMode {
 }
 
 impl OutMode {
-    pub fn is_json(self) -> bool {
-        matches!(self, OutMode::Json)
+    /// The one place `--json` and `--color` become a mode. `run()` needs it BEFORE a `Ctx`
+    /// exists (to render the refusal when `Ctx::open` itself fails) and `Ctx::open` needs
+    /// it again, so both call this rather than each deciding colour on their own.
+    pub fn from_cli(cli: &Cli) -> OutMode {
+        if cli.json {
+            OutMode::Json
+        } else {
+            OutMode::Human {
+                color: crate::out::apply_color_policy(cli.color),
+            }
+        }
     }
 }
 
@@ -150,6 +157,10 @@ pub struct Ctx {
     pub now: DateTime<Utc>,
     pub out: OutMode,
     pub invoked_as: &'static str,
+    /// The command line as the user typed it — what `## Log` notes and `sync = "commit"`
+    /// subjects record. A `Ctx` built for a browser action overrides it with the verb the
+    /// browser asked for, so the note never claims a CLI run that did not happen.
+    pub invocation: String,
 }
 
 impl Ctx {
@@ -160,13 +171,6 @@ impl Ctx {
         let layout = Layout::open(&repo, &cfg);
         let git = Git::bind(repo.primary_root());
         let gh = Gh::detect(&git, &cfg.git.gh);
-        let out = if cli.json {
-            OutMode::Json
-        } else {
-            OutMode::Human {
-                color: crate::out::color_enabled(),
-            }
-        };
         Ok(Ctx {
             repo,
             layout,
@@ -175,8 +179,12 @@ impl Ctx {
             gh,
             actor: Actor::detect(),
             now: detect_now()?,
-            out,
-            invoked_as: cli.invoked_as(),
+            out: OutMode::from_cli(cli),
+            invoked_as: crate::cli::invoked_as(),
+            invocation: std::iter::once(crate::cli::invoked_as().to_string())
+                .chain(std::env::args().skip(1))
+                .collect::<Vec<_>>()
+                .join(" "),
         })
     }
 
@@ -186,16 +194,13 @@ impl Ctx {
 
     /// `"kanspec ship --pr 142"` — the Log note, and `Store::transact`'s `cmdline`.
     pub fn invocation(&self) -> String {
-        let mut parts = vec![self.invoked_as.to_string()];
-        parts.extend(std::env::args().skip(1));
-        parts.join(" ")
+        self.invocation.clone()
     }
 
     pub fn style(&self) -> Style {
         Style {
             color: matches!(self.out, OutMode::Human { color: true }),
             width: crate::out::term_width(),
-            quiet: false,
         }
     }
 

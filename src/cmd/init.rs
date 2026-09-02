@@ -230,8 +230,7 @@ fn refuse_taken_projections(ctx: &Ctx) -> Result<()> {
 /// two plan and this one writes, which is the same split `Store::transact` makes for the
 /// store. Nothing here is clever: every decision was made by the planner that produced the
 /// list, and this is deliberately the boring end.
-pub(crate) fn apply(edits: &[Edit]) -> Result<Vec<PathBuf>> {
-    let mut touched = Vec::new();
+pub(crate) fn apply(edits: &[Edit]) -> Result<()> {
     for e in edits {
         match e {
             Edit::MkDir { path } => {
@@ -249,30 +248,26 @@ pub(crate) fn apply(edits: &[Edit]) -> Result<Vec<PathBuf>> {
                 if *exec {
                     make_executable(path)?;
                 }
-                touched.push(path.clone());
             }
             Edit::Move { from, to } => {
                 if let Some(d) = to.parent() {
                     std::fs::create_dir_all(d).map_err(|e| io_err(d, "create", e))?;
                 }
                 std::fs::rename(from, to).map_err(|e| io_err(from, "move", e))?;
-                touched.push(to.clone());
             }
             Edit::Remove { path } => match std::fs::remove_file(path) {
-                Ok(()) => touched.push(path.clone()),
+                Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(io_err(path, "remove", e)),
             },
             // "if empty" IS the error: `remove_dir` refuses a populated directory, which
             // is exactly the guard we want, so a failure here is a no-op by design.
             Edit::PruneDir { path } => {
-                if std::fs::remove_dir(path).is_ok() {
-                    touched.push(path.clone());
-                }
+                let _ = std::fs::remove_dir(path);
             }
         }
     }
-    Ok(touched)
+    Ok(())
 }
 
 /// A hook without the executable bit is silently never run by git — the single most

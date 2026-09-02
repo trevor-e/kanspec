@@ -86,7 +86,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
         ScanOpts {
             fetch: !a.no_fetch,
             only,
-            quiet: a.quiet,
         },
     )?;
 
@@ -172,7 +171,7 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
 
     // Every git call happens BEFORE the lock (§2.16). The SHA the human is attesting to is
     // resolved through git so the log line names a commit that provably exists.
-    let sha = ticket_rev(t).and_then(|rev| ctx.git.head_sha(&rev).ok());
+    let sha = scan::ticket_rev(t).and_then(|(rev, _)| ctx.git.head_sha(&rev).ok());
     let f = ConfirmFacts {
         sha: sha.map(|h| h.sha().clone()),
         actor: ctx.actor.clone(),
@@ -193,6 +192,7 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
     // survive the round trip through the `## Log`, it did not survive at all.
     let t = done.snapshot.ticket(&id)?;
     let proof = scan::confirmed_proof(&ctx.git, t);
+    let fix = next_verb(t.fm.state, MergeStatus::Merged, &id);
     Ok(ScanReport {
         scanned: 1,
         landed: vec![ScanRow {
@@ -205,7 +205,7 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
             method: Some(crate::git::Method::HumanConfirm.to_string()),
             sha: proof.as_ref().map(|p| p.sha().short().to_string()),
             pr: t.fm.pr,
-            fix: next_verb(t.fm.state, MergeStatus::Merged, &id),
+            fix: fix.clone(),
             trace: Vec::new(),
         }],
         not_landed: Vec::new(),
@@ -213,27 +213,9 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
         fetch_age_secs: None,
         checked_at: ctx.now,
         confirmed: Some(id.clone()),
-        next: next_verb(t.fm.state, MergeStatus::Merged, &id)
-            .into_iter()
-            .collect(),
+        next: fix.into_iter().collect(),
         quiet: a.quiet,
     })
-}
-
-/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip", the same rev the
-/// ladder reasons about.
-fn ticket_rev(t: &crate::model::Ticket) -> Option<String> {
-    t.fm.head
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "null")
-        .or_else(|| {
-            t.fm.branch
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        })
-        .map(str::to_string)
 }
 
 /// `"in main (gh-pr #142 · a1b9c3d)"` · `"unknown (squash suspected, no gh)"`.

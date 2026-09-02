@@ -9,10 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use crate::cli::{DropArgs, ParkArgs, ReadyArgs, ShipArgs, StartArgs};
+use crate::cmd::ticket::{facts, join};
 use crate::ctx::Ctx;
 use crate::derive::{self, Badge};
 use crate::error::{KsError, Result};
@@ -23,6 +23,7 @@ use crate::keys::TicketKey;
 use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Ticket};
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{Facts, Op, Plan, ShipFacts, StartFacts};
+use crate::rulesdoc::Scope;
 use crate::store::Store;
 use crate::transitions::{self, State, Verb};
 use crate::{fix, fixes};
@@ -108,9 +109,10 @@ impl Render for ReadyReport {
             if let Some(p) = &r.proposal {
                 chips.push(p.to_string());
             }
+            // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
             let mut line = Line::state(State::Todo, &r.title)
                 .id(&r.id)
-                .fix(format!("kanspec start {}", r.id));
+                .fix(crate::out::spoken(&format!("kanspec start {}", r.id)));
             if !chips.is_empty() {
                 line = line.dim(format!("· {}", chips.join(" · ")));
             }
@@ -137,10 +139,7 @@ fn ids(v: &[TicketId]) -> String {
     if v.is_empty() {
         return "nothing".to_string();
     }
-    v.iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ")
+    join(v, ", ")
 }
 
 // ── start ────────────────────────────────────────────────────────────────────
@@ -212,11 +211,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {
-        base: Facts {
-            actor: ctx.actor.clone(),
-            at: ctx.now,
-            invocation: ctx.invocation(),
-        },
+        base: facts(ctx),
         branch: branch.clone(),
         worktree: wt_display.clone(),
         head,
@@ -390,13 +385,7 @@ impl StartReport {
             } else {
                 "match"
             },
-            listed(
-                &self
-                    .quirks_matching
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            )
+            listed(&self.quirks_matching)
         );
         format!("{spec} · {d} · {q}")
     }
@@ -410,11 +399,11 @@ fn plural(n: usize) -> &'static str {
     }
 }
 
-fn listed(v: &[String]) -> String {
+fn listed<T: std::fmt::Display>(v: &[T]) -> String {
     if v.is_empty() {
         String::new()
     } else {
-        format!(" ({})", v.join(", "))
+        format!(" ({})", join(v, ", "))
     }
 }
 
@@ -425,13 +414,9 @@ fn listed(v: &[String]) -> String {
 /// Read from the REAL knowledge entities in the snapshot — `specs/`, `decisions/`,
 /// `quirks/` — which `store::load_snapshot` has parsed since wave 1.
 ///
-/// It deliberately does NOT go through `rulesdoc::build`. That was originally because S6's
-/// generator was `todo!()` and calling it would have panicked every `start`; **S6 landed in
-/// round C, so the reason is now a different one** (comment corrected in round D): `build`
-/// assembles the full rendered rules document, and this needs three counts. Moving the
-/// *scoping* onto `rulesdoc::Scope` remains the right cleanup — invariant 3 wants one
-/// definition of "in scope" — but it is a refactor with a behavioural risk (the claim
-/// transcript is snapshot-pinned), not the removal of a stub.
+/// It deliberately does NOT go through `rulesdoc::build`: `build` assembles the full
+/// rendered rules document, and this needs three counts. The *scoping* does go through
+/// `rulesdoc::Scope` — invariant 3 wants ONE definition of "in scope", and this is it.
 struct ClaimContext {
     spec_rules: usize,
     decisions: Vec<String>,
@@ -440,67 +425,35 @@ struct ClaimContext {
 
 fn claim_context(s: &Snapshot, t: &Ticket) -> ClaimContext {
     let spec = t.fm.spec.as_ref().and_then(|n| s.specs.get(n));
-    let globs: Vec<String> = spec.map(|sp| sp.fm.code.clone()).unwrap_or_default();
+    // At claim time there is no diff to match against — the work has not happened yet — so
+    // the only honest scope is the spec's own `code:` globs. `Scope::touches` asks
+    // glob-versus-glob BOTH ways (`src/auth/**` covers `src/auth/login.ts`, and a decision
+    // scoped at `src/auth/login.ts` is in scope for a spec that owns `src/auth/**`), and
+    // over-reports rather than under-reports, which is the right direction for a landmine
+    // warning. A spec with no globs, or one whose hand-edited glob cannot compile, reaches
+    // nothing; an entity with no globs is reached by nothing.
+    let scope = spec.and_then(|sp| Scope::of(&sp.fm.code).ok());
+    let touches = |globs: &[String]| scope.as_ref().is_some_and(|sc| sc.touches(globs));
 
-    let mut decisions: Vec<String> = Vec::new();
-    for (id, d) in &s.decisions {
-        // Proposed decisions are NOT standing rules (invariant 8): they sit in `status`
-        // until a human accepts them, and they must not steer a claim.
-        if d.fm.status != DecisionStatus::Accepted {
-            continue;
-        }
-        if overlaps(&d.scope, &globs) {
-            decisions.push(id.to_string());
-        }
-    }
-    let mut quirks: Vec<QuirkId> = Vec::new();
-    for (id, q) in &s.quirks {
-        if q.fm.status != QuirkStatus::Active {
-            continue;
-        }
-        if overlaps(&q.fm.paths, &globs) {
-            quirks.push(id.clone());
-        }
-    }
+    // Proposed decisions are NOT standing rules (invariant 8): they sit in `status` until a
+    // human accepts them, and they must not steer a claim.
+    let decisions = s
+        .decisions
+        .iter()
+        .filter(|(_, d)| d.fm.status == DecisionStatus::Accepted && touches(&d.scope))
+        .map(|(id, _)| id.to_string())
+        .collect();
+    let quirks = s
+        .quirks
+        .iter()
+        .filter(|(_, q)| q.fm.status == QuirkStatus::Active && touches(&q.fm.paths))
+        .map(|(id, _)| id.clone())
+        .collect();
     ClaimContext {
         spec_rules: spec.map(|sp| sp.rules.len()).unwrap_or(0),
         decisions,
         quirks,
     }
-}
-
-/// Do two glob SETS describe overlapping ground?
-///
-/// At claim time there is no diff to match against — the work has not happened yet — so the
-/// only honest scope is the spec's own `code:` globs. Glob-versus-glob has no exact answer,
-/// so this asks it both ways: `src/auth/**` covers `src/auth/login.ts`, and a decision
-/// scoped at `src/auth/login.ts` is in scope for a spec that owns `src/auth/**`. It
-/// over-reports rather than under-reports, which is the right direction for a landmine
-/// warning.
-fn overlaps(a: &[String], b: &[String]) -> bool {
-    if a.is_empty() || b.is_empty() {
-        return false;
-    }
-    matches_any(a, b) || matches_any(b, a)
-}
-
-fn matches_any(patterns: &[String], candidates: &[String]) -> bool {
-    let Some(set) = compile(patterns) else {
-        return false;
-    };
-    candidates.iter().any(|c| set.is_match(c))
-}
-
-fn compile(globs: &[String]) -> Option<GlobSet> {
-    let mut b = GlobSetBuilder::new();
-    let mut any = false;
-    for g in globs {
-        if let Ok(glob) = GlobBuilder::new(g).literal_separator(true).build() {
-            b.add(glob);
-            any = true;
-        }
-    }
-    any.then(|| b.build().ok()).flatten()
 }
 
 // ── the git plumbing `start` owns ────────────────────────────────────────────
@@ -742,11 +695,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
     }
 
     let f = ShipFacts {
-        base: Facts {
-            actor: ctx.actor.clone(),
-            at: ctx.now,
-            invocation: ctx.invocation(),
-        },
+        base: facts(ctx),
         head,
     };
     let committed = Store::open(ctx).transact(Some(Verb::Ship), &ctx.invocation(), |s, m| {
@@ -841,11 +790,7 @@ pub struct ParkReport {
 pub fn park(ctx: &Ctx, a: &ParkArgs) -> Result<ParkReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = Facts {
-        actor: ctx.actor.clone(),
-        at: ctx.now,
-        invocation: ctx.invocation(),
-    };
+    let f = facts(ctx);
     let committed = Store::open(ctx).transact(Some(Verb::Park), &ctx.invocation(), |s, m| {
         plan_park(s, &f, a, m)
     })?;
@@ -910,11 +855,7 @@ pub struct DropReport {
 pub fn drop_ticket(ctx: &Ctx, a: &DropArgs) -> Result<DropReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = Facts {
-        actor: ctx.actor.clone(),
-        at: ctx.now,
-        invocation: ctx.invocation(),
-    };
+    let f = facts(ctx);
     let committed = Store::open(ctx).transact(Some(Verb::Drop), &ctx.invocation(), |s, m| {
         plan_drop(s, &f, a, m)
     })?;
@@ -1383,14 +1324,18 @@ mod tests {
         );
     }
 
+    /// The claim scope is `rulesdoc::Scope`, so "in scope" has one definition: glob-versus-
+    /// glob in both directions, and nothing when either side is empty.
     #[test]
-    fn glob_overlap_answers_both_directions_and_neither_when_empty() {
+    fn the_claim_scope_answers_both_directions_and_neither_when_empty() {
         let auth = vec!["src/auth/**".to_string()];
-        assert!(overlaps(&auth, &["src/auth/login.ts".to_string()]));
-        assert!(overlaps(&["src/auth/login.ts".to_string()], &auth));
-        assert!(overlaps(&auth, &auth));
-        assert!(!overlaps(&auth, &["src/billing/**".to_string()]));
-        assert!(!overlaps(&auth, &[]));
-        assert!(!overlaps(&[], &auth));
+        let login = vec!["src/auth/login.ts".to_string()];
+        let scope = |g: &[String]| Scope::of(g).unwrap();
+        assert!(scope(&auth).touches(&login));
+        assert!(scope(&login).touches(&auth));
+        assert!(scope(&auth).touches(&auth));
+        assert!(!scope(&auth).touches(&["src/billing/**".to_string()]));
+        assert!(!scope(&auth).touches(&[]));
+        assert!(!scope(&[]).touches(&auth));
     }
 }

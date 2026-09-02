@@ -227,7 +227,7 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
     // collision has to be measured against the commit `git switch {main}` would really land
     // on: the local branch when it exists, and otherwise the remote ref git's DWIM would
     // create it from.
-    let rev = if local_branch(ctx, &main) {
+    let rev = if ref_exists(ctx, &format!("refs/heads/{main}")) {
         main.clone()
     } else {
         resolved.clone()
@@ -297,10 +297,6 @@ fn short_name(ctx: &Ctx, resolved: &str) -> String {
         Some((_remote, branch)) if !branch.is_empty() => branch.to_string(),
         _ => resolved.to_string(),
     }
-}
-
-fn local_branch(ctx: &Ctx, b: &str) -> bool {
-    ref_exists(ctx, &format!("refs/heads/{b}"))
 }
 
 fn ref_exists(ctx: &Ctx, r: &str) -> bool {

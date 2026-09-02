@@ -10,6 +10,7 @@
 use serde::Serialize;
 
 use crate::cli::{AbandonArgs, ApproveArgs, CloseArgs, ProposeArgs, ReviewArgs};
+use crate::cmd::ticket::{facts, rel_to};
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
 use crate::fm::{self, Yv};
@@ -84,14 +85,12 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
 
     let title = a.title.clone();
     let created = ctx.now.date_naive();
-    let mut minted: Option<ProposalId> = None;
-    Store::open(ctx).transact(None, &ctx.invocation(), |_s, m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |_s, m| {
         let id = m.proposal(&title)?;
         let contents = scaffold(&id, &title, &specs, created);
         // The directory carries the slug so a teammate browsing the repo reads
         // `p-7de2-login-rate-limiting/`, not `p-7de2/`.
         let slug = crate::ids::slug(&title);
-        minted = Some(id.clone());
         let mut plan = Plan::of(vec![Op::CreateProposal {
             id: id.clone(),
             slug,
@@ -100,41 +99,44 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
         plan.mint(EntityRef::Proposal(id));
         Ok(plan)
     })?;
-    let id =
-        minted.ok_or_else(|| KsError::internal(anyhow::anyhow!("`propose` minted no proposal")))?;
-
-    let after = ctx.snapshot()?;
-    let path = after
+    let id = done
+        .minted
+        .iter()
+        .find_map(|e| match e {
+            EntityRef::Proposal(p) => Some(p.clone()),
+            _ => None,
+        })
+        .ok_or_else(|| KsError::internal(anyhow::anyhow!("`propose` minted no proposal")))?;
+    // `Committed` carries the post-write snapshot, read under the lock: no second load.
+    let path = done
+        .snapshot
         .proposals
         .get(&id)
-        .map(|p| rel(ctx, &ctx.layout.proposal_md(&p.dir)))
+        .map(|p| rel_to(ctx, &ctx.layout.proposal_md(&p.dir)))
         .unwrap_or_default();
 
     Ok(ProposeReport {
-        status: crate::model::ProposalStatus::Draft,
+        status: ProposalStatus::Draft,
         path,
         next: vec![format!(
             "edit the Changes bullets, then {} review {id}",
             ctx.invoked_as
         )],
-        title: a.title.clone(),
+        title,
         id,
     })
 }
 
-fn rel(ctx: &Ctx, p: &std::path::Path) -> String {
-    p.strip_prefix(ctx.repo.primary_root())
-        .unwrap_or(p)
-        .display()
-        .to_string()
-}
-
 /// Resolve a proposal id, telling a CLOSED one apart from a missing one — closed proposals
 /// bind nothing, and saying "not found" about one that is merely closed sends a human
-/// looking for a file that is right there.
-fn open_proposal<'a>(ctx: &Ctx, s: &'a Snapshot, raw: &str) -> Result<&'a Proposal> {
-    let id = ProposalId::parse(raw)?;
-    s.proposals.get(&id).ok_or_else(|| {
+/// looking for a file that is right there. Every verb here and in `cmd::comment` refuses
+/// through this one function, so the two refusals cannot drift apart.
+pub(crate) fn proposal_or_refuse<'a>(
+    ctx: &Ctx,
+    s: &'a Snapshot,
+    id: &ProposalId,
+) -> Result<&'a Proposal> {
+    s.proposals.get(id).ok_or_else(|| {
         if s.closed_ids.contains(id.as_str()) {
             KsError::gate(
                 "proposal_closed",
@@ -151,6 +153,61 @@ fn open_proposal<'a>(ctx: &Ctx, s: &'a Snapshot, raw: &str) -> Result<&'a Propos
     })
 }
 
+fn open_proposal<'a>(ctx: &Ctx, s: &'a Snapshot, raw: &str) -> Result<&'a Proposal> {
+    proposal_or_refuse(ctx, s, &ProposalId::parse(raw)?)
+}
+
+/// The proposal as it stands INSIDE a transaction — re-read under the lock, so a plan
+/// never extends a ledger somebody else just rewrote.
+pub(crate) fn live<'a>(sn: &'a Snapshot, pid: &ProposalId) -> Result<&'a Proposal> {
+    sn.proposals.get(pid).ok_or_else(|| {
+        KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
+    })
+}
+
+/// `1 open thread` / `3 open threads` — the count-and-noun pair every gate message spells.
+pub(crate) fn plural(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// The refusal every verb gives a closed or abandoned proposal. `already` picks the
+/// wording: `close` and `abandon` say "is already closed", `review` and `approve` say it
+/// steers nothing.
+fn refuse_terminal(ctx: &Ctx, p: &Proposal, already: bool) -> Result<()> {
+    use ProposalStatus as S;
+    if !matches!(p.fm.status, S::Closed | S::Abandoned) {
+        return Ok(());
+    }
+    let (id, word) = (&p.fm.id, status_word(p.fm.status));
+    Err(KsError::gate(
+        "proposal_terminal",
+        if already {
+            format!("{id} is already {word}")
+        } else {
+            format!("{id} is {word} — it steers nothing")
+        },
+        fixes![fix!("{} board", ctx.invoked_as)],
+    ))
+}
+
+/// Fold a `plan_new` sub-plan into `plan`, recording `<anchor> <word>→<t-id>` in `ledger`
+/// for every ticket it minted. `approve` and `close` both mint tickets this way, and that
+/// ledger line is the ONE record `page` and `derive::dispositioned` read back.
+fn absorb(plan: &mut Plan, sub: Plan, ledger: &mut Vec<String>, anchor: &ItemRef, word: &str) {
+    plan.ops.extend(sub.ops);
+    for e in sub.minted {
+        if let EntityRef::Ticket(t) = &e {
+            ledger.push(format!("{anchor} {word}→{t}"));
+        }
+        plan.mint(e);
+    }
+}
+
+/// `c3` — the short anchor the body uses and the transcript prints.
+fn short(i: &ItemRef) -> String {
+    format!("{}{}", i.kind.letter(), i.n)
+}
+
 impl Render for ProposeReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::new('▸', format!("{} created", self.title))
@@ -161,8 +218,12 @@ impl Render for ProposeReport {
     }
 }
 
-/// The shared `→ next` tail every report in this module ends with.
-fn next_lines(next: &[String], w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+/// The shared `→ next` tail every report in this module and `cmd::comment` ends with.
+pub(crate) fn next_lines(
+    next: &[String],
+    w: &mut dyn std::io::Write,
+    st: &Style,
+) -> std::io::Result<()> {
     for n in next {
         crate::out::Line::new(crate::out::glyph::FIX, "next")
             .fix(n.as_str())
@@ -200,23 +261,15 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
     let id = p.fm.id.clone();
 
     use crate::model::ProposalStatus as S;
-    match p.fm.status {
-        // Re-review is how iteration works: comment -> agent edit -> re-review.
-        S::Draft | S::Review => {}
-        S::Approved => {
-            return Err(KsError::gate(
-                "already_approved",
-                format!("{id} is already approved — reopening it would unstamp the approval"),
-                fixes![fix!("{} close {id}", ctx.invoked_as)],
-            ))
-        }
-        S::Closed | S::Abandoned => {
-            return Err(KsError::gate(
-                "proposal_terminal",
-                format!("{id} is {} — it steers nothing", status_word(p.fm.status)),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            ))
-        }
+    refuse_terminal(ctx, p, false)?;
+    // Re-review is how iteration works: comment -> agent edit -> re-review. An approved
+    // proposal is the exception, because reopening it would unstamp the approval.
+    if p.fm.status == S::Approved {
+        return Err(KsError::gate(
+            "already_approved",
+            format!("{id} is already approved — reopening it would unstamp the approval"),
+            fixes![fix!("{} close {id}", ctx.invoked_as)],
+        ));
     }
 
     let open = unresolved(&snap, p);
@@ -255,8 +308,7 @@ impl Render for ReviewReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         let dim = match self.unresolved {
             0 => "· in review · no open threads".to_string(),
-            1 => "· in review · 1 open thread".to_string(),
-            n => format!("· in review · {n} open threads"),
+            n => format!("· in review · {}", plural(n, "open thread")),
         };
         Line::new('▸', "up for review")
             .id(&self.id)
@@ -286,21 +338,12 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     let id = p.fm.id.clone();
 
     use crate::model::ProposalStatus as S;
-    match p.fm.status {
-        S::Draft | S::Review => {}
-        S::Approved => {
-            return Err(KsError::conflict(
-                format!("{id} is already approved{}", stamp_tail(p)),
-                fixes![fix!("{} close {id}", ctx.invoked_as)],
-            ))
-        }
-        S::Closed | S::Abandoned => {
-            return Err(KsError::gate(
-                "proposal_terminal",
-                format!("{id} is {} — it steers nothing", status_word(p.fm.status)),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            ))
-        }
+    refuse_terminal(ctx, p, false)?;
+    if p.fm.status == S::Approved {
+        return Err(KsError::conflict(
+            format!("{id} is already approved{}", stamp_tail(p)),
+            fixes![fix!("{} close {id}", ctx.invoked_as)],
+        ));
     }
 
     // THE gate. Unresolved feedback is the one thing approval must not paper over — and
@@ -311,8 +354,8 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         return Err(KsError::gate(
             "unresolved_threads",
             format!(
-                "cannot approve {id} — {open} unresolved review thread{}",
-                if open == 1 { "" } else { "s" }
+                "cannot approve {id} — {}",
+                plural(open, "unresolved review thread")
             ),
             fixes![
                 fix!("{} comments {id} --unresolved", ctx.invoked_as),
@@ -350,9 +393,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     let spec = p.fm.specs.first().map(ToString::to_string);
     let pid = id.clone();
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
-        let p = sn.proposals.get(&pid).ok_or_else(|| {
-            KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
-        })?;
+        let p = live(sn, &pid)?;
         let mut plan = Plan::of(vec![Op::SetFields {
             entity: EntityRef::Proposal(pid.clone()),
             sets: vec![
@@ -362,11 +403,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         }]);
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
-            let f = crate::plan::Facts {
-                actor: ctx.actor.clone(),
-                at: ctx.now,
-                invocation: ctx.invocation(),
-            };
+            let f = facts(ctx);
             for (anchor, title, deps) in &wanted {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
@@ -380,15 +417,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
                     no_link: true,
                 };
                 let sub = crate::cmd::ticket::plan_new(sn, &f, &args, m, None)?;
-                for op in sub.ops {
-                    plan.push(op);
-                }
-                for e in sub.minted {
-                    if let EntityRef::Ticket(t) = &e {
-                        ledger.push(format!("{anchor} minted→{t}"));
-                    }
-                    plan.mint(e);
-                }
+                absorb(&mut plan, sub, &mut ledger, anchor, "minted");
             }
         }
         if ledger != p.fm.ledger {
@@ -484,10 +513,6 @@ pub enum Disposition {
         item: ItemRef,
         rule: String,
     },
-    Promoted {
-        item: ItemRef,
-        record: String,
-    },
     Followup {
         item: ItemRef,
         ticket: TicketId,
@@ -564,29 +589,20 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     let id = p.fm.id.clone();
 
     use crate::model::ProposalStatus as S;
-    match p.fm.status {
-        S::Approved => {}
-        S::Abandoned | S::Closed => {
-            return Err(KsError::gate(
-                "proposal_terminal",
-                format!("{id} is already {}", status_word(p.fm.status)),
-                fixes![fix!("{} board", ctx.invoked_as)],
-            ))
-        }
-        S::Draft | S::Review => {
-            return Err(KsError::gate(
-                "not_approved",
-                format!(
-                    "{id} is {} — close is the END of an approved proposal, not a way out \
-                     of one",
-                    status_word(p.fm.status)
-                ),
-                fixes![
-                    fix!("{} approve {id}", ctx.invoked_as),
-                    fix!("{} abandon {id} --why \"...\"", ctx.invoked_as),
-                ],
-            ))
-        }
+    refuse_terminal(ctx, p, true)?;
+    if p.fm.status != S::Approved {
+        return Err(KsError::gate(
+            "not_approved",
+            format!(
+                "{id} is {} — close is the END of an approved proposal, not a way out \
+                 of one",
+                status_word(p.fm.status)
+            ),
+            fixes![
+                fix!("{} approve {id}", ctx.invoked_as),
+                fix!("{} abandon {id} --why \"...\"", ctx.invoked_as),
+            ],
+        ));
     }
 
     // 1 — the dispositions the human named on the command line.
@@ -648,112 +664,95 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
         {
             continue;
         }
-        match i.id.kind {
-            crate::ids::ItemKind::Change => {
-                // An item-level token beats the positional fallback: it says which rule
-                // shipped THIS change, so nothing has to be inferred.
-                let named = evidence.exact.get(&i.id.to_string()).cloned();
-                if let Some(rule) = named.or_else(|| loose_left.next().cloned()) {
+        if i.id.kind == crate::ids::ItemKind::Change {
+            // An item-level token beats the positional fallback: it says which rule
+            // shipped THIS change, so nothing has to be inferred.
+            let named = evidence.exact.get(&i.id.to_string()).cloned();
+            if let Some(rule) = named.or_else(|| loose_left.next().cloned()) {
+                ledger.push(format!("{} shipped→{rule}", i.id));
+                dispositions.push(Disposition::Shipped {
+                    item: i.id.clone(),
+                    rule,
+                });
+            } else {
+                unmet.push((
+                    i.id.clone(),
+                    format!("\"{}\" — not found in any spec", i.text),
+                    vec![
+                        format!("{} close {id} --followup {}", ctx.invoked_as, short(&i.id)),
+                        format!(
+                            "{} close {id} --dropped {} --note \"...\"",
+                            ctx.invoked_as,
+                            short(&i.id)
+                        ),
+                    ],
+                ));
+            }
+            continue;
+        }
+        // A prescription. A `(temp until t-x)` whose guard landed expires on its own.
+        if let Some(t) = landed_guard(&snap, i) {
+            let reason = format!("{t} landed");
+            ledger.push(format!("{} expired ({reason})", i.id));
+            dispositions.push(Disposition::Expired {
+                item: i.id.clone(),
+                reason,
+            });
+            continue;
+        }
+        let fixes = match &i.prescription {
+            // A `(promote: spec)` prescription ships the way a change does: as a rule
+            // bullet written on the implementing branch, carrying `{p-x#pN}`. The exact
+            // token is required — a bare `{p-x}` names the proposal, not the item, and a
+            // prescription is never handed the positional fallback a change gets.
+            Some(crate::model::Prescription::Promote(crate::model::PromoteAs::Spec)) => {
+                if let Some(rule) = evidence.exact.get(&i.id.to_string()).cloned() {
                     ledger.push(format!("{} shipped→{rule}", i.id));
                     dispositions.push(Disposition::Shipped {
                         item: i.id.clone(),
                         rule,
                     });
-                } else {
-                    unmet.push((
-                        i.id.clone(),
-                        format!("\"{}\" — not found in any spec", i.text),
-                        vec![
-                            format!(
-                                "{} close {id} --followup {}{}",
-                                ctx.invoked_as,
-                                i.id.kind.letter(),
-                                i.id.n
-                            ),
-                            format!(
-                                "{} close {id} --dropped {}{} --note \"...\"",
-                                ctx.invoked_as,
-                                i.id.kind.letter(),
-                                i.id.n
-                            ),
-                        ],
-                    ));
-                }
-            }
-            crate::ids::ItemKind::Prescription => {
-                if let Some(t) = landed_guard(&snap, i) {
-                    let reason = format!("{t} landed");
-                    ledger.push(format!("{} expired ({reason})", i.id));
-                    dispositions.push(Disposition::Expired {
-                        item: i.id.clone(),
-                        reason,
-                    });
                     continue;
                 }
-                // A `(promote: spec)` prescription ships the way a change does: as a rule
-                // bullet written on the implementing branch, carrying `{p-x#pN}`. The exact
-                // token is required — a bare `{p-x}` names the proposal, not the item, and
-                // a prescription is never handed the positional fallback a change gets.
-                if matches!(
-                    &i.prescription,
-                    Some(crate::model::Prescription::Promote(
-                        crate::model::PromoteAs::Spec
-                    ))
-                ) {
-                    if let Some(rule) = evidence.exact.get(&i.id.to_string()).cloned() {
-                        ledger.push(format!("{} shipped→{rule}", i.id));
-                        dispositions.push(Disposition::Shipped {
-                            item: i.id.clone(),
-                            rule,
-                        });
-                        continue;
-                    }
-                }
-                let fixes = match &i.prescription {
-                    // `promote --as spec` refuses by design (a rule is written, not minted),
-                    // so the advice must name the write, not the verb that bounces.
-                    Some(crate::model::Prescription::Promote(crate::model::PromoteAs::Spec)) => {
-                        vec![format!(
-                            "add `- [<spec>.<rule>] … {{{}}}` to .kanspec/specs/<spec>.md, then {} close {id}",
-                            i.id, ctx.invoked_as
-                        )]
-                    }
-                    Some(crate::model::Prescription::Promote(kind)) => vec![format!(
-                        "{} promote {} --as {} --scope \"src/**\"",
-                        ctx.invoked_as,
-                        i.id,
-                        promote_word(*kind)
-                    )],
-                    Some(crate::model::Prescription::TempUntil(t)) => vec![
-                        format!("{} scan --confirm", ctx.invoked_as),
-                        format!(
-                            "{} expire {} --reason \"{t} is not landing\"",
-                            ctx.invoked_as, i.id
-                        ),
-                    ],
-                    // An untyped prescription is a close blocker BY DESIGN: nobody can say
-                    // what it was supposed to become, which is exactly the silent drop this
-                    // gate exists to stop.
-                    _ => vec![
-                        format!("type it `(promote: decision)` or `(temp until t-x)` in the body"),
-                        format!("{} expire {} --reason \"...\"", ctx.invoked_as, i.id),
-                    ],
-                };
-                unmet.push((i.id.clone(), format!("\"{}\"", i.text), fixes));
+                // `promote --as spec` refuses by design (a rule is written, not minted),
+                // so the advice must name the write, not the verb that bounces.
+                vec![format!(
+                    "add `- [<spec>.<rule>] … {{{}}}` to .kanspec/specs/<spec>.md, then {} close {id}",
+                    i.id, ctx.invoked_as
+                )]
             }
-            crate::ids::ItemKind::Ticket => {}
-        }
+            Some(crate::model::Prescription::Promote(kind)) => vec![format!(
+                "{} promote {} --as {} --scope \"src/**\"",
+                ctx.invoked_as,
+                i.id,
+                promote_word(*kind)
+            )],
+            Some(crate::model::Prescription::TempUntil(t)) => vec![
+                format!("{} scan --confirm", ctx.invoked_as),
+                format!(
+                    "{} expire {} --reason \"{t} is not landing\"",
+                    ctx.invoked_as, i.id
+                ),
+            ],
+            // An untyped prescription is a close blocker BY DESIGN: nobody can say what
+            // it was supposed to become, which is exactly the silent drop this gate
+            // exists to stop.
+            _ => vec![
+                "type it `(promote: decision)` or `(temp until t-x)` in the body".to_string(),
+                format!("{} expire {} --reason \"...\"", ctx.invoked_as, i.id),
+            ],
+        };
+        unmet.push((i.id.clone(), format!("\"{}\"", i.text), fixes));
     }
 
     // 3 — a followup still needs its ticket, which is minted in the same transaction.
     if !unmet.is_empty() {
         let mut msg = format!(
-            "cannot close {id} — {} item{} undispositioned:",
-            unmet.len(),
-            if unmet.len() == 1 { "" } else { "s" }
+            "cannot close {id} — {} undispositioned:",
+            plural(unmet.len(), "item")
         );
         for (item, what, _) in &unmet {
-            msg.push_str(&format!("\n  [{}{}] {what}", item.kind.letter(), item.n));
+            msg.push_str(&format!("\n  [{}] {what}", short(item)));
         }
         // Invariant 9: every refusal names its next command — here, the exact command for
         // each unmet item, which is what turns a twelve-item close into two keys.
@@ -783,16 +782,9 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     let spec = p.fm.specs.first().map(ToString::to_string);
     let pid = id.clone();
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
-        let p = sn.proposals.get(&pid).ok_or_else(|| {
-            KsError::not_found("proposal", pid.to_string(), fixes![fix!("kanspec board")])
-        })?;
         let mut ledger = ledger.clone();
         let mut plan = Plan::empty();
-        let f = crate::plan::Facts {
-            actor: ctx.actor.clone(),
-            at: ctx.now,
-            invocation: ctx.invocation(),
-        };
+        let f = facts(ctx);
         for (item, text) in &followups {
             let args = crate::cli::NewArgs {
                 title: text.clone(),
@@ -807,15 +799,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
                 no_link: true,
             };
             let sub = crate::cmd::ticket::plan_new(sn, &f, &args, m, None)?;
-            for op in sub.ops {
-                plan.push(op);
-            }
-            for e in sub.minted {
-                if let EntityRef::Ticket(t) = &e {
-                    ledger.push(format!("{item} followup→{t}"));
-                }
-                plan.mint(e);
-            }
+            absorb(&mut plan, sub, &mut ledger, item, "followup");
         }
         // The ledger and the status ride the SAME `SetFields`, so a plan that stamps one
         // without the other is unavailable rather than merely wrong.
@@ -830,19 +814,20 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
             from: dir.clone(),
             to: dest.clone(),
         });
-        let _ = p;
         Ok(plan)
     })?;
 
+    // One ticket per followup, in minting order — the same pairing the ledger inside the
+    // transaction recorded, so the transcript and the file cannot name different tickets.
+    let mut tickets = done.minted.iter().filter_map(|e| match e {
+        EntityRef::Ticket(t) => Some(t.clone()),
+        _ => None,
+    });
     for (item, _) in &followups {
-        if let Some(EntityRef::Ticket(t)) = done
-            .minted
-            .iter()
-            .find(|e| matches!(e, EntityRef::Ticket(_)))
-        {
+        if let Some(ticket) = tickets.next() {
             dispositions.push(Disposition::Followup {
                 item: item.clone(),
-                ticket: t.clone(),
+                ticket,
             });
         }
     }
@@ -850,7 +835,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     Ok(CloseReport {
         status: S::Closed,
         ledger: dispositions,
-        moved_to: rel(ctx, &dest),
+        moved_to: rel_to(ctx, &dest),
         next: vec![format!("{} rules", ctx.invoked_as)],
         id,
     })
@@ -874,12 +859,11 @@ impl Render for CloseReport {
         for d in &self.ledger {
             let (item, what) = match d {
                 Disposition::Shipped { item, rule } => (item, format!("shipped→{rule}")),
-                Disposition::Promoted { item, record } => (item, format!("promoted→{record}")),
                 Disposition::Followup { item, ticket } => (item, format!("followup→{ticket}")),
                 Disposition::Dropped { item, note } => (item, format!("dropped ({note})")),
                 Disposition::Expired { item, reason } => (item, format!("expired ({reason})")),
             };
-            writeln!(w, "   · {}{} {what}", item.kind.letter(), item.n)?;
+            writeln!(w, "   · {} {what}", short(item))?;
         }
         next_lines(&self.next, w, st)
     }
@@ -910,13 +894,7 @@ pub fn abandon(ctx: &Ctx, a: &AbandonArgs) -> Result<AbandonReport> {
     let id = p.fm.id.clone();
 
     use crate::model::ProposalStatus as S;
-    if matches!(p.fm.status, S::Closed | S::Abandoned) {
-        return Err(KsError::gate(
-            "proposal_terminal",
-            format!("{id} is already {}", status_word(p.fm.status)),
-            fixes![fix!("{} board", ctx.invoked_as)],
-        ));
-    }
+    refuse_terminal(ctx, p, true)?;
 
     let why = a.why.clone();
     let line = format!("- {} · {}", ctx.now.date_naive(), why);
@@ -1059,31 +1037,37 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
     let items = p
         .items
         .iter()
-        .map(|i| PageItem {
-            kind: i.id.kind.letter(),
+        .map(|i| {
             // The `(promote: decision)` marker becomes the badge, so leaving it in the
             // text too would render it twice on the card.
-            text: strip_marker(&i.text),
-            headline: split_headline(&strip_marker(&i.text)).0,
-            detail: split_headline(&strip_marker(&i.text)).1,
-            badge: match &i.prescription {
-                Some(crate::model::Prescription::TempUntil(t)) => Some(format!("TEMP until {t}")),
-                Some(crate::model::Prescription::Promote(k)) => {
-                    Some(format!("PROMOTE → {}", promote_word(*k)))
-                }
-                // An untyped prescription is a close blocker, so the page says so where the
-                // author can still fix it rather than at close time.
-                Some(crate::model::Prescription::Untyped) => Some("UNTYPED".to_string()),
-                None => None,
-            },
-            threads: live
-                .iter()
-                .filter(|t| t.target == i.id.to_string())
-                .cloned()
-                .collect(),
-            ticket: ticket_of(&i.id),
-            dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
-            id: i.id.clone(),
+            let text = strip_marker(&i.text);
+            let (headline, detail) = split_headline(&text);
+            PageItem {
+                kind: i.id.kind.letter(),
+                text,
+                headline,
+                detail,
+                badge: match &i.prescription {
+                    Some(crate::model::Prescription::TempUntil(t)) => {
+                        Some(format!("TEMP until {t}"))
+                    }
+                    Some(crate::model::Prescription::Promote(k)) => {
+                        Some(format!("PROMOTE → {}", promote_word(*k)))
+                    }
+                    // An untyped prescription is a close blocker, so the page says so where
+                    // the author can still fix it rather than at close time.
+                    Some(crate::model::Prescription::Untyped) => Some("UNTYPED".to_string()),
+                    None => None,
+                },
+                threads: live
+                    .iter()
+                    .filter(|t| t.target == i.id.to_string())
+                    .cloned()
+                    .collect(),
+                ticket: ticket_of(&i.id),
+                dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
+                id: i.id.clone(),
+            }
         })
         .collect();
 
@@ -1114,12 +1098,7 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
         items,
         orphaned,
         unresolved: open,
-        blocked_by: (open > 0).then(|| {
-            format!(
-                "{open} unresolved review thread{}",
-                if open == 1 { "" } else { "s" }
-            )
-        }),
+        blocked_by: (open > 0).then(|| plural(open, "unresolved review thread")),
         context,
         id: p.fm.id.clone(),
     })

@@ -60,18 +60,11 @@ impl std::fmt::Display for Fix {
 pub struct Fixes(Fix, Vec<Fix>);
 
 impl Fixes {
-    pub fn one(f: Fix) -> Fixes {
-        Fixes(f, Vec::new())
-    }
     pub fn new(head: Fix, rest: Vec<Fix>) -> Fixes {
         Fixes(head, rest)
     }
     pub fn iter(&self) -> impl Iterator<Item = &Fix> {
         std::iter::once(&self.0).chain(self.1.iter())
-    }
-    /// The head fix — the one a single-line renderer shows.
-    pub fn head(&self) -> &Fix {
-        &self.0
     }
 }
 
@@ -93,8 +86,7 @@ macro_rules! fixes {
 
 /// Why the environment is unusable. Distinguishing these is what lets a wrapper script
 /// tell "no `.kanspec/` here" apart from "a gate refused" (J-7).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvCode {
     NotARepo,
     NotInitialized,
@@ -173,12 +165,7 @@ pub enum KsError {
 
 impl KsError {
     pub fn gate(code: &'static str, message: impl Into<String>, fix: Fixes) -> KsError {
-        KsError::Gate {
-            code,
-            message: message.into(),
-            detail: GateDetail::Plain,
-            fix,
-        }
+        KsError::gate_detail(code, message, GateDetail::Plain, fix)
     }
 
     /// A gate refusal carrying a structured payload — the ladder trace or the

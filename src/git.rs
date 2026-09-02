@@ -290,6 +290,69 @@ impl Git {
         self.run(&all)
     }
 
+    /// exit 0 -> the output; anything else -> `KsError::Git` naming what failed. The ONE
+    /// place a non-zero exit becomes an error, so stderr reaches the message exactly once.
+    fn must(&self, what: &str, args: &[&str], ps: &[Pathspec]) -> Result<GitOut> {
+        let o = if ps.is_empty() {
+            self.run(args)?
+        } else {
+            self.run_ps(args, ps)?
+        };
+        if o.code == 0 {
+            return Ok(o);
+        }
+        Err(self.git_err(what.to_string(), shown(args, ps), o.code, &o.err))
+    }
+
+    /// exit 0 -> the output; anything else, git-not-runnable included, -> the evidence a
+    /// `Tri::Unknown` carries. `cmd` is what `scan --explain` prints, so it stays explicit.
+    fn evidence(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        ps: &[Pathspec],
+    ) -> std::result::Result<GitOut, Unknown> {
+        let r = if ps.is_empty() {
+            self.run(args)
+        } else {
+            self.run_ps(args, ps)
+        };
+        match r {
+            Err(e) => Err(git_failed(cmd.into(), -1, &e.to_string())),
+            Ok(o) if o.code == 0 => Ok(o),
+            Ok(o) => Err(git_failed(cmd.into(), o.code, &o.err)),
+        }
+    }
+
+    /// `rev-list --count`-shaped: exactly one number on stdout.
+    fn count(&self, cmd: &str, args: &[&str], ps: &[Pathspec]) -> Tri<u32> {
+        let n = self.evidence(cmd, args, ps).and_then(|o| {
+            o.out
+                .trim()
+                .parse()
+                .map_err(|_| git_failed(cmd.into(), 0, &o.out))
+        });
+        match n {
+            Ok(n) => Tri::Yes(n),
+            Err(u) => Tri::Unknown(u),
+        }
+    }
+
+    /// Did it exit 0? For probes whose only answer is yes/no.
+    fn succeeds(&self, args: &[&str]) -> bool {
+        self.run(args).is_ok_and(|o| o.code == 0)
+    }
+
+    /// `symbolic-ref --quiet --short`; `None` when `name` is not a symbolic ref.
+    fn symbolic_ref(&self, name: &str) -> Option<String> {
+        let o = self
+            .run(&["symbolic-ref", "--quiet", "--short", name])
+            .ok()?;
+        (o.code == 0)
+            .then(|| o.out.trim().to_string())
+            .filter(|b| !b.is_empty())
+    }
+
     pub fn head_sha(&self, rev: &str) -> Result<HeadSha> {
         let spec = format!("{rev}^{{commit}}");
         let o = self.run(&["rev-parse", "--verify", &spec])?;
@@ -307,19 +370,11 @@ impl Git {
     pub fn current_branch(&self) -> Option<String> {
         // NOT `rev-parse --abbrev-ref HEAD`: that prints the literal string `HEAD` when
         // detached, which is ambiguous with a branch actually named `HEAD`.
-        let o = self
-            .run(&["symbolic-ref", "--quiet", "--short", "HEAD"])
-            .ok()?;
-        (o.code == 0)
-            .then(|| o.out.trim().to_string())
-            .filter(|b| !b.is_empty())
+        self.symbolic_ref("HEAD")
     }
 
     pub fn object_exists(&self, s: &Sha) -> bool {
-        let spec = format!("{}^{{commit}}", s.as_str());
-        self.run(&["rev-parse", "--verify", "--quiet", &spec])
-            .map(|o| o.code == 0)
-            .unwrap_or(false)
+        self.rev_resolves(s.as_str())
     }
 
     /// The configured `main`, or `symbolic-ref refs/remotes/origin/HEAD` when it does not
@@ -331,18 +386,11 @@ impl Git {
         }
         // git >= 2.28 populates origin/HEAD on the first fetch; older git and a manually
         // deleted ref both land on the candidate list below.
-        if let Ok(o) = self.run(&[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ]) {
-            if o.code == 0 {
-                let r = o.out.trim().to_string();
-                if !r.is_empty() && self.rev_resolves(&r) {
-                    return Ok(r);
-                }
-            }
+        if let Some(r) = self
+            .symbolic_ref("refs/remotes/origin/HEAD")
+            .filter(|r| self.rev_resolves(r))
+        {
+            return Ok(r);
         }
         for cand in ["origin/main", "origin/master", "main", "master"] {
             if self.rev_resolves(cand) {
@@ -361,9 +409,7 @@ impl Git {
 
     fn rev_resolves(&self, rev: &str) -> bool {
         let spec = format!("{rev}^{{commit}}");
-        self.run(&["rev-parse", "--verify", "--quiet", &spec])
-            .map(|o| o.code == 0)
-            .unwrap_or(false)
+        self.succeeds(&["rev-parse", "--verify", "--quiet", &spec])
     }
 
     /// 0=Yes 1=No 128=Unknown. Ancestry-NEGATIVE is `No` HERE; it is the *ladder* that
@@ -396,14 +442,7 @@ impl Git {
     pub fn commits_ahead(&self, base: &str, head: &Sha) -> Tri<u32> {
         let range = format!("{base}..{}", head.as_str());
         let cmd = format!("git rev-list --count {range}");
-        match self.run(&["rev-list", "--count", &range]) {
-            Err(e) => Tri::Unknown(git_failed(cmd, -1, &e.to_string())),
-            Ok(o) if o.code == 0 => match o.out.trim().parse::<u32>() {
-                Ok(n) => Tri::Yes(n),
-                Err(_) => Tri::Unknown(git_failed(cmd, 0, &o.out)),
-            },
-            Ok(o) => Tri::Unknown(git_failed(cmd, o.code, &o.err)),
-        }
+        self.count(&cmd, &["rev-list", "--count", &range], &[])
     }
 
     /// UNANCHORED (git indents squash-body trailers 4 spaces) and boundary-terminated
@@ -414,10 +453,13 @@ impl Git {
         // `log` exits 0 with empty stdout when nothing matches, so the exit code alone is
         // never the answer; scope to `base` and never `--all`, which would match the
         // branch's own commits.
-        match self.run(&["log", base, "-E", "--grep", &pat, "--format=%H"]) {
-            Err(e) => Tri::Unknown(git_failed(cmd, -1, &e.to_string())),
-            Ok(o) if o.code == 0 => Tri::Yes(o.out.lines().filter_map(Sha::mint).collect()),
-            Ok(o) => Tri::Unknown(git_failed(cmd, o.code, &o.err)),
+        match self.evidence(
+            &cmd,
+            &["log", base, "-E", "--grep", &pat, "--format=%H"],
+            &[],
+        ) {
+            Ok(o) => Tri::Yes(o.out.lines().filter_map(Sha::mint).collect()),
+            Err(u) => Tri::Unknown(u),
         }
     }
 
@@ -426,9 +468,8 @@ impl Git {
     /// ladder maps it to `Unknown` rather than `NotMerged` (D-3).
     pub fn cherry(&self, base: &str, head: &Sha) -> Tri<Vec<CherryLine>> {
         let cmd = format!("git cherry {base} {}", head.as_str());
-        match self.run(&["cherry", base, head.as_str()]) {
-            Err(e) => Tri::Unknown(git_failed(cmd, -1, &e.to_string())),
-            Ok(o) if o.code == 0 => Tri::Yes(
+        match self.evidence(&cmd, &["cherry", base, head.as_str()], &[]) {
+            Ok(o) => Tri::Yes(
                 o.out
                     .lines()
                     .filter_map(|l| {
@@ -442,7 +483,7 @@ impl Git {
                     })
                     .collect(),
             ),
-            Ok(o) => Tri::Unknown(git_failed(cmd, o.code, &o.err)),
+            Err(u) => Tri::Unknown(u),
         }
     }
 
@@ -452,14 +493,11 @@ impl Git {
     pub fn changed_paths(&self, base: &str, head: &str) -> Tri<Vec<ChangedPath>> {
         let range = format!("{base}...{head}");
         let cmd = format!("git diff --name-status -M -z {range}");
-        let o = match self.run(&["diff", "--name-status", "-M", "-z", &range]) {
-            Err(e) => return Tri::Unknown(git_failed(cmd, -1, &e.to_string())),
+        // An unborn branch and a gc'd ref both land in `Err` as 128 — "cannot answer".
+        let o = match self.evidence(&cmd, &["diff", "--name-status", "-M", "-z", &range], &[]) {
             Ok(o) => o,
+            Err(u) => return Tri::Unknown(u),
         };
-        if o.code != 0 {
-            // An unborn branch and a gc'd ref both land here as 128 — "cannot answer".
-            return Tri::Unknown(git_failed(cmd, o.code, &o.err));
-        }
         let mut out = Vec::new();
         let mut it = o.out.split('\0').filter(|f| !f.is_empty());
         while let Some(status) = it.next() {
@@ -500,14 +538,11 @@ impl Git {
             "git rev-list --count --first-parent {range} -- <{} globs>",
             globs.len()
         );
-        match self.run_ps(&["rev-list", "--count", "--first-parent", &range], globs) {
-            Err(e) => Tri::Unknown(git_failed(cmd, -1, &e.to_string())),
-            Ok(o) if o.code == 0 => match o.out.trim().parse::<u32>() {
-                Ok(n) => Tri::Yes(n),
-                Err(_) => Tri::Unknown(git_failed(cmd, 0, &o.out)),
-            },
-            Ok(o) => Tri::Unknown(git_failed(cmd, o.code, &o.err)),
-        }
+        self.count(
+            &cmd,
+            &["rev-list", "--count", "--first-parent", &range],
+            globs,
+        )
     }
 
     /// The spec's last-edit anchor. `None` means "never committed on `rev`" — which is
@@ -562,7 +597,7 @@ impl Git {
         )?;
         if o.code != 0 {
             return Err(self.git_err(
-                format!("git fetch failed: {}", o.err.trim()),
+                "git fetch failed".to_string(),
                 "git fetch --prune --quiet origin".to_string(),
                 o.code,
                 &o.err,
@@ -597,15 +632,8 @@ impl Git {
 
     /// `-z`; the FIRST stanza is the primary worktree, wherever this runs from.
     pub fn worktrees(&self) -> Result<Vec<WorktreeRow>> {
-        let o = self.run(&["worktree", "list", "--porcelain", "-z"])?;
-        if o.code != 0 {
-            return Err(self.git_err(
-                "cannot list worktrees".to_string(),
-                "git worktree list --porcelain -z".to_string(),
-                o.code,
-                &o.err,
-            ));
-        }
+        let args = ["worktree", "list", "--porcelain", "-z"];
+        let o = self.must("cannot list worktrees", &args, &[])?;
         let mut rows = Vec::new();
         let mut cur: Option<WorktreeRow> = None;
         for field in o.out.split('\0') {
@@ -666,12 +694,12 @@ impl Git {
     /// code.
     pub fn worktree_add(&self, path: &Path, branch: &str, base: &str) -> Result<()> {
         let p = path.to_string_lossy().into_owned();
-        let o = self.run(&["worktree", "add", "--no-track", "-b", branch, &p, base])?;
+        let args = ["worktree", "add", "--no-track", "-b", branch, &p, base];
+        let o = self.run(&args)?;
         if o.code == 0 {
             return Ok(());
         }
         let e = o.err.trim().to_string();
-        let cmd = format!("git worktree add --no-track -b {branch} {p} {base}");
         if e.contains("already used by worktree at") {
             return Err(KsError::conflict(
                 format!("branch `{branch}` is checked out in another worktree"),
@@ -699,7 +727,12 @@ impl Git {
                 fixes![fix!("rm -rf {p}"), fix!("kanspec start <id>")],
             ));
         }
-        Err(self.git_err(format!("cannot create worktree: {e}"), cmd, o.code, &o.err))
+        Err(self.git_err(
+            "cannot create worktree".to_string(),
+            shown(&args, &[]),
+            o.code,
+            &o.err,
+        ))
     }
 
     /// Does NOT delete the branch — `git worktree remove` never does, so `kanspec` calls
@@ -711,30 +744,18 @@ impl Git {
             args.push("--force");
         }
         args.push(&p);
-        let o = self.run(&args)?;
-        if o.code == 0 {
-            return Ok(());
-        }
-        Err(self.git_err(
-            format!("cannot remove worktree {p}: {}", o.err.trim()),
-            format!("git worktree remove {p}"),
-            o.code,
-            &o.err,
-        ))
+        self.must(&format!("cannot remove worktree {p}"), &args, &[])
+            .map(drop)
     }
 
     pub fn branch_delete(&self, branch: &str, force: bool) -> Result<()> {
         let flag = if force { "-D" } else { "-d" };
-        let o = self.run(&["branch", flag, branch])?;
-        if o.code == 0 {
-            return Ok(());
-        }
-        Err(self.git_err(
-            format!("cannot delete branch {branch}: {}", o.err.trim()),
-            format!("git branch {flag} {branch}"),
-            o.code,
-            &o.err,
-        ))
+        self.must(
+            &format!("cannot delete branch {branch}"),
+            &["branch", flag, branch],
+            &[],
+        )
+        .map(drop)
     }
 
     /// How many `.kanspec/` changes are pending — what `sync = "batch"` reminds about.
@@ -747,15 +768,11 @@ impl Git {
     pub fn dirty_kanspec(&self, extra: &[&Path]) -> Result<u32> {
         let mut ps = vec![Pathspec::glob(".kanspec/**")];
         ps.extend(extra.iter().map(|p| Pathspec::glob(&p.to_string_lossy())));
-        let o = self.run_ps(&["status", "--porcelain=v2", "-z"], &ps)?;
-        if o.code != 0 {
-            return Err(self.git_err(
-                "cannot read the working tree status".to_string(),
-                "git status --porcelain=v2 -z -- .kanspec/**".to_string(),
-                o.code,
-                &o.err,
-            ));
-        }
+        let o = self.must(
+            "cannot read the working tree status",
+            &["status", "--porcelain=v2", "-z"],
+            &ps,
+        )?;
         // porcelain=v2 -z puts a rename's ORIGINAL path in its own NUL-terminated field,
         // so counting records would overcount renames; count only entry headers.
         Ok(o.out
@@ -774,30 +791,21 @@ impl Git {
     /// committed before the rule was added stays tracked forever — which is why `doctor`
     /// pairs it with [`Git::is_tracked`].
     pub fn is_ignored(&self, p: &Path) -> bool {
-        let s = p.to_string_lossy().into_owned();
-        self.run(&["check-ignore", "-q", "--", &s])
-            .map(|o| o.code == 0)
-            .unwrap_or(false)
+        self.succeeds(&["check-ignore", "-q", "--", &p.to_string_lossy()])
     }
 
     pub fn is_tracked(&self, p: &Path) -> bool {
-        let s = p.to_string_lossy().into_owned();
-        self.run(&["ls-files", "--error-unmatch", "--", &s])
-            .map(|o| o.code == 0)
-            .unwrap_or(false)
+        self.succeeds(&["ls-files", "--error-unmatch", "--", &p.to_string_lossy()])
     }
 
     /// `--git-path hooks`, because `core.hooksPath` (husky/lefthook) makes `.git/hooks`
     /// completely inert — a hook installed there would be silently dead (D-7).
     pub fn hooks_dir(&self) -> Result<PathBuf> {
-        let o = self.run(&["rev-parse", "--path-format=absolute", "--git-path", "hooks"])?;
-        if o.code != 0 || o.out.trim().is_empty() {
-            return Err(self.git_err(
-                "cannot resolve the hooks directory".to_string(),
-                "git rev-parse --git-path hooks".to_string(),
-                o.code,
-                &o.err,
-            ));
+        let what = "cannot resolve the hooks directory";
+        let args = ["rev-parse", "--path-format=absolute", "--git-path", "hooks"];
+        let o = self.must(what, &args, &[])?;
+        if o.out.trim().is_empty() {
+            return Err(self.git_err(what.to_string(), shown(&args, &[]), o.code, &o.err));
         }
         Ok(PathBuf::from(o.out.trim()))
     }
@@ -806,29 +814,12 @@ impl Git {
     /// changed nothing does not manufacture an empty commit.
     pub fn commit_kanspec(&self, msg: &str) -> Result<()> {
         let ps = [Pathspec::glob(".kanspec/**")];
-        let add = self.run_ps(&["add", "-A"], &ps)?;
-        if add.code != 0 {
-            return Err(self.git_err(
-                format!("cannot stage .kanspec/: {}", add.err.trim()),
-                "git add -A -- .kanspec/**".to_string(),
-                add.code,
-                &add.err,
-            ));
-        }
-        let staged = self.run_ps(&["diff", "--cached", "--quiet"], &ps)?;
-        if staged.code == 0 {
+        self.must("cannot stage .kanspec/", &["add", "-A"], &ps)?;
+        if self.run_ps(&["diff", "--cached", "--quiet"], &ps)?.code == 0 {
             return Ok(()); // nothing to commit
         }
-        let commit = self.run_ps(&["commit", "-m", msg], &ps)?;
-        if commit.code != 0 {
-            return Err(self.git_err(
-                format!("cannot commit .kanspec/: {}", commit.err.trim()),
-                format!("git commit -m {msg:?} -- .kanspec/**"),
-                commit.code,
-                &commit.err,
-            ));
-        }
-        Ok(())
+        self.must("cannot commit .kanspec/", &["commit", "-m", msg], &ps)
+            .map(drop)
     }
 
     fn git_err(&self, message: String, cmd: String, exit: i32, stderr: &str) -> KsError {
@@ -844,6 +835,19 @@ impl Git {
             fix: fixes![fix!("kanspec doctor"), fix!("kanspec scan --explain")],
         }
     }
+}
+
+/// The argv as one line — what `KsError::Git::cmd` records for a failed invocation.
+fn shown(args: &[&str], ps: &[Pathspec]) -> String {
+    let mut s = format!("git {}", args.join(" "));
+    if !ps.is_empty() {
+        s.push_str(" --");
+        for p in ps {
+            s.push(' ');
+            s.push_str(p.as_str());
+        }
+    }
+    s
 }
 
 fn git_failed(cmd: String, code: i32, stderr: &str) -> Unknown {

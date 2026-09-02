@@ -108,45 +108,16 @@ fn homerunner_knows_this_repo(ctx: &Ctx) -> bool {
     std::fs::read_to_string(cfg).is_ok_and(|t| t.contains(&slug))
 }
 
-pub fn status_for(ctx: &Ctx, id: &TicketId) -> Result<CiStatus> {
-    let provider = detect_provider(ctx);
-    match provider {
-        CiProvider::None | CiProvider::Auto => Ok(CiStatus {
-            state: CiState::None,
-            job: None,
-            sha: None,
-            provider: CiProvider::None,
-            checked_at: ctx.now,
-            local_only: false,
-        }),
-        _ => {
-            let _ = id;
-            Err(not_yet_v02(ctx, provider))
-        }
-    }
-}
-
 /// `kanspec ci why t-9c41` — resolves ticket -> SHA -> latest failed `gh_job_id` and
 /// shells to `homerunner why <id> --json` at the configured absolute path. The excerpt
 /// heuristics live in that binary and stay there.
+///
+/// The per-ticket readers (`homerunner_status` over a `PRAGMA query_only=ON` connection —
+/// never immutable/URI-ro mode, because the live data sits in the WAL — and `gh run list
+/// --commit <sha>`) land with it in v0.2; until then this is the one reader entry point.
 pub fn why(ctx: &Ctx, id: &TicketId) -> Result<Digest> {
     let _ = id;
     Err(not_yet_v02(ctx, detect_provider(ctx)))
-}
-
-/// A normal read-only connection with `PRAGMA query_only=ON` — **never** immutable/URI-ro
-/// mode, because the live data sits in the WAL.
-#[cfg(feature = "ci-homerunner")]
-pub fn homerunner_status(ctx: &Ctx, sha: &str) -> Result<CiStatus> {
-    let _ = sha;
-    Err(not_yet_v02(ctx, CiProvider::Homerunner))
-}
-
-/// `gh run list --commit <sha>` — the same chip and the same rules for repos without
-/// homerunner.
-pub fn gh_status(ctx: &Ctx, sha: &str) -> Result<CiStatus> {
-    let _ = sha;
-    Err(not_yet_v02(ctx, CiProvider::Gh))
 }
 
 /// One wording for "detected, not read yet", so nobody mistakes an unimplemented reader

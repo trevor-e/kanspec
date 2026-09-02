@@ -190,33 +190,16 @@ pub const fn next(from: Option<State>, verb: Verb) -> Option<State> {
     }
 }
 
-const FROM_NONE: &[Verb] = &[Verb::New];
-const FROM_TODO: &[Verb] = &[Verb::Start, Verb::Drop, Verb::Confirm, Verb::Repair];
-const FROM_DOING: &[Verb] = &[
-    Verb::Ship,
-    Verb::Done,
-    Verb::Park,
-    Verb::Drop,
-    Verb::Confirm,
-    Verb::Repair,
-];
-const FROM_REVIEW: &[Verb] = &[
-    Verb::Start,
-    Verb::Done,
-    Verb::Drop,
-    Verb::Confirm,
-    Verb::Repair,
-];
-const FROM_TERMINAL: &[Verb] = &[Verb::Confirm, Verb::Repair];
-
 /// `&'static [Verb]`, because `KsError::IllegalTransition` holds one without allocating.
 pub const fn allowed_slice(from: Option<State>) -> &'static [Verb] {
+    use State::*;
+    use Verb as V;
     match from {
-        None => FROM_NONE,
-        Some(State::Todo) => FROM_TODO,
-        Some(State::Doing) => FROM_DOING,
-        Some(State::Review) => FROM_REVIEW,
-        Some(State::Done) | Some(State::Dropped) => FROM_TERMINAL,
+        None => &[V::New],
+        Some(Todo) => &[V::Start, V::Drop, V::Confirm, V::Repair],
+        Some(Doing) => &[V::Ship, V::Done, V::Park, V::Drop, V::Confirm, V::Repair],
+        Some(Review) => &[V::Start, V::Done, V::Drop, V::Confirm, V::Repair],
+        Some(Done) | Some(Dropped) => &[V::Confirm, V::Repair],
     }
 }
 
@@ -235,16 +218,9 @@ pub const fn states_for(verb: Verb) -> &'static [State] {
         V::Done => &[Doing, Review],
         V::Park => &[Doing],
         V::Drop => &[Todo, Doing, Review],
-        V::Confirm | V::Repair => ALL_STATES_SLICE,
+        V::Confirm | V::Repair => ALL_STATES,
     }
 }
-const ALL_STATES_SLICE: &[State] = &[
-    State::Todo,
-    State::Doing,
-    State::Review,
-    State::Done,
-    State::Dropped,
-];
 
 /// "start, done, or drop" — an Oxford-comma list, because these land in user-facing prose.
 pub fn verbs_str(vs: &[Verb]) -> String {
@@ -334,65 +310,29 @@ fn onward(id: &TicketId, from: State) -> Fixes {
 // The mechanical proof (invariant 10)
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq, thiserror::Error)]
 #[serde(tag = "break", rename_all = "snake_case")]
 pub enum LogViolation {
+    #[error("the ## Log is empty — no state was ever reached")]
     Empty,
-    NoGenesis {
-        first: Verb,
-    },
+    #[error("the ## Log opens with `{first}`, not `new`")]
+    NoGenesis { first: Verb },
+    #[error("log entry {index}: `{verb}` is not legal from {}", from.map(|s| s.as_str()).unwrap_or("nothing"))]
     IllegalStep {
         index: usize,
         from: Option<State>,
         verb: Verb,
     },
+    #[error("log entry {index} records `{logged}` where the table says `{legal}`")]
     StateMismatch {
         index: usize,
         logged: State,
         legal: State,
     },
-    OutOfOrder {
-        index: usize,
-        at: DateTime<Utc>,
-    },
-    Divergence {
-        replayed: State,
-        frontmatter: State,
-    },
-}
-
-impl std::fmt::Display for LogViolation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LogViolation::Empty => write!(f, "the ## Log is empty — no state was ever reached"),
-            LogViolation::NoGenesis { first } => {
-                write!(f, "the ## Log opens with `{first}`, not `new`")
-            }
-            LogViolation::IllegalStep { index, from, verb } => write!(
-                f,
-                "log entry {index}: `{verb}` is not legal from {}",
-                from.map(|s| s.as_str()).unwrap_or("nothing")
-            ),
-            LogViolation::StateMismatch {
-                index,
-                logged,
-                legal,
-            } => write!(
-                f,
-                "log entry {index} records `{logged}` where the table says `{legal}`"
-            ),
-            LogViolation::OutOfOrder { index, at } => {
-                write!(f, "log entry {index} ({at}) goes backwards in time")
-            }
-            LogViolation::Divergence {
-                replayed,
-                frontmatter,
-            } => write!(
-                f,
-                "frontmatter says `{frontmatter}` but the ## Log replays to `{replayed}`"
-            ),
-        }
-    }
+    #[error("log entry {index} ({at}) goes backwards in time")]
+    OutOfOrder { index: usize, at: DateTime<Utc> },
+    #[error("frontmatter says `{frontmatter}` but the ## Log replays to `{replayed}`")]
+    Divergence { replayed: State, frontmatter: State },
 }
 
 /// Folds the ticket's own `## Log` through the SAME oracle the write path uses. Checks
@@ -510,7 +450,7 @@ mod tests {
     #[test]
     fn terminal_states_accept_only_confirm_and_repair() {
         for st in [State::Done, State::Dropped] {
-            assert_eq!(allowed_slice(Some(st)), FROM_TERMINAL);
+            assert_eq!(allowed_slice(Some(st)), &[Verb::Confirm, Verb::Repair][..]);
         }
     }
 

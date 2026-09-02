@@ -12,19 +12,12 @@
 //!
 //! Owner: **S1**.
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum FmError {
+    #[error("the file has no `---` frontmatter fence")]
     NoFrontmatter,
+    #[error("the frontmatter fence is never closed")]
     Unterminated,
-}
-
-impl std::fmt::Display for FmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FmError::NoFrontmatter => f.write_str("the file has no `---` frontmatter fence"),
-            FmError::Unterminated => f.write_str("the frontmatter fence is never closed"),
-        }
-    }
 }
 
 /// `open + fm + close + body` reconstructs the input **byte-exactly**. That property is
@@ -186,10 +179,7 @@ pub fn index(fm: &str) -> Vec<KeySpan> {
         let rest = &line[after_colon..];
         let lead = rest.len() - rest.trim_start().len();
         let vs = after_colon + lead;
-        let mut ve = ce;
-        if let Some(c) = comment_start(&fm[st + vs..ce]) {
-            ve = st + vs + c;
-        }
+        let ve = comment_start(&fm[st + vs..ce]).map_or(ce, |c| st + vs + c);
         let ve = st + vs + fm[st + vs..ve].trim_end().len();
 
         // How far does this key's value block extend? Everything indented or blank
@@ -260,10 +250,7 @@ impl Yv {
     /// `None -> Yv::Null`, which renders as the literal `null` DESIGN.md's frontmatter
     /// uses, not as an empty value.
     pub fn opt_s(v: Option<impl Into<String>>) -> Yv {
-        match v {
-            Some(s) => Yv::Str(s.into()),
-            None => Yv::Null,
-        }
+        v.map_or(Yv::Null, Yv::s)
     }
     pub fn list(v: impl IntoIterator<Item = String>) -> Yv {
         Yv::List(v.into_iter().map(Yv::Str).collect())
@@ -316,13 +303,10 @@ fn plain_round_trips(s: &str, flow: bool) -> bool {
         return false;
     };
     let scalar = if flow {
-        v.get("k").and_then(|k| k.as_sequence()).and_then(|q| {
-            if q.len() == 1 {
-                q.first()
-            } else {
-                None
-            }
-        })
+        v.get("k")
+            .and_then(|k| k.as_sequence())
+            .filter(|q| q.len() == 1)
+            .and_then(|q| q.first())
     } else {
         v.get("k")
     };
@@ -409,13 +393,20 @@ pub fn set(doc: &mut MdDoc, key: &str, val: &Yv, order: &[&str]) -> SetOutcome {
             if doc.fm[vs..ve] == new {
                 return SetOutcome::Unchanged;
             }
-            // `key:` with no value at all needs the separating space back.
-            let sep = if vs == ve && doc.fm[..vs].ends_with(':') {
+            // `key:` with no value at all needs the separating space back — and an empty
+            // value whose line carries a comment (`key:   # why`) needs one AFTER the value
+            // too, or `null# why` reads back as the string "null# why".
+            let lead = if vs == ve && doc.fm[..vs].ends_with(':') {
                 " "
             } else {
                 ""
             };
-            doc.fm.replace_range(vs..ve, &format!("{sep}{new}"));
+            let trail = if doc.fm[ve..].starts_with('#') {
+                " "
+            } else {
+                ""
+            };
+            doc.fm.replace_range(vs..ve, &format!("{lead}{new}{trail}"));
             return SetOutcome::Replaced;
         }
         // A block scalar / nested map / multi-line sequence collapses to one line. The
@@ -423,18 +414,21 @@ pub fn set(doc: &mut MdDoc, key: &str, val: &Yv, order: &[&str]) -> SetOutcome {
         let ls = lines_of(&doc.fm);
         let start = ls[k.line].0;
         let end = ls[k.block_end].2;
-        let nl = if doc.fm[..end].ends_with("\r\n") {
-            "\r\n"
-        } else {
-            "\n"
-        };
+        let nl = doc.nl();
         doc.fm
             .replace_range(start..end, &format!("{key}: {new}{nl}"));
         return SetOutcome::ReplacedMultiline;
     }
 
     // Absent: insert before the first schema-successor that IS present, else append.
+    // Appending to a frontmatter whose last line has no terminator would weld the new key
+    // onto it. `split` guarantees `fm` ends at a line boundary, but a hand-built `MdDoc`
+    // that ends mid-line is exactly the input this guard exists for — and it has to run
+    // BEFORE `at` is measured, or the key lands in front of the newline it just added.
     let nl = doc.nl();
+    if !doc.fm.is_empty() && !doc.fm.ends_with('\n') {
+        doc.fm.push_str(nl);
+    }
     let at = order
         .iter()
         .skip_while(|k| **k != key)
@@ -442,13 +436,6 @@ pub fn set(doc: &mut MdDoc, key: &str, val: &Yv, order: &[&str]) -> SetOutcome {
         .find_map(|succ| keys.iter().find(|k| k.key == *succ))
         .map(|k| lines_of(&doc.fm)[k.line].0)
         .unwrap_or(doc.fm.len());
-    // Appending to a frontmatter whose last line has no terminator would weld the new key
-    // onto it. `split` guarantees `fm` ends at a line boundary, but a hand-edited file
-    // that ends mid-line is exactly the input this guard exists for.
-    if at == doc.fm.len() && !doc.fm.is_empty() && !doc.fm.ends_with('\n') {
-        doc.fm.push_str(nl);
-    }
-    let at = at.min(doc.fm.len());
     doc.fm.insert_str(at, &format!("{key}: {new}{nl}"));
     SetOutcome::Inserted
 }
@@ -581,19 +568,6 @@ fn is_rule_bullet(line: &str, anchor: &str) -> bool {
     !a.is_empty() && !a.eq_ignore_ascii_case("x") && a == anchor
 }
 
-/// Byte offset of body line `index` (0-based) and its content without the line ending.
-fn line_span(body: &str, index: usize) -> Option<(usize, &str)> {
-    let mut off = 0usize;
-    for (i, raw) in body.split_inclusive('\n').enumerate() {
-        if i == index {
-            let c = raw.strip_suffix('\n').unwrap_or(raw);
-            return Some((off, c.strip_suffix('\r').unwrap_or(c)));
-        }
-        off += raw.len();
-    }
-    None
-}
-
 /// Append `token` to the rule bullet on 1-based body `line`, which must still be the
 /// `- [anchor] …` bullet the snapshot parsed there. Returns false when it is not — a plan
 /// staging several stamps into one doc must never write a token onto a line that moved
@@ -609,9 +583,10 @@ pub fn stamp_rule(doc: &mut MdDoc, line: usize, anchor: &str, token: &str) -> bo
     let Some(i) = line.checked_sub(1) else {
         return false;
     };
-    let Some((start, raw)) = line_span(&doc.body, i) else {
+    let Some(&(start, end, _)) = lines_of(&doc.body).get(i) else {
         return false;
     };
+    let raw = &doc.body[start..end];
     if !is_rule_bullet(raw, anchor) {
         return false;
     }

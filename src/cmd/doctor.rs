@@ -112,8 +112,7 @@ impl Render for DoctorReport {
                 .count();
             writeln!(
                 w,
-                " {} of {} checks found {errors} error(s) and {} warning(s)",
-                self.checks_run,
+                " {} checks found {errors} error(s) and {} warning(s)",
                 self.checks_run,
                 self.findings.len() - errors
             )?;

@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
 use crate::fm::{self, MdDoc, SetOutcome, Yv};
-use crate::ids::{DecisionId, ItemKind, ItemRef, Minter, ProposalId, QuirkId, SpecName, TicketId};
+use crate::ids::{ItemKind, ItemRef, Minter, ProposalId, SpecName, TicketId};
 use crate::lock::{LockOwner, LockToken};
 use crate::logentry::{self, LogEntry, LOG_HEADING};
 use crate::model::{
@@ -47,72 +47,59 @@ pub fn load_snapshot(ctx: &Ctx) -> Result<Snapshot> {
     let mut snap = Snapshot::empty(ctx.cfg.clone(), ctx.now);
 
     for path in md_files(&l.tickets_dir()) {
-        let (fm_text, body, mtime) = read_entity(&path)?;
-        let fm: crate::model::TicketFm = parse_fm(&fm_text, &path)?;
-        let ticket = Ticket {
-            steps: fm::steps(&body)
-                .into_iter()
-                .map(|(index, done, text)| Step { index, done, text })
-                .collect(),
-            log: logentry::parse_log(&body),
-            fm,
-            path: path.clone(),
-            body,
-            mtime,
-        };
+        let (doc, mtime) = read_entity(&path)?;
+        let ticket = ticket_from(&path, &doc.fm, doc.body, mtime)?;
         // The FILENAME is the id. A ticket whose frontmatter disagrees is exactly the
         // hand-edit that would make `deps:` point at nothing, so it is refused loudly.
-        let named = file_id::<TicketId>(&path)?;
-        if named != ticket.fm.id {
-            return Err(mismatch(&path, named.as_str(), ticket.fm.id.as_str()));
-        }
+        check_named(&path, &ticket.fm.id)?;
         snap.tickets.insert(ticket.fm.id.clone(), ticket);
     }
 
     for path in md_files(&l.specs_dir()) {
-        let (fm_text, body, _) = read_entity(&path)?;
-        let fm: crate::model::SpecFm = parse_fm(&fm_text, &path)?;
+        let (doc, _) = read_entity(&path)?;
+        let fm: crate::model::SpecFm = parse_fm(&doc.fm, &path)?;
         let name = SpecName::parse(&stem(&path)).map_err(|e| at_path(e, &path))?;
-        let rules = parse_rules(&body);
+        let rules = parse_rules(&doc.body);
         snap.specs.insert(
             name.clone(),
             Spec {
                 name,
                 fm,
                 path,
-                body,
+                body: doc.body,
                 rules,
             },
         );
     }
 
     for path in md_files(&l.decisions_dir()) {
-        let (fm_text, body, _) = read_entity(&path)?;
-        let fm: crate::model::DecisionFm = parse_fm(&fm_text, &path)?;
-        let named = file_id::<DecisionId>(&path)?;
-        if named != fm.id {
-            return Err(mismatch(&path, named.as_str(), fm.id.as_str()));
-        }
+        let (doc, _) = read_entity(&path)?;
+        let fm: crate::model::DecisionFm = parse_fm(&doc.fm, &path)?;
+        check_named(&path, &fm.id)?;
         let scope = fm.scope.clone();
         snap.decisions.insert(
             fm.id.clone(),
             Decision {
                 fm,
                 path,
-                body,
+                body: doc.body,
                 scope,
             },
         );
     }
 
     for path in md_files(&l.quirks_dir()) {
-        let (fm_text, body, _) = read_entity(&path)?;
-        let fm: crate::model::QuirkFm = parse_fm(&fm_text, &path)?;
-        let named = file_id::<QuirkId>(&path)?;
-        if named != fm.id {
-            return Err(mismatch(&path, named.as_str(), fm.id.as_str()));
-        }
-        snap.quirks.insert(fm.id.clone(), Quirk { fm, path, body });
+        let (doc, _) = read_entity(&path)?;
+        let fm: crate::model::QuirkFm = parse_fm(&doc.fm, &path)?;
+        check_named(&path, &fm.id)?;
+        snap.quirks.insert(
+            fm.id.clone(),
+            Quirk {
+                fm,
+                path,
+                body: doc.body,
+            },
+        );
     }
 
     // OPEN proposals: full bodies. `proposals/closed/` contributes IDS ONLY — there is
@@ -126,9 +113,9 @@ pub fn load_snapshot(ctx: &Ctx) -> Result<Snapshot> {
         if !md.is_file() {
             continue;
         }
-        let (fm_text, body, _) = read_entity(&md)?;
-        let fm: crate::model::ProposalFm = parse_fm(&fm_text, &md)?;
-        let items = parse_items(&fm.id, &body);
+        let (doc, _) = read_entity(&md)?;
+        let fm: crate::model::ProposalFm = parse_fm(&doc.fm, &md)?;
+        let items = parse_items(&fm.id, &doc.body);
         let comments = read_comments(&l.comments_jsonl(&dir))?;
         if !comments.is_empty() {
             snap.comments.insert(fm.id.clone(), comments);
@@ -138,7 +125,7 @@ pub fn load_snapshot(ctx: &Ctx) -> Result<Snapshot> {
             Proposal {
                 fm,
                 dir,
-                body,
+                body: doc.body,
                 items,
             },
         );
@@ -154,31 +141,27 @@ pub fn load_snapshot(ctx: &Ctx) -> Result<Snapshot> {
     Ok(snap)
 }
 
-fn md_files(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = rd
+/// A missing directory is an empty list, never an error: a fresh repo has no quirks yet.
+fn listed(dir: &Path, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "md"))
-        .filter(|p| !stem(p).starts_with('.'))
+        .filter(|p| keep(p))
         .collect();
     out.sort();
     out
 }
 
+fn md_files(dir: &Path) -> Vec<PathBuf> {
+    listed(dir, |p| {
+        p.is_file() && p.extension().is_some_and(|x| x == "md") && !stem(p).starts_with('.')
+    })
+}
+
 fn sub_dirs(dir: &Path) -> Vec<PathBuf> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<PathBuf> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
-    out.sort();
-    out
+    listed(dir, Path::is_dir)
 }
 
 fn stem(p: &Path) -> String {
@@ -198,8 +181,9 @@ fn dir_proposal_id(dir: &Path) -> Option<String> {
         .map(|id| id.as_str().to_string())
 }
 
-/// `(frontmatter text, body, mtime)`.
-fn read_entity(p: &Path) -> Result<(String, String, SystemTime)> {
+/// The split document and its mtime. Also the one read `doc_at` makes, so a file that
+/// cannot be split is refused with the same words whether it is being loaded or edited.
+fn read_entity(p: &Path) -> Result<(MdDoc, SystemTime)> {
     let src = std::fs::read_to_string(p).map_err(|e| io_err(p, "read", e))?;
     let doc = fm::split(&src).map_err(|e| {
         KsError::invalid(
@@ -213,7 +197,7 @@ fn read_entity(p: &Path) -> Result<(String, String, SystemTime)> {
     let mtime = std::fs::metadata(p)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    Ok((doc.fm, doc.body, mtime))
+    Ok((doc, mtime))
 }
 
 fn parse_fm<T: serde::de::DeserializeOwned>(fm_text: &str, p: &Path) -> Result<T> {
@@ -228,48 +212,36 @@ fn parse_fm<T: serde::de::DeserializeOwned>(fm_text: &str, p: &Path) -> Result<T
     })
 }
 
-fn file_id<I>(p: &Path) -> Result<I>
+/// The FILENAME is authoritative for tickets, decisions and quirks. Every id newtype is
+/// `TryFrom<String>` with its `KsError` text as the error, so the three share this one
+/// path without a shim.
+fn check_named<I>(p: &Path, inside: &I) -> Result<()>
 where
-    I: IdFromStem,
+    I: TryFrom<String, Error = String> + PartialEq + std::fmt::Display,
 {
-    I::from_stem(&stem(p)).map_err(|e| at_path(e, p))
-}
-
-/// A tiny shim so the three id kinds whose FILENAME is authoritative share one code path.
-pub(crate) trait IdFromStem: Sized {
-    fn from_stem(s: &str) -> Result<Self>;
-}
-impl IdFromStem for TicketId {
-    fn from_stem(s: &str) -> Result<Self> {
-        TicketId::parse(s)
-    }
-}
-impl IdFromStem for DecisionId {
-    fn from_stem(s: &str) -> Result<Self> {
-        DecisionId::parse(s)
-    }
-}
-impl IdFromStem for QuirkId {
-    fn from_stem(s: &str) -> Result<Self> {
-        QuirkId::parse(s)
-    }
-}
-
-fn mismatch(p: &Path, named: &str, inside: &str) -> KsError {
-    KsError::invalid(
-        format!(
-            "{} is named `{named}` but its frontmatter says `{inside}`",
-            p.display()
-        ),
-        fixes![
-            fix!(
-                "git mv {} $(dirname {})/{inside}.md",
-                p.display(),
+    let named = I::try_from(stem(p)).map_err(|e| {
+        KsError::invalid(
+            format!("{}: {e}", p.display()),
+            fixes![fix!("kanspec doctor")],
+        )
+    })?;
+    if named != *inside {
+        return Err(KsError::invalid(
+            format!(
+                "{} is named `{named}` but its frontmatter says `{inside}`",
                 p.display()
             ),
-            fix!("kanspec doctor"),
-        ],
-    )
+            fixes![
+                fix!(
+                    "git mv {} $(dirname {})/{inside}.md",
+                    p.display(),
+                    p.display()
+                ),
+                fix!("kanspec doctor"),
+            ],
+        ));
+    }
+    Ok(())
 }
 
 fn at_path(e: KsError, p: &Path) -> KsError {
@@ -302,7 +274,6 @@ fn parse_rules(body: &str) -> Vec<Rule> {
         }
         let mut provenance = Vec::new();
         let mut items = Vec::new();
-        let mut text = String::new();
         let mut rest = tail.trim();
         while let Some(open) = rest.rfind('{') {
             let Some(close) = rest[open..].find('}') else {
@@ -328,10 +299,9 @@ fn parse_rules(body: &str) -> Vec<Rule> {
         }
         provenance.reverse();
         items.reverse();
-        text.push_str(rest);
         out.push(Rule {
             anchor: anchor.trim().to_string(),
-            text,
+            text: rest.to_string(),
             provenance,
             items,
             line: i + 1,
@@ -557,7 +527,7 @@ impl<'c> Store<'c> {
             if !is_ticket_path(&ctx.layout, path) {
                 continue;
             }
-            let t = staged_ticket(path, doc)?;
+            let t = ticket_from(path, &doc.fm, doc.body.clone(), SystemTime::now())?;
             transitions::prove(&t).map_err(|v| broken_log(&t.fm.id, v))?;
         }
 
@@ -649,7 +619,7 @@ impl<'c> Store<'c> {
                 // `Op::Transition` computes its own destination through the ONE oracle, so
                 // a caller cannot pass a state the table never produces.
                 let to = transitions::require(id, from, *verb)?;
-                let doc = doc_at(&path, staged, false)?;
+                let doc = doc_at(&path, staged)?;
                 set_key(
                     doc,
                     "state",
@@ -674,36 +644,27 @@ impl<'c> Store<'c> {
                 authoritative.insert(path);
             }
             Op::SetFields { entity, sets } => {
-                let path = l.path_for(entity);
-                let path = entity_file(entity, path, l);
-                let doc = doc_at(&path, staged, false)?;
+                let path = entity_file(l, entity);
+                let doc = doc_at(&path, staged)?;
                 for (k, v) in sets {
                     set_key(doc, k.as_str(), v, k.order(), &path)?;
                 }
             }
             Op::CreateEntity { entity, contents } => {
-                let path = entity_file(entity, l.path_for(entity), l);
-                let doc = fm::split(contents).map_err(|e| {
-                    KsError::invalid(
-                        format!("cannot create {entity}: {e}"),
-                        fixes![fix!("kanspec doctor")],
-                    )
-                })?;
-                writable_or_refuse(&doc, &path)?;
-                staged.push((path, Staged::Doc { doc, create: true }));
+                stage_create(entity_file(l, entity), contents, entity, staged)?
             }
             Op::AppendSection {
                 entity,
                 heading,
                 line,
             } => {
-                let path = entity_file(entity, l.path_for(entity), l);
-                let doc = doc_at(&path, staged, false)?;
+                let path = entity_file(l, entity);
+                let doc = doc_at(&path, staged)?;
                 fm::append_to_section(doc, heading, line);
             }
             Op::MarkSteps { id, checks } => {
                 let path = l.ticket(id);
-                let doc = doc_at(&path, staged, false)?;
+                let doc = doc_at(&path, staged)?;
                 for (index, done) in checks {
                     if !fm::mark_step(doc, *index, *done) {
                         return Err(KsError::invalid(
@@ -713,20 +674,15 @@ impl<'c> Store<'c> {
                     }
                 }
             }
-            Op::CreateProposal { id, slug, contents } => {
-                let path = l.proposal_md(&l.proposal_dir(id, slug));
-                let doc = fm::split(contents).map_err(|e| {
-                    KsError::invalid(
-                        format!("cannot create proposal {id}: {e}"),
-                        fixes![fix!("kanspec doctor")],
-                    )
-                })?;
-                writable_or_refuse(&doc, &path)?;
-                staged.push((path, Staged::Doc { doc, create: true }));
-            }
+            Op::CreateProposal { id, slug, contents } => stage_create(
+                l.proposal_md(&l.proposal_dir(id, slug)),
+                contents,
+                &format!("proposal {id}"),
+                staged,
+            )?,
             Op::StampRule { spec, anchor, line } => {
                 let path = l.spec(spec);
-                let doc = doc_at(&path, staged, false)?;
+                let doc = doc_at(&path, staged)?;
                 if !fm::stamp_rule(doc, *line, anchor, crate::rulesdoc::ADOPTED_TOKEN) {
                     // The snapshot was reloaded inside the lock, so this means the bullet
                     // moved between planning and applying — refuse rather than stamp a
@@ -755,11 +711,30 @@ impl<'c> Store<'c> {
 }
 
 /// A proposal's `EntityRef` names a DIRECTORY; every other kind names the file itself.
-fn entity_file(e: &EntityRef, p: PathBuf, l: &crate::paths::Layout) -> PathBuf {
+fn entity_file(l: &crate::paths::Layout, e: &EntityRef) -> PathBuf {
+    let p = l.path_for(e);
     match e {
         EntityRef::Proposal(_) => l.proposal_md(&p),
         _ => p,
     }
+}
+
+/// `CreateEntity` / `CreateProposal`: split, guard, and stage a file to be created whole.
+fn stage_create(
+    path: PathBuf,
+    contents: &str,
+    what: &dyn std::fmt::Display,
+    staged: &mut Vec<(PathBuf, Staged)>,
+) -> Result<()> {
+    let doc = fm::split(contents).map_err(|e| {
+        KsError::invalid(
+            format!("cannot create {what}: {e}"),
+            fixes![fix!("kanspec doctor")],
+        )
+    })?;
+    writable_or_refuse(&doc, &path)?;
+    staged.push((path, Staged::Doc { doc, create: true }));
+    Ok(())
 }
 
 fn slot<'a>(staged: &'a mut [(PathBuf, Staged)], path: &Path) -> Option<&'a mut Staged> {
@@ -768,11 +743,7 @@ fn slot<'a>(staged: &'a mut [(PathBuf, Staged)], path: &Path) -> Option<&'a mut 
 
 /// The staged `MdDoc` for `path`, loading it from disk on first touch. The `fm::writable`
 /// guard runs HERE — before any `set` — which is the only point at which refusing is free.
-fn doc_at<'a>(
-    path: &Path,
-    staged: &'a mut Vec<(PathBuf, Staged)>,
-    _create: bool,
-) -> Result<&'a mut MdDoc> {
+fn doc_at<'a>(path: &Path, staged: &'a mut Vec<(PathBuf, Staged)>) -> Result<&'a mut MdDoc> {
     if let Some(i) = staged.iter().position(|(p, _)| p == path) {
         return match &mut staged[i].1 {
             Staged::Doc { doc, .. } => Ok(doc),
@@ -785,19 +756,13 @@ fn doc_at<'a>(
             )),
         };
     }
-    let src = std::fs::read_to_string(path).map_err(|e| io_err(path, "read", e))?;
-    let doc = fm::split(&src).map_err(|e| {
-        KsError::invalid(
-            format!("{}: {e}", path.display()),
-            fixes![fix!("kanspec doctor")],
-        )
-    })?;
+    let (doc, _) = read_entity(path)?;
     writable_or_refuse(&doc, path)?;
     staged.push((path.to_path_buf(), Staged::Doc { doc, create: false }));
-    match &mut staged.last_mut().expect("just pushed").1 {
-        Staged::Doc { doc, .. } => Ok(doc),
-        _ => unreachable!("just pushed a Doc"),
-    }
+    let Some((_, Staged::Doc { doc, .. })) = staged.last_mut() else {
+        unreachable!("just pushed a Doc")
+    };
+    Ok(doc)
 }
 
 fn writable_or_refuse(doc: &MdDoc, path: &Path) -> Result<()> {
@@ -853,19 +818,20 @@ fn is_ticket_path(l: &crate::paths::Layout, p: &Path) -> bool {
     p.parent() == Some(l.tickets_dir().as_path())
 }
 
-/// Re-parses a staged ticket so `prove` sees exactly the bytes that are about to land.
-fn staged_ticket(path: &Path, doc: &MdDoc) -> Result<Ticket> {
-    let fm: crate::model::TicketFm = parse_fm(&doc.fm, path)?;
+/// One `Ticket` from its parts. The load path and the pre-write proof — which re-parses
+/// the STAGED bytes, so `prove` sees exactly what is about to land — build it the same way.
+fn ticket_from(path: &Path, fm_text: &str, body: String, mtime: SystemTime) -> Result<Ticket> {
+    let fm: crate::model::TicketFm = parse_fm(fm_text, path)?;
     Ok(Ticket {
-        steps: fm::steps(&doc.body)
+        steps: fm::steps(&body)
             .into_iter()
             .map(|(index, done, text)| Step { index, done, text })
             .collect(),
-        log: logentry::parse_log(&doc.body),
+        log: logentry::parse_log(&body),
         fm,
         path: path.to_path_buf(),
-        body: doc.body.clone(),
-        mtime: SystemTime::now(),
+        body,
+        mtime,
     })
 }
 
@@ -928,10 +894,7 @@ pub(crate) fn append_line(p: &Path, line: &str, _t: &LockToken) -> Result<()> {
 /// `close`: `proposals/<id>-<slug>` -> `proposals/closed/<id>-<slug>`.
 pub(crate) fn move_dir(a: &Path, b: &Path, _t: &LockToken) -> Result<()> {
     if b.exists() {
-        return Err(KsError::conflict(
-            format!("{} already exists — refusing to overwrite it", b.display()),
-            fixes![fix!("kanspec doctor")],
-        ));
+        return Err(exists_conflict(b));
     }
     let dir = parent_of(b)?;
     std::fs::create_dir_all(dir).map_err(|e| io_err(dir, "create", e))?;
@@ -950,12 +913,7 @@ pub(crate) fn create_new(p: &Path, bytes: &[u8], _t: &LockToken) -> Result<()> {
         .open(p)
     {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(KsError::conflict(
-                format!("{} already exists — refusing to overwrite it", p.display()),
-                fixes![fix!("kanspec doctor")],
-            ))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists_conflict(p)),
         Err(e) => return Err(io_err(p, "create", e)),
     };
     f.write_all(bytes).map_err(|e| io_err(p, "write", e))?;
@@ -968,6 +926,14 @@ fn parent_of(p: &Path) -> Result<&Path> {
     p.parent().ok_or_else(|| {
         KsError::internal(anyhow::anyhow!("{} has no parent directory", p.display()))
     })
+}
+
+/// `create_new` and `move_dir` must never clobber; this is their one refusal.
+fn exists_conflict(p: &Path) -> KsError {
+    KsError::conflict(
+        format!("{} already exists — refusing to overwrite it", p.display()),
+        fixes![fix!("kanspec doctor")],
+    )
 }
 
 /// A rename is only durable once the DIRECTORY entry is on disk. Best-effort: a

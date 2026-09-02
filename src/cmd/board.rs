@@ -19,7 +19,6 @@ use serde::Serialize;
 use crate::board::{self, BoardModel};
 use crate::cli::BoardArgs;
 use crate::ctx::Ctx;
-use crate::derive;
 use crate::error::Result;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{Op, Plan};
@@ -99,25 +98,13 @@ impl Render for BoardReport {
             return Ok(());
         }
 
-        write!(w, "{}", board::render_terminal(&self.model, st))?;
+        board::render_terminal(&self.model, w, st)?;
 
         // The freshness stamp: every badge above came out of the disposable cache.
+        let age = board::cache_age_line(&self.model);
         match self.cache_age_secs {
-            Some(age) => writeln!(
-                w,
-                "   {}",
-                crate::out::paint(
-                    &format!(
-                        "merge state checked {} ago",
-                        derive::short(std::time::Duration::from_secs(age))
-                    ),
-                    Color::Dim,
-                    st.color
-                )
-            ),
-            None => Line::new('·', "merge state never scanned")
-                .fix("kanspec scan")
-                .write(w, st),
+            Some(_) => writeln!(w, "   {}", crate::out::paint(&age, Color::Dim, st.color)),
+            None => Line::new('·', age).fix("kanspec scan").write(w, st),
         }
     }
 }

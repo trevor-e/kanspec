@@ -27,7 +27,8 @@ use crate::ctx::Ctx;
 use crate::error::{KsError, Result};
 use crate::{fix, fixes};
 
-/// Every git hook kanspec owns, with what it runs.
+/// Every git hook kanspec owns. The scan hooks run `kanspec scan --quiet`; the two message
+/// hooks append the `Kanspec: <id>` trailer.
 ///
 /// The trailer is stamped by **two** hooks, which sounds like one too many and is not:
 /// `prepare-commit-msg` runs *before* the editor, so on an interactive commit the message
@@ -36,14 +37,11 @@ use crate::{fix, fixes};
 /// So `prepare-commit-msg` handles the messages that already have content (`-m`, `-F`,
 /// `-t`) and `commit-msg`, which runs *after* the editor, handles the rest. Each no-ops
 /// when the other has already stamped, so no commit ever gets two.
-pub const HOOKS: &[(&str, &str)] = &[
-    ("post-merge", "kanspec scan --quiet"),
-    ("post-checkout", "kanspec scan --quiet"),
-    ("prepare-commit-msg", "append the `Kanspec: <id>` trailer"),
-    (
-        "commit-msg",
-        "append the `Kanspec: <id>` trailer after the editor",
-    ),
+pub const HOOKS: &[&str] = &[
+    "post-merge",
+    "post-checkout",
+    "prepare-commit-msg",
+    "commit-msg",
 ];
 
 /// The marker line that tells install from re-install, and ours from theirs.
@@ -137,23 +135,6 @@ pub enum Edit {
     },
 }
 
-impl Edit {
-    pub fn path(&self) -> &Path {
-        match self {
-            Edit::MkDir { path }
-            | Edit::Write { path, .. }
-            | Edit::Remove { path }
-            | Edit::PruneDir { path } => path,
-            Edit::Move { to, .. } => to,
-        }
-    }
-}
-
-/// `rev-parse --git-path hooks`, honouring `core.hooksPath`.
-pub fn hooks_dir(ctx: &Ctx) -> Result<PathBuf> {
-    ctx.git.hooks_dir()
-}
-
 /// Install (or, with `force`, unconditionally rewrite) every hook in [`HOOKS`].
 ///
 /// A pre-existing hook that is not ours is **displaced**, not overwritten: it moves to
@@ -173,54 +154,53 @@ pub fn remove(ctx: &Ctx) -> Result<Vec<HookReport>> {
 }
 
 pub fn plan_install(ctx: &Ctx, force: bool) -> Result<(Vec<Edit>, Vec<HookReport>)> {
-    let dir = hooks_dir(ctx)?;
+    // `rev-parse --git-path hooks`, honouring `core.hooksPath`.
+    let dir = ctx.git.hooks_dir()?;
     let mut edits = vec![Edit::MkDir { path: dir.clone() }];
     let mut reports = Vec::new();
 
-    for (hook, _) in HOOKS {
+    for &hook in HOOKS {
         let path = dir.join(hook);
         let body = dispatcher_script(hook, &action_for(hook, ctx.invoked_as), ctx.invoked_as);
         let existing = read(&path);
+        let ours = existing.as_deref().is_some_and(|t| t.contains(MARKER));
 
         // A hook we did not write is displaced, never clobbered.
         let mut note = None;
-        if let Some(text) = existing.as_deref() {
-            if !text.contains(MARKER) {
-                let to = displaced_path(&dir, hook);
-                if to.exists() {
-                    return Err(KsError::conflict(
-                        format!(
-                            "{} already exists — refusing to overwrite the hook kanspec \
-                             displaced last time",
-                            to.display()
-                        ),
-                        fixes![
-                            fix!("mv {} {}", to.display(), path.display()),
-                            fix!("{} init --refresh-hooks", ctx.invoked_as),
-                        ],
-                    ));
-                }
-                edits.push(Edit::MkDir {
-                    path: dot_d(&dir, hook),
-                });
-                edits.push(Edit::Move {
-                    from: path.clone(),
-                    to: to.clone(),
-                });
-                note = Some(format!(
-                    "your existing {hook} moved to {} and still runs first",
-                    rel(&dir, &to)
+        if existing.is_some() && !ours {
+            let to = displaced_path(&dir, hook);
+            if to.exists() {
+                return Err(KsError::conflict(
+                    format!(
+                        "{} already exists — refusing to overwrite the hook kanspec \
+                         displaced last time",
+                        to.display()
+                    ),
+                    fixes![
+                        fix!("mv {} {}", to.display(), path.display()),
+                        fix!("{} init --refresh-hooks", ctx.invoked_as),
+                    ],
                 ));
-                reports.push(HookReport {
-                    hook,
-                    path: to,
-                    action: HookAction::Displaced,
-                    note: note.clone(),
-                });
             }
+            edits.push(Edit::MkDir {
+                path: dot_d(&dir, hook),
+            });
+            edits.push(Edit::Move {
+                from: path.clone(),
+                to: to.clone(),
+            });
+            note = Some(format!(
+                "your existing {hook} moved to {} and still runs first",
+                rel(&dir, &to)
+            ));
+            reports.push(HookReport {
+                hook,
+                path: to,
+                action: HookAction::Displaced,
+                note: note.clone(),
+            });
         }
 
-        let ours = existing.as_deref().is_some_and(|t| t.contains(MARKER));
         let action = match (&existing, ours) {
             (Some(t), true) if t == &body && !force => HookAction::Unchanged,
             (Some(_), true) => HookAction::Refreshed,
@@ -244,11 +224,11 @@ pub fn plan_install(ctx: &Ctx, force: bool) -> Result<(Vec<Edit>, Vec<HookReport
 }
 
 pub fn plan_remove(ctx: &Ctx) -> Result<(Vec<Edit>, Vec<HookReport>)> {
-    let dir = hooks_dir(ctx)?;
+    let dir = ctx.git.hooks_dir()?;
     let mut edits = Vec::new();
     let mut reports = Vec::new();
 
-    for (hook, _) in HOOKS {
+    for &hook in HOOKS {
         let path = dir.join(hook);
         if !is_ours(&path) {
             reports.push(HookReport {
@@ -394,9 +374,7 @@ fi"#
 
 /// Whether this file is one kanspec wrote.
 pub fn is_ours(path: &Path) -> bool {
-    std::fs::read_to_string(path)
-        .map(|t| t.contains(MARKER))
-        .unwrap_or(false)
+    read(path).is_some_and(|t| t.contains(MARKER))
 }
 
 fn dot_d(dir: &Path, hook: &str) -> PathBuf {
@@ -408,8 +386,13 @@ fn displaced_path(dir: &Path, hook: &str) -> PathBuf {
     dot_d(dir, hook).join(format!("10-{hook}"))
 }
 
-fn read(p: &Path) -> Option<String> {
-    std::fs::read_to_string(p).ok()
+/// Lossy on purpose: a hook that is not valid UTF-8 (a compiled binary, a Latin-1 script) is
+/// still a hook somebody installed. Reading it as "absent" would make the planner overwrite
+/// it, which is the one thing this module promises never to do.
+pub(crate) fn read(p: &Path) -> Option<String> {
+    std::fs::read(p)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
 }
 
 /// What the dispatcher would actually run: `"$dir"/*` in `sh` skips dotfiles, so a stray
@@ -452,7 +435,7 @@ mod tests {
 
     #[test]
     fn every_hook_carries_the_marker_and_a_trailing_newline() {
-        for (hook, _) in HOOKS {
+        for &hook in HOOKS {
             let s = dispatcher_script(hook, &action_for(hook, "kanspec"), "kanspec");
             assert!(s.starts_with("#!/bin/sh\n"));
             assert!(s.contains(MARKER), "{hook} is not identifiable as ours");

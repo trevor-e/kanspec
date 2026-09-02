@@ -26,6 +26,7 @@
 use serde::Serialize;
 
 use crate::cli::FeaturesArgs;
+use crate::cmd::ticket::{rel_to, write_next};
 use crate::ctx::Ctx;
 use crate::derive::Staleness;
 use crate::error::{KsError, Result};
@@ -86,7 +87,6 @@ pub fn features(ctx: &Ctx, a: &FeaturesArgs) -> Result<FeaturesReport> {
     })
 }
 
-/// The tripwire's one-key resolution: "I looked, and nothing about this capability's
 /// `features --uncovered <pathspec>` — the reverse of the dead-glob check.
 ///
 /// `doctor` answers "does this spec's glob match anything". The question it CANNOT answer
@@ -138,6 +138,7 @@ fn uncovered(ctx: &Ctx, pathspec: &str) -> Result<FeaturesReport> {
     })
 }
 
+/// The tripwire's one-key resolution: "I looked, and nothing about this capability's
 /// behaviour changed."
 fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
     let name = SpecName::parse(raw)?;
@@ -191,7 +192,7 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
     // frontmatter, and the committed feature map is a function of `feature:`/`code:`/
     // provenance — so it usually does NOT move, and claiming "regenerated" every time
     // would put a line in front of the human that `git status` then contradicts.
-    let written = project::regenerate(ctx)?.then(|| rel(ctx, ctx.layout.features_md()));
+    let written = project::regenerate(ctx)?.then(|| rel_to(ctx, ctx.layout.features_md()));
 
     let snap = ctx.snapshot()?;
     Ok(FeaturesReport {
@@ -207,21 +208,13 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
     })
 }
 
-fn rel(ctx: &Ctx, p: &std::path::Path) -> String {
-    p.strip_prefix(ctx.repo.primary_root())
-        .unwrap_or(p)
-        .display()
-        .to_string()
-}
-
 /// One glyph per verdict, so the terminal table, the board's feature strip and the
 /// `spec show` footer can be read the same way at a glance. All three are LIVE reads; the
 /// committed projection carries no freshness at all (see `project`'s module header).
 fn dot(s: &Staleness) -> char {
     match s {
         Staleness::Ok => glyph::OK,
-        Staleness::Stale { .. } => '⚠',
-        Staleness::DeadGlobs { .. } => '⚠',
+        Staleness::Stale { .. } | Staleness::DeadGlobs { .. } => '⚠',
         Staleness::NeverScanned => '·',
     }
 }
@@ -286,14 +279,6 @@ impl Render for FeaturesReport {
             ]);
         }
         writeln!(w, "{t}")?;
-        for n in &self.next {
-            writeln!(
-                w,
-                "  {} {}",
-                glyph::FIX,
-                crate::out::paint(n, Color::Cyan, st.color)
-            )?;
-        }
-        Ok(())
+        write_next(w, st, &self.next)
     }
 }

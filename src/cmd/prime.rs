@@ -21,6 +21,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::cli::PrimeArgs;
+use crate::cmd::ticket::claimed_ticket;
 use crate::ctx::Ctx;
 use crate::derive::{self, Attention, Derived, Owner};
 use crate::error::Result;
@@ -32,7 +33,6 @@ use crate::plan::{Op, Plan};
 use crate::rulesdoc::{RulesDoc, Scope};
 use crate::scan::{self, ScanOpts};
 use crate::store::Store;
-use crate::transitions::State;
 
 /// How many ready tickets and anomaly lines the payload carries. The budget is ~1.5k
 /// tokens for the WHOLE injection, and the standing rules are the half that earns its
@@ -80,18 +80,29 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
         Scope::of(&a.paths)?
     };
     let dv = derive::compute(&snap);
+    // The ticket this session stands on, resolved ONCE and through the same lookup `new` and
+    // `where` use — the branch where the caller STANDS (a linked worktree included), the
+    // config key `start` wrote, then a single unambiguous claim — so `prime` cannot
+    // disagree with them about what is claimed.
+    let claimed = claimed_ticket(ctx, &snap).and_then(|id| snap.tickets.get(&id));
+    let unresolved = claimed
+        .and_then(|t| t.fm.proposal.as_ref())
+        .map(|p| derive::unresolved(&snap, p))
+        .unwrap_or(0);
+    // The payload, produced in exactly ONE place. `rules` writes the first half of this and
+    // stops; `prime` writes all of it. That is the whole of invariant 3.
     let standing = crate::rulesdoc::build(&snap, &scope);
-    let text = payload(ctx, &snap, &dv, &scope);
+    let text = format!(
+        "{}\n{}",
+        crate::rulesdoc::render_text(&standing),
+        live_slice(ctx, &snap, &dv, claimed, unresolved)
+    );
 
-    let claimed = claimed_ticket(ctx, &snap);
     Ok(PrimeReport {
         live: LiveSlice {
             claimed: claimed.map(|t| t.fm.id.clone()),
             claimed_title: claimed.map(|t| t.fm.title.clone()),
-            unresolved: claimed
-                .and_then(|t| t.fm.proposal.as_ref())
-                .map(|p| derive::unresolved(&snap, p))
-                .unwrap_or(0),
+            unresolved,
             ready: dv.ready.iter().take(READY_TOP).cloned().collect(),
             anomalies: dv.attention.iter().take(ANOMALY_TOP).cloned().collect(),
             // The CI provider layer is v0.2 (`ci.rs`, ARCHITECTURE §1); until it lands
@@ -104,14 +115,13 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
     })
 }
 
-/// The payload, produced in **exactly one place**. `rules` writes the first line of this
-/// and stops; `prime` writes all of it. That is the whole of invariant 3.
-pub fn payload(ctx: &Ctx, s: &Snapshot, dv: &Derived, scope: &Scope) -> String {
-    let standing = crate::rulesdoc::render_text(&crate::rulesdoc::build(s, scope));
-    format!("{standing}\n{}", live_slice(ctx, s, dv))
-}
-
-fn live_slice(ctx: &Ctx, s: &Snapshot, dv: &Derived) -> String {
+fn live_slice(
+    ctx: &Ctx,
+    s: &Snapshot,
+    dv: &Derived,
+    claimed: Option<&Ticket>,
+    unresolved: usize,
+) -> String {
     let mut o = String::new();
     o.push_str(&format!(
         "LIVE SLICE for {} (merge state {})\n",
@@ -119,13 +129,8 @@ fn live_slice(ctx: &Ctx, s: &Snapshot, dv: &Derived) -> String {
         s.git.freshness(s.now),
     ));
 
-    match claimed_ticket(ctx, s) {
+    match claimed {
         Some(t) => {
-            let unresolved =
-                t.fm.proposal
-                    .as_ref()
-                    .map(|p| derive::unresolved(s, p))
-                    .unwrap_or(0);
             o.push_str(&format!(
                 " CLAIMED  {}  {} · {}{}{}\n",
                 t.fm.id,
@@ -200,25 +205,6 @@ fn owner_tag(o: Owner) -> &'static str {
     }
 }
 
-/// Which ticket is this session working on? The branch is the strongest signal — it is
-/// what `start` wrote and what the commit-msg hook keys off — and a claim by this actor is
-/// the fallback for an agent that has not checked out yet.
-fn claimed_ticket<'s>(ctx: &Ctx, s: &'s Snapshot) -> Option<&'s Ticket> {
-    if let Some(branch) = ctx.git.current_branch() {
-        if let Some(t) = s
-            .tickets
-            .values()
-            .find(|t| t.fm.branch.as_deref() == Some(&branch))
-        {
-            return Some(t);
-        }
-    }
-    let me = ctx.actor.label();
-    s.tickets
-        .values()
-        .find(|t| t.fm.state == State::Doing && t.fm.claimed_by.as_deref() == Some(&me))
-}
-
 /// Scope to what the branch actually touched. On `main`, or when git declines to answer,
 /// that is nothing — and an unscoped payload is the honest answer, not a broken one.
 fn branch_scope(ctx: &Ctx) -> Result<Scope> {
@@ -247,7 +233,6 @@ fn refresh(ctx: &Ctx, snap: &Snapshot) -> bool {
         ScanOpts {
             fetch: true,
             only: None,
-            quiet: true,
         },
     ) else {
         return false;

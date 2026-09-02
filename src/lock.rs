@@ -139,11 +139,8 @@ impl LockToken {
     /// Who currently holds it, for the contention message. `None` renders as "held by an
     /// unknown process" — the note is written after acquiring, so empty is legitimate.
     pub fn read_owner(layout: &Layout) -> Option<LockOwner> {
-        let text = std::fs::read_to_string(layout.lock()).ok()?;
-        if text.trim().is_empty() {
-            return None;
-        }
-        serde_json::from_str(&text).ok()
+        // An empty or half-written note simply fails to parse: no owner, never a wrong one.
+        serde_json::from_str(&std::fs::read_to_string(layout.lock()).ok()?).ok()
     }
 
     /// The lockfile, for diagnostics. Nothing may write to it except this module.

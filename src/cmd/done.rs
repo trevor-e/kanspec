@@ -18,6 +18,7 @@ use chrono::SecondsFormat;
 use serde::Serialize;
 
 use crate::cli::DoneArgs;
+use crate::cmd::ticket::{facts, join, minted};
 use crate::ctx::{Ctx, OutMode};
 use crate::error::{KsError, Result};
 use crate::fm::Yv;
@@ -27,11 +28,11 @@ use crate::keys::TicketKey;
 use crate::logentry::LogEntry;
 use crate::model::Snapshot;
 use crate::out::{glyph, Color, Line, Render, Style};
-use crate::plan::{DoneFacts, EntityRef, Facts, Op, Plan};
+use crate::plan::{DoneFacts, EntityRef, Op, Plan};
 use crate::scan::{self, Landed, NoCodeWaiver};
 use crate::store::Store;
 use crate::transitions::{self, State, Verb};
-use crate::triage::{NewDecision, NewQuirk, SpecCheck, Triage};
+use crate::triage::{specs_matching, SpecCheck, Triage};
 use crate::{derive, fix, fixes};
 
 #[derive(Debug, Serialize)]
@@ -125,8 +126,6 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         })
         .collect();
 
-    let f_touched = touched.clone();
-
     // ── steps 2 + 3: leftover triage and the knowledge checkpoint ────────────
     //
     // One typed value, two front doors. A pipe is not a person: without a terminal the
@@ -138,28 +137,23 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     };
 
     // What the checkpoint is actually about: the globs the branch's changes fell inside.
-    let spec_globs: Vec<String> = Triage::specs_touched(&f_touched, &snap)
+    let spec_globs: Vec<String> = specs_matching(&touched, &snap)
         .iter()
         .filter_map(|n| snap.specs.get(n))
         .flat_map(|sp| sp.fm.code.clone())
         .collect();
 
     let landed_line = describe(ctx, &landed, &main);
-    let method = match &landed {
-        Landed::Proof(p) => Some(p.method().to_string()),
-        Landed::NoCode(_) => None,
-    };
-    let sha = match &landed {
-        Landed::Proof(p) => Some(p.sha().short().to_string()),
-        Landed::NoCode(_) => None,
+    let (method, sha) = match &landed {
+        Landed::Proof(p) => (
+            Some(p.method().to_string()),
+            Some(p.sha().short().to_string()),
+        ),
+        Landed::NoCode(_) => (None, None),
     };
 
     let f = DoneFacts {
-        base: Facts {
-            actor: ctx.actor.clone(),
-            at: ctx.now,
-            invocation: ctx.invocation(),
-        },
+        base: facts(ctx),
         landed,
         touched,
     };
@@ -177,31 +171,26 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     let snap = &committed.snapshot;
     let t = snap.ticket(&id)?;
     // `Plan::minted` preserves the order `plan_done` pushed them in, which is step order.
-    let spawned: Vec<Spawned> = minted_tickets(&committed.minted)
-        .into_iter()
-        .zip(triage.spawns())
-        .map(|(id, (from_step, title))| Spawned {
-            id,
-            title: title.to_string(),
-            from_step,
-        })
-        .collect();
-    let quirks: Vec<QuirkId> = committed
-        .minted
-        .iter()
-        .filter_map(|e| match e {
-            EntityRef::Quirk(q) => Some(q.clone()),
-            _ => None,
-        })
-        .collect();
-    let decisions: Vec<DecisionId> = committed
-        .minted
-        .iter()
-        .filter_map(|e| match e {
-            EntityRef::Decision(d) => Some(d.clone()),
-            _ => None,
-        })
-        .collect();
+    let spawned: Vec<Spawned> = minted(&committed, |e| match e {
+        EntityRef::Ticket(id) => Some(id.clone()),
+        _ => None,
+    })
+    .into_iter()
+    .zip(triage.spawns())
+    .map(|(id, (from_step, title))| Spawned {
+        id,
+        title: title.to_string(),
+        from_step,
+    })
+    .collect();
+    let quirks: Vec<QuirkId> = minted(&committed, |e| match e {
+        EntityRef::Quirk(q) => Some(q.clone()),
+        _ => None,
+    });
+    let decisions: Vec<DecisionId> = minted(&committed, |e| match e {
+        EntityRef::Decision(d) => Some(d.clone()),
+        _ => None,
+    });
 
     // "Settling" is derived, never stored: the moment the last linked ticket goes terminal
     // the proposal surfaces as *close me*, so close-out is prompted, never remembered.
@@ -350,19 +339,38 @@ pub fn plan_done(
     }
 
     // ── the knowledge checkpoint's captures ──────────────────────────────────
+    // Both records are minted through the SAME scaffolds `quirk add` and `decide` use, so a
+    // landmine or a decision captured at close-out cannot drift from a hand-captured one.
+    // `status: active` and `source:` point home (provenance rule 3); the decision is
+    // `proposed`, never `accepted` — invariant 8, with `HumanActor` enforcing the other half.
     for (n, q) in t.quirks.iter().enumerate() {
         let qid = m.quirk(&format!("{}#{n}", q.title))?;
         plan.push(Op::CreateEntity {
             entity: EntityRef::Quirk(qid.clone()),
-            contents: quirk_scaffold(&qid, q, &id),
+            contents: crate::cmd::quirk::scaffold(&qid, &q.title, &q.paths, q.severity, Some(&id)),
         })
         .mint(EntityRef::Quirk(qid));
     }
     for (n, d) in t.decisions.iter().enumerate() {
         let did = m.decision(&format!("{}#{n}", d.title))?;
+        let body = format!(
+            "## Context\nRecorded while closing out {id} on {when}.\n\n## Decision\n{}\n\n\
+             ## Consequences\n(unfilled — a human accepts this, and should say what it costs \
+             first)\n",
+            d.title,
+            when = f.base.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        );
         plan.push(Op::CreateEntity {
             entity: EntityRef::Decision(did.clone()),
-            contents: decision_scaffold(&did, d, &id, f),
+            contents: crate::cmd::decision::scaffold(
+                &did,
+                &d.title,
+                f.base.at,
+                Some(id.as_str()),
+                &d.scope,
+                None,
+                &body,
+            ),
         })
         .mint(EntityRef::Decision(did));
     }
@@ -377,14 +385,7 @@ pub fn plan_done(
 
     let mut detail = landed_note;
     if !spawned.is_empty() {
-        detail.push_str(&format!(
-            " · spawned {}",
-            spawned
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        detail.push_str(&format!(" · spawned {}", join(&spawned, ", ")));
     }
     let dropped = t.dropped();
     if !dropped.is_empty() {
@@ -403,63 +404,6 @@ pub fn plan_done(
         also,
     });
     Ok(plan)
-}
-
-/// DESIGN.md's quirk file, in `keys::QUIRK_ORDER`. `status: active` and `source:` — retired
-/// only by evidence, and always pointing home (provenance rule 3).
-fn quirk_scaffold(id: &QuirkId, q: &NewQuirk, from: &TicketId) -> String {
-    let mut fm = String::new();
-    let mut put = |k: &str, v: Yv| {
-        fm.push_str(k);
-        fm.push_str(": ");
-        fm.push_str(&crate::fm::emit(&v, false));
-        fm.push('\n');
-    };
-    put("id", Yv::s(id.as_str()));
-    put("title", Yv::s(q.title.clone()));
-    put("paths", Yv::list(q.paths.clone()));
-    put(
-        "severity",
-        Yv::s(match q.severity {
-            crate::model::Severity::Landmine => "landmine",
-            crate::model::Severity::Gotcha => "gotcha",
-            crate::model::Severity::Debt => "debt",
-        }),
-    );
-    put("status", Yv::s("active"));
-    put("source", Yv::s(from.as_str()));
-    put("fixed_by", Yv::Null);
-    format!("---\n{fm}---\n{}\n", q.title)
-}
-
-/// DESIGN.md's decision file — minted `proposed`, never `accepted`. Invariant 8: agents
-/// never self-accept standing rules, and `HumanActor` is what enforces the other half.
-fn decision_scaffold(id: &DecisionId, d: &NewDecision, from: &TicketId, f: &DoneFacts) -> String {
-    let mut fm = String::new();
-    let mut put = |k: &str, v: Yv| {
-        fm.push_str(k);
-        fm.push_str(": ");
-        fm.push_str(&crate::fm::emit(&v, false));
-        fm.push('\n');
-    };
-    put("id", Yv::s(id.as_str()));
-    put("title", Yv::s(d.title.clone()));
-    put("status", Yv::s("proposed"));
-    put(
-        "date",
-        Yv::s(f.base.at.date_naive().format("%Y-%m-%d").to_string()),
-    );
-    put("source", Yv::s(from.as_str()));
-    put("scope", Yv::list(d.scope.clone()));
-    put("supersedes", Yv::Null);
-    put("superseded_by", Yv::Null);
-    format!(
-        "---\n{fm}---\n## Context\nRecorded while closing out {from} on \
-         {when}.\n\n## Decision\n{title}\n\n## Consequences\n(unfilled — a human accepts \
-         this, and should say what it costs first)\n",
-        title = d.title,
-        when = f.base.at.to_rfc3339_opts(SecondsFormat::Secs, true),
-    )
 }
 
 /// The one wording for "the escape is not available here", raised in two places on purpose:
@@ -503,16 +447,6 @@ fn describe(ctx: &Ctx, landed: &Landed, main: &str) -> String {
     }
 }
 
-fn minted_tickets(minted: &[EntityRef]) -> Vec<TicketId> {
-    minted
-        .iter()
-        .filter_map(|e| match e {
-            EntityRef::Ticket(id) => Some(id.clone()),
-            _ => None,
-        })
-        .collect()
-}
-
 impl Render for DoneReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         // DESIGN.md's close-out transcript.
@@ -553,11 +487,7 @@ impl Render for DoneReport {
                 w,
                 "Knowledge check — branch touched {} (spec: {}): spec edited on this branch {}",
                 self.spec_globs.join(", "),
-                specs
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                join(specs, ", "),
                 glyph::OK
             )?,
             SpecCheck::Unchanged { why } => writeln!(
@@ -601,11 +531,7 @@ impl Render for DoneReport {
                 glyph::DISCOVERED,
                 self.discovered.len(),
                 if self.discovered.len() == 1 { "" } else { "s" },
-                self.discovered
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                join(&self.discovered, ", ")
             )?;
         }
         for n in self.next.iter().skip(1) {
@@ -621,6 +547,7 @@ mod tests {
     use crate::config::Config;
     use crate::ctx::Actor;
     use crate::model::{Step, Ticket, TicketFm};
+    use crate::plan::Facts;
     use chrono::{DateTime, TimeZone, Utc};
 
     fn at() -> DateTime<Utc> {

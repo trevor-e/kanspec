@@ -68,15 +68,10 @@ pub struct Rank {
 
 impl Scope {
     pub fn none() -> Scope {
-        Scope {
-            paths: Vec::new(),
-            // An empty `GlobSet` matches nothing; `matches` short-circuits on `paths` for
-            // the unscoped case, so the two never disagree.
-            set: GlobSetBuilder::new()
-                .build()
-                .unwrap_or_else(|_| GlobSet::empty()),
-            each: Vec::new(),
-        }
+        // An empty builder cannot fail, and the empty `GlobSet` it builds matches nothing;
+        // `matches` short-circuits on `paths` for the unscoped case, so the two never
+        // disagree.
+        Scope::of(&[]).expect("an empty scope always compiles")
     }
 
     pub fn of(paths: &[String]) -> Result<Scope> {

@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{KsError, Result};
 use crate::{fix, fixes};
 
-macro_rules! id_kind {
-    ($name:ident, $prefix:literal, $noun:literal) => {
+/// One invocation declares every kind AND `ALL_PREFIXES`, so a sixth kind cannot be added
+/// without also becoming a "foreign prefix" the other five reject.
+macro_rules! id_kinds {
+    ($($name:ident, $prefix:literal, $noun:literal;)+) => { $(
         #[doc = concat!("A `", $prefix, "`-prefixed ", $noun, " id.")]
         #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
@@ -71,17 +73,19 @@ macro_rules! id_kind {
                 v.0
             }
         }
+    )+
+        /// Every prefix in the crate — used to tell "bare body" apart from "wrong kind".
+        pub const ALL_PREFIXES: &[&str] = &[$($prefix),+];
     };
 }
 
-id_kind!(TicketId, "t-", "ticket");
-id_kind!(ProposalId, "p-", "proposal");
-id_kind!(DecisionId, "D-", "decision");
-id_kind!(QuirkId, "q-", "quirk");
-id_kind!(CommentId, "cm-", "comment");
-
-/// Every prefix in the crate — used to tell "bare body" apart from "wrong kind".
-pub const ALL_PREFIXES: &[&str] = &["t-", "p-", "D-", "q-", "cm-"];
+id_kinds! {
+    TicketId, "t-", "ticket";
+    ProposalId, "p-", "proposal";
+    DecisionId, "D-", "decision";
+    QuirkId, "q-", "quirk";
+    CommentId, "cm-", "comment";
+}
 
 fn has_foreign_prefix(raw: &str, mine: &str) -> bool {
     ALL_PREFIXES

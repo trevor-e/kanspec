@@ -40,11 +40,12 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 
 use crate::cli::{
-    Cli, ColorChoice, Command, DoneArgs, DropArgs, ParkArgs, ScanArgs, ShipArgs, ShowArgs,
-    StartArgs, StatusArgs,
+    Cli, ColorChoice, Command, CommentCommand, DoneArgs, DropArgs, ParkArgs, ScanArgs, ShipArgs,
+    ShowArgs, StartArgs, StatusArgs,
 };
 use crate::ctx::Ctx;
 use crate::error::{code, KsError, Result};
+use crate::ids::{ItemRef, ProposalId};
 use crate::{fix, fixes};
 
 /// The board SPA: vanilla JS, no build step. `build.rs` prints
@@ -113,7 +114,9 @@ type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 /// serve future closes the listener and every live connection at once, which is what
 /// "Ctrl-C is instant even with two SSE tabs open" actually requires.
 pub async fn serve(ctx: Arc<Ctx>, port: u16) -> Result<()> {
-    let (events, _rx) = tokio::sync::broadcast::channel::<Tick>(64);
+    // The receiver is dropped on purpose: `publish` ignores a send with no subscriber, and
+    // every SSE client subscribes its own.
+    let (events, _) = tokio::sync::broadcast::channel::<Tick>(64);
     let state = AppState {
         ctx: ctx.clone(),
         rev: Arc::new(AtomicU64::new(0)),
@@ -237,25 +240,29 @@ pub fn router(state: AppState) -> axum::Router {
 /// shell gave `kanspec up`. Declaring JSON mode is what makes every POST take the
 /// flags-only door through `Triage`, so a browser can never be waiting on a prompt printed
 /// into a terminal nobody is watching.
-pub(crate) fn request_ctx(anchor: &Ctx) -> Result<Ctx> {
+pub(crate) fn request_ctx(anchor: &Ctx, verb: &str) -> Result<Ctx> {
     let cli = Cli {
         json: true,
         color: ColorChoice::Never,
         repo: Some(anchor.repo.primary_root().to_path_buf()),
         command: Command::Status(StatusArgs { owner: None }),
     };
-    Ctx::open(&cli, anchor.repo.primary_root())
+    let mut ctx = Ctx::open(&cli, anchor.repo.primary_root())?;
+    // This process's own argv is `up --port …`; the log must name the verb the browser
+    // asked for, not the server that relayed it.
+    ctx.invocation = format!("{} {verb} (web)", anchor.invoked_as);
+    Ok(ctx)
 }
 
 /// Every handler's body: hop to a blocking thread, build a `Ctx`, call the SAME `cmd::*`
 /// function the CLI calls. There is deliberately no other shape available here.
-async fn blocking<T, F>(state: &AppState, f: F) -> std::result::Result<T, ApiError>
+async fn blocking<T, F>(state: &AppState, verb: String, f: F) -> std::result::Result<T, ApiError>
 where
     F: FnOnce(&Ctx) -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
     let anchor = state.ctx.clone();
-    let joined = tokio::task::spawn_blocking(move || f(&request_ctx(&anchor)?)).await;
+    let joined = tokio::task::spawn_blocking(move || f(&request_ctx(&anchor, &verb)?)).await;
     match joined {
         Ok(r) => r.map_err(ApiError),
         Err(e) => Err(ApiError(KsError::internal(anyhow::anyhow!(
@@ -285,52 +292,48 @@ fn body_of<T: serde::de::DeserializeOwned + Default>(
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn api_board(State(st): State<AppState>) -> ApiResult<crate::board::BoardModel> {
-    Ok(Json(
-        blocking(&st, |ctx| {
-            ctx.require_initialized()?;
-            let snap = ctx.snapshot()?;
-            crate::board::build(ctx, &snap)
-        })
-        .await?,
-    ))
+    blocking(&st, "board".into(), |ctx| {
+        ctx.require_initialized()?;
+        let snap = ctx.snapshot()?;
+        crate::board::build(ctx, &snap)
+    })
+    .await
+    .map(Json)
 }
 
 async fn api_status(State(st): State<AppState>) -> ApiResult<crate::cmd::status::StatusReport> {
-    Ok(Json(
-        blocking(&st, |ctx| {
-            crate::cmd::status::status(ctx, &StatusArgs { owner: None })
-        })
-        .await?,
-    ))
+    blocking(&st, "status".into(), |ctx| {
+        crate::cmd::status::status(ctx, &StatusArgs { owner: None })
+    })
+    .await
+    .map(Json)
 }
 
 async fn api_rules(State(st): State<AppState>) -> ApiResult<crate::cmd::rules::RulesReport> {
-    Ok(Json(
-        blocking(&st, |ctx| {
-            crate::cmd::rules::rules(
-                ctx,
-                &crate::cli::RulesArgs {
-                    paths: Vec::new(),
-                    audit: false,
-                    adopt: false,
-                    full: false,
-                },
-            )
-        })
-        .await?,
-    ))
+    blocking(&st, "rules".into(), |ctx| {
+        crate::cmd::rules::rules(
+            ctx,
+            &crate::cli::RulesArgs {
+                paths: Vec::new(),
+                audit: false,
+                adopt: false,
+                full: false,
+            },
+        )
+    })
+    .await
+    .map(Json)
 }
 
 async fn api_ticket(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::ticket::ShowReport> {
-    Ok(Json(
-        blocking(&st, move |ctx| {
-            crate::cmd::ticket::show(ctx, &ShowArgs { id })
-        })
-        .await?,
-    ))
+    blocking(&st, format!("show {id}"), move |ctx| {
+        crate::cmd::ticket::show(ctx, &ShowArgs { id })
+    })
+    .await
+    .map(Json)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -387,25 +390,44 @@ pub struct DoneBody {
     pub why: Option<String>,
 }
 
+/// Every write handler's body: parse the body (empty means default), hop to a blocking
+/// thread for the SAME `cmd::*` call the CLI makes, then publish a tick so every open page
+/// refetches. `n` is the tick's coalesced-event count (D-23). There is deliberately no
+/// other shape available here.
+async fn mutate<B, T, F>(st: &AppState, raw: &str, n: u64, verb: String, f: F) -> ApiResult<T>
+where
+    B: serde::de::DeserializeOwned + Default + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&Ctx, B) -> Result<T> + Send + 'static,
+{
+    let b: B = body_of(raw)?;
+    let r = blocking(st, verb, move |ctx| f(ctx, b)).await?;
+    publish(st, n);
+    Ok(Json(r))
+}
+
 async fn post_start(
     State(st): State<AppState>,
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::flow::StartReport> {
-    let b: StartBody = body_of(&raw)?;
-    let r = blocking(&st, move |ctx| {
-        crate::cmd::flow::start(
-            ctx,
-            &StartArgs {
-                id,
-                worktree: b.worktree == Some(true),
-                no_worktree: b.worktree == Some(false),
-            },
-        )
-    })
-    .await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(
+        &st,
+        &raw,
+        1,
+        format!("start {id}"),
+        move |ctx, b: StartBody| {
+            crate::cmd::flow::start(
+                ctx,
+                &StartArgs {
+                    id,
+                    worktree: b.worktree == Some(true),
+                    no_worktree: b.worktree == Some(false),
+                },
+            )
+        },
+    )
+    .await
 }
 
 async fn post_ship(
@@ -413,13 +435,14 @@ async fn post_ship(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::flow::ShipReport> {
-    let b: ShipBody = body_of(&raw)?;
-    let r = blocking(&st, move |ctx| {
-        crate::cmd::flow::ship(ctx, &ShipArgs { id, pr: b.pr })
-    })
-    .await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(
+        &st,
+        &raw,
+        1,
+        format!("ship {id}"),
+        move |ctx, b: ShipBody| crate::cmd::flow::ship(ctx, &ShipArgs { id, pr: b.pr }),
+    )
+    .await
 }
 
 async fn post_park(
@@ -427,13 +450,14 @@ async fn post_park(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::flow::ParkReport> {
-    let b: WhyBody = body_of(&raw)?;
-    let r = blocking(&st, move |ctx| {
-        crate::cmd::flow::park(ctx, &ParkArgs { id, why: b.why })
-    })
-    .await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(
+        &st,
+        &raw,
+        1,
+        format!("park {id}"),
+        move |ctx, b: WhyBody| crate::cmd::flow::park(ctx, &ParkArgs { id, why: b.why }),
+    )
+    .await
 }
 
 async fn post_drop(
@@ -441,13 +465,14 @@ async fn post_drop(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::flow::DropReport> {
-    let b: WhyBody = body_of(&raw)?;
-    let r = blocking(&st, move |ctx| {
-        crate::cmd::flow::drop_ticket(ctx, &DropArgs { id, why: b.why })
-    })
-    .await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(
+        &st,
+        &raw,
+        1,
+        format!("drop {id}"),
+        move |ctx, b: WhyBody| crate::cmd::flow::drop_ticket(ctx, &DropArgs { id, why: b.why }),
+    )
+    .await
 }
 
 async fn post_done(
@@ -455,30 +480,33 @@ async fn post_done(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::done::DoneReport> {
-    let b: DoneBody = body_of(&raw)?;
-    let r = blocking(&st, move |ctx| {
-        crate::cmd::done::done(
-            ctx,
-            &DoneArgs {
-                id,
-                spawn: b.spawn,
-                drop_step: b.drop_step,
-                actually_done: b.actually_done,
-                no_followups: b.no_followups,
-                spec_unchanged: b.spec_unchanged,
-                quirk: b.quirk,
-                quirk_paths: b.quirk_paths,
-                no_quirks: b.no_quirks,
-                decision: b.decision,
-                no_decisions: b.no_decisions,
-                no_code: b.no_code,
-                why: b.why,
-            },
-        )
-    })
-    .await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(
+        &st,
+        &raw,
+        1,
+        format!("done {id}"),
+        move |ctx, b: DoneBody| {
+            crate::cmd::done::done(
+                ctx,
+                &DoneArgs {
+                    id,
+                    spawn: b.spawn,
+                    drop_step: b.drop_step,
+                    actually_done: b.actually_done,
+                    no_followups: b.no_followups,
+                    spec_unchanged: b.spec_unchanged,
+                    quirk: b.quirk,
+                    quirk_paths: b.quirk_paths,
+                    no_quirks: b.no_quirks,
+                    decision: b.decision,
+                    no_decisions: b.no_decisions,
+                    no_code: b.no_code,
+                    why: b.why,
+                },
+            )
+        },
+    )
+    .await
 }
 
 // ── the review page ──────────────────────────────────────────────────────────
@@ -487,9 +515,16 @@ async fn api_proposal(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::proposal::ProposalPage> {
-    Ok(Json(
-        blocking(&st, move |ctx| crate::cmd::proposal::page(ctx, &id)).await?,
-    ))
+    blocking(&st, format!("review {id}"), move |ctx| {
+        crate::cmd::proposal::page(ctx, &id)
+    })
+    .await
+    .map(Json)
+}
+
+/// The three comment POSTs are one CLI verb with three subcommands.
+fn comment_verb(ctx: &Ctx, cmd: CommentCommand) -> Result<crate::cmd::comment::CommentReport> {
+    crate::cmd::comment::comment(ctx, &crate::cli::CommentArgs { cmd })
 }
 
 /// `{target, body}` — the browser POSTs the same shape the CLI takes, and it lands through
@@ -505,24 +540,34 @@ pub struct CommentBody {
 
 async fn post_comment(
     State(st): State<AppState>,
-    Path(_id): Path<String>,
+    Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::comment::CommentReport> {
-    let b: CommentBody = body_of(&raw)?;
-    let out = blocking(&st, move |ctx| {
-        crate::cmd::comment::comment(
-            ctx,
-            &crate::cli::CommentArgs {
-                cmd: crate::cli::CommentCommand::Add {
-                    target: b.target.clone(),
-                    body: b.body.clone(),
+    mutate(
+        &st,
+        &raw,
+        0,
+        format!("comment add {id}"),
+        move |ctx, b: CommentBody| {
+            // The route names a proposal and the body names an item. They must agree, or a
+            // POST under one proposal's URL would write into another proposal's log.
+            let pid = ProposalId::parse(&id)?;
+            if ItemRef::parse(&b.target)?.proposal != pid {
+                return Err(KsError::invalid(
+                    format!("{} is not an item of {pid}", b.target),
+                    fixes![fix!("POST {{\"target\": \"{pid}#c1\", \"body\": \"...\"}}")],
+                ));
+            }
+            comment_verb(
+                ctx,
+                CommentCommand::Add {
+                    target: b.target,
+                    body: b.body,
                 },
-            },
-        )
-    })
-    .await?;
-    publish(&st, 0);
-    Ok(Json(out))
+            )
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -536,21 +581,14 @@ async fn post_reply(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::comment::CommentReport> {
-    let b: ReplyBody = body_of(&raw)?;
-    let out = blocking(&st, move |ctx| {
-        crate::cmd::comment::comment(
-            ctx,
-            &crate::cli::CommentArgs {
-                cmd: crate::cli::CommentCommand::Reply {
-                    id: id.clone(),
-                    body: b.body.clone(),
-                },
-            },
-        )
-    })
-    .await?;
-    publish(&st, 0);
-    Ok(Json(out))
+    mutate(
+        &st,
+        &raw,
+        0,
+        format!("comment reply {id}"),
+        move |ctx, b: ReplyBody| comment_verb(ctx, CommentCommand::Reply { id, body: b.body }),
+    )
+    .await
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -564,33 +602,24 @@ async fn post_resolve(
     Path(id): Path<String>,
     raw: String,
 ) -> ApiResult<crate::cmd::comment::CommentReport> {
-    let b: ResolveBody = body_of(&raw)?;
-    let out = blocking(&st, move |ctx| {
-        crate::cmd::comment::comment(
-            ctx,
-            &crate::cli::CommentArgs {
-                cmd: crate::cli::CommentCommand::Resolve {
-                    id: id.clone(),
-                    note: b.note.clone(),
-                },
-            },
-        )
-    })
-    .await?;
-    publish(&st, 0);
-    Ok(Json(out))
+    mutate(
+        &st,
+        &raw,
+        0,
+        format!("comment resolve {id}"),
+        move |ctx, b: ResolveBody| comment_verb(ctx, CommentCommand::Resolve { id, note: b.note }),
+    )
+    .await
 }
 
 async fn post_review(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::proposal::ReviewReport> {
-    let out = blocking(&st, move |ctx| {
-        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id: id.clone() })
+    mutate(&st, "", 0, format!("review {id}"), move |ctx, _: ()| {
+        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id })
     })
-    .await?;
-    publish(&st, 0);
-    Ok(Json(out))
+    .await
 }
 
 /// Approval from the page is still the gated verb: it refuses over unresolved threads
@@ -599,18 +628,17 @@ async fn post_approve(
     State(st): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::proposal::ApproveReport> {
-    let out = blocking(&st, move |ctx| {
-        crate::cmd::proposal::approve(ctx, &crate::cli::ApproveArgs { id: id.clone() })
+    mutate(&st, "", 0, format!("approve {id}"), move |ctx, _: ()| {
+        crate::cmd::proposal::approve(ctx, &crate::cli::ApproveArgs { id })
     })
-    .await?;
-    publish(&st, 0);
-    Ok(Json(out))
+    .await
 }
 
 async fn post_scan(State(st): State<AppState>) -> ApiResult<crate::cmd::scan::ScanReport> {
-    let r = blocking(&st, |ctx| crate::cmd::scan::scan(ctx, &quiet_scan())).await?;
-    publish(&st, 1);
-    Ok(Json(r))
+    mutate(&st, "", 1, "scan".into(), |ctx, _: ()| {
+        crate::cmd::scan::scan(ctx, &quiet_scan())
+    })
+    .await
 }
 
 fn quiet_scan() -> ScanArgs {
@@ -667,7 +695,7 @@ async fn scan_loop(state: AppState) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        let done = blocking(&state, |ctx| {
+        let done = blocking(&state, "scan".into(), |ctx| {
             ctx.require_initialized()?;
             let fresh = ctx
                 .git
@@ -741,7 +769,7 @@ fn kanspec_dir(ctx: &Ctx) -> Option<PathBuf> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn static_asset(uri: Uri) -> Response {
-    match asset(uri.path()).await {
+    match asset(uri.path()) {
         Some((headers, body)) => (headers, body).into_response(),
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
     }
@@ -752,7 +780,7 @@ async fn static_asset(uri: Uri) -> Response {
 /// Anything that is not a file falls back to `index.html`, so the SPA's own routes
 /// (`/t/<id>`, `/p/<id>`, `/d/<id>`) survive a reload — except under `/api/`, where a
 /// typo must 404 rather than hand an agent a page of HTML to parse as JSON.
-async fn asset(path: &str) -> Option<(HeaderMap, Vec<u8>)> {
+fn asset(path: &str) -> Option<(HeaderMap, Vec<u8>)> {
     let rel = path.trim_start_matches('/');
     let file = Assets::get(rel).or_else(|| {
         if rel.starts_with("api/") || rel == "events" {
@@ -779,7 +807,6 @@ mod tests {
     /// `Router::route()`, so building the router at all is the assertion.
     #[test]
     fn the_router_builds_which_is_the_axum_08_brace_syntax_assertion() {
-        let (events, _rx) = tokio::sync::broadcast::channel::<Tick>(8);
         // Constructing `AppState` needs a real `Ctx`; the router shape does not, so this
         // asserts the one thing that can panic — the path syntax — without one.
         let paths = [
@@ -806,26 +833,23 @@ mod tests {
             assert!(!p.contains(':'), "axum 0.8 panics on `:id`: {p}");
             r = r.route(p, get(|| async { "ok" }));
         }
-        drop(events);
     }
 
-    #[tokio::test]
-    async fn the_spa_is_embedded_and_unknown_routes_fall_back_to_it() {
-        let (h, body) = asset("/index.html").await.expect("index.html is embedded");
+    #[test]
+    fn the_spa_is_embedded_and_unknown_routes_fall_back_to_it() {
+        let (h, body) = asset("/index.html").expect("index.html is embedded");
         assert!(h[header::CONTENT_TYPE].to_str().unwrap().contains("html"));
         assert!(!body.is_empty());
 
         // A deep link the SPA owns must serve the shell, not a 404.
-        let (_, deep) = asset("/t/t-9c41")
-            .await
-            .expect("SPA routes serve the shell");
+        let (_, deep) = asset("/t/t-9c41").expect("SPA routes serve the shell");
         assert_eq!(deep, body);
 
         // …but a mistyped API path must NOT hand an agent HTML to parse as JSON.
-        assert!(asset("/api/bogus").await.is_none());
+        assert!(asset("/api/bogus").is_none());
 
         for f in ["/app.js", "/style.css"] {
-            assert!(asset(f).await.is_some(), "{f} is not embedded");
+            assert!(asset(f).is_some(), "{f} is not embedded");
         }
     }
 

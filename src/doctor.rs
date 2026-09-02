@@ -15,9 +15,11 @@
 //!
 //! Owner: **S4**.
 
+use std::collections::BTreeMap;
+use std::path::Path;
+
 use serde::Serialize;
 
-use crate::ctx::Ctx;
 use crate::derive;
 use crate::error::Result;
 use crate::ids::ProposalId;
@@ -47,6 +49,27 @@ pub struct Finding {
     pub fix: String,
     /// whether `--fix` can repair it mechanically
     pub fixable: bool,
+}
+
+impl Finding {
+    /// Every check's finding is unfixable unless its registry row says otherwise, so that
+    /// is the default here and `closed_agree` overrides it.
+    fn new(
+        check: &'static str,
+        severity: Severity,
+        subject: impl ToString,
+        message: String,
+        fix: String,
+    ) -> Finding {
+        Finding {
+            check,
+            severity,
+            subject: subject.to_string(),
+            message,
+            fix,
+            fixable: false,
+        }
+    }
 }
 
 /// Pure over the snapshot — a check never touches the filesystem or git directly.
@@ -190,17 +213,6 @@ pub fn plan_fixes(snap: &Snapshot, findings: &[Finding]) -> Result<Plan> {
     Ok(plan)
 }
 
-/// A convenience for `cmd/status.rs`, which shows doctor errors as YOU lines.
-pub fn run_all_ctx(ctx: &Ctx) -> Result<Vec<Finding>> {
-    Ok(run_all(&ctx.snapshot()?))
-}
-
-/// Every check's id, for `doctor`'s "N checks passed" line and for an agent that wants to
-/// know what was proved.
-pub fn check_ids() -> Vec<&'static str> {
-    CHECKS.iter().map(|c| c.id).collect()
-}
-
 // ── the checks ───────────────────────────────────────────────────────────────
 
 /// R-2, mechanically: the seals bind the tool, the `## Log` binds the human. A
@@ -233,19 +245,18 @@ fn check_log_trail(s: &Snapshot) -> Vec<Finding> {
             }
             _ => format!("edit {path} and repair the ## Log lines above the break"),
         };
-        out.push(Finding {
-            check: "log_trail",
-            severity: Severity::Error,
-            subject: id.to_string(),
+        out.push(Finding::new(
+            "log_trail",
+            Severity::Error,
+            id,
             // The escape stays discoverable, and stays described as what it is: a recorded
             // human attestation, badged from then on, for history that is genuinely lost.
-            message: format!(
+            format!(
                 "{v} — if the history is genuinely unrecoverable, `kanspec repair {id} \
                  --why \"...\"` attests it and the ticket is badged attested from then on"
             ),
             fix,
-            fixable: false,
-        });
+        ));
     }
     out
 }
@@ -280,31 +291,24 @@ fn check_attested_state(s: &Snapshot) -> Vec<Finding> {
                 (
                     Severity::Error,
                     format!(
-                    "is `done` because {} attested it on {when}, and nothing in its ## Log says \
-                     the work ever landed — this close was vouched for, never proven",
-                    a.actor
-                ),
+                        "is `done` because {} attested it on {when}, and nothing in its ## Log \
+                         says the work ever landed — this close was vouched for, never proven",
+                        a.actor
+                    ),
                     format!("kanspec scan --confirm {id} --why \"...\""),
                 )
             } else {
                 (
                     Severity::Warning,
                     format!(
-                    "reached `{}` by attestation ({} on {when}) — a human's word, not a replayed \
-                     trail",
-                    t.fm.state, a.actor
-                ),
+                        "reached `{}` by attestation ({} on {when}) — a human's word, not a \
+                         replayed trail",
+                        t.fm.state, a.actor
+                    ),
                     format!("kanspec log {id}"),
                 )
             };
-        out.push(Finding {
-            check: "attested_state",
-            severity,
-            subject: id.to_string(),
-            message,
-            fix,
-            fixable: false,
-        });
+        out.push(Finding::new("attested_state", severity, id, message, fix));
     }
     out
 }
@@ -346,11 +350,11 @@ fn check_unproven_close(s: &Snapshot) -> Vec<Finding> {
             continue;
         }
         let id = &t.fm.id;
-        out.push(Finding {
-            check: "unproven_close",
-            severity: Severity::Error,
-            subject: id.to_string(),
-            message: format!(
+        out.push(Finding::new(
+            "unproven_close",
+            Severity::Error,
+            id,
+            format!(
                 "is `done` with nothing outside its own ## Log behind the close: no commit \
                  recorded by the gate, no `--no-code` waiver, no attestation, and no ladder run \
                  that ever saw it in main. A ## Log is plain text, so a `done` line proves a \
@@ -362,9 +366,8 @@ fn check_unproven_close(s: &Snapshot) -> Vec<Finding> {
             // Ask GIT first. A TARGETED scan re-runs the ladder even on a terminal ticket,
             // so this is the diagnostic AND — when the work really did land — the repair,
             // while laundering nothing when it did not.
-            fix: format!("kanspec scan --explain {id}"),
-            fixable: false,
-        });
+            format!("kanspec scan --explain {id}"),
+        ));
     }
     out
 }
@@ -374,20 +377,21 @@ fn check_unproven_close(s: &Snapshot) -> Vec<Finding> {
 /// which has no write path to blame.
 fn check_reserved_keys(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
-    let mut check = |subject: String, path: &std::path::Path, keys: Vec<&str>| {
+    for (subject, path, extra) in frontmatters(s) {
+        let keys = reserved(extra);
         if keys.is_empty() {
-            return;
+            continue;
         }
         let listed = keys
             .iter()
             .map(|k| format!("`{k}`"))
             .collect::<Vec<_>>()
             .join(", ");
-        out.push(Finding {
-            check: "reserved_keys",
-            severity: Severity::Error,
+        out.push(Finding::new(
+            "reserved_keys",
+            Severity::Error,
             subject,
-            message: format!(
+            format!(
                 "frontmatter claims the derived {} {listed} — kanspec computes {} from git and \
                  never writes {} into a file",
                 if keys.len() == 1 { "fact" } else { "facts" },
@@ -396,34 +400,37 @@ fn check_reserved_keys(s: &Snapshot) -> Vec<Finding> {
             ),
             // There is no verb for this on purpose (see the registry entry): naming the
             // file and the lines IS the one-command fix.
-            fix: format!("edit {} and delete the line(s) above", path.display()),
-            fixable: false,
-        });
-    };
-    for t in s.tickets.values() {
-        check(t.fm.id.to_string(), &t.path, reserved(&t.fm.extra));
-    }
-    for sp in s.specs.values() {
-        check(
-            format!("spec {}", sp.name),
-            &sp.path,
-            reserved(&sp.fm.extra),
-        );
-    }
-    for d in s.decisions.values() {
-        check(d.fm.id.to_string(), &d.path, reserved(&d.fm.extra));
-    }
-    for q in s.quirks.values() {
-        check(q.fm.id.to_string(), &q.path, reserved(&q.fm.extra));
-    }
-    for p in s.proposals.values() {
-        check(p.fm.id.to_string(), &p.dir, reserved(&p.fm.extra));
+            format!("edit {} and delete the line(s) above", path.display()),
+        ));
     }
     out
 }
 
+/// Every entity's frontmatter as `(subject, file, keys the schema did not claim)` — the one
+/// walk the two frontmatter checks share, so a new entity kind is added in one place and
+/// both checks name it the same way.
+fn frontmatters(s: &Snapshot) -> Vec<(String, &Path, &BTreeMap<String, serde_yaml_ng::Value>)> {
+    let mut v = Vec::new();
+    for t in s.tickets.values() {
+        v.push((t.fm.id.to_string(), &*t.path, &t.fm.extra));
+    }
+    for sp in s.specs.values() {
+        v.push((format!("spec {}", sp.name), &*sp.path, &sp.fm.extra));
+    }
+    for d in s.decisions.values() {
+        v.push((d.fm.id.to_string(), &*d.path, &d.fm.extra));
+    }
+    for q in s.quirks.values() {
+        v.push((q.fm.id.to_string(), &*q.path, &q.fm.extra));
+    }
+    for p in s.proposals.values() {
+        v.push((p.fm.id.to_string(), &*p.dir, &p.fm.extra));
+    }
+    v
+}
+
 /// Exactly `keys::RESERVED_DERIVED`, in its own order so two entities report identically.
-fn reserved(extra: &std::collections::BTreeMap<String, serde_yaml_ng::Value>) -> Vec<&'static str> {
+fn reserved(extra: &BTreeMap<String, serde_yaml_ng::Value>) -> Vec<&'static str> {
     RESERVED_DERIVED
         .iter()
         .copied()
@@ -449,56 +456,36 @@ fn reserved(extra: &std::collections::BTreeMap<String, serde_yaml_ng::Value>) ->
 /// text — see the module header.
 fn check_frontmatter_writable(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
-    let mut check =
-        |subject: String,
-         path: &std::path::Path,
-         extra: &std::collections::BTreeMap<String, serde_yaml_ng::Value>| {
-            for (k, v) in extra {
-                if !indexable(k) {
-                    out.push(Finding {
-                        check: "frontmatter_writable",
-                        severity: Severity::Error,
-                        subject: subject.clone(),
-                        message: format!(
-                            "frontmatter key `{k}` is not one kanspec can edit in place; the next \
+    for (subject, path, extra) in frontmatters(s) {
+        for (k, v) in extra {
+            if !indexable(k) {
+                out.push(Finding::new(
+                    "frontmatter_writable",
+                    Severity::Error,
+                    &subject,
+                    format!(
+                        "frontmatter key `{k}` is not one kanspec can edit in place; the next \
                          field update on this file would append a duplicate key"
-                        ),
-                        fix: format!(
-                            "edit {} and rewrite `{k}` as a plain `key: value`",
-                            path.display()
-                        ),
-                        fixable: false,
-                    });
-                }
-                if multiline(v) {
-                    out.push(Finding {
-                        check: "frontmatter_writable",
-                        severity: Severity::Warning,
-                        subject: subject.clone(),
-                        message: format!(
+                    ),
+                    format!(
+                        "edit {} and rewrite `{k}` as a plain `key: value`",
+                        path.display()
+                    ),
+                ));
+            }
+            if multiline(v) {
+                out.push(Finding::new(
+                    "frontmatter_writable",
+                    Severity::Warning,
+                    &subject,
+                    format!(
                         "the value of `{k}` spans more than one line; a surgical field update on \
                          this file will refuse rather than reformat it (R-9)"
                     ),
-                        fix: format!("edit {} and put `{k}` on one line", path.display()),
-                        fixable: false,
-                    });
-                }
+                    format!("edit {} and put `{k}` on one line", path.display()),
+                ));
             }
-        };
-    for t in s.tickets.values() {
-        check(t.fm.id.to_string(), &t.path, &t.fm.extra);
-    }
-    for sp in s.specs.values() {
-        check(format!("spec {}", sp.name), &sp.path, &sp.fm.extra);
-    }
-    for d in s.decisions.values() {
-        check(d.fm.id.to_string(), &d.path, &d.fm.extra);
-    }
-    for q in s.quirks.values() {
-        check(q.fm.id.to_string(), &q.path, &q.fm.extra);
-    }
-    for p in s.proposals.values() {
-        check(p.fm.id.to_string(), &p.dir, &p.fm.extra);
+        }
     }
     out
 }
@@ -529,33 +516,29 @@ fn multiline(v: &serde_yaml_ng::Value) -> bool {
 fn check_orphan_deps(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
     for t in s.tickets.values() {
+        let id = &t.fm.id;
         for dep in &t.fm.deps {
-            match s.tickets.get(dep) {
-                None => out.push(Finding {
-                    check: "orphan_deps",
-                    severity: Severity::Error,
-                    subject: t.fm.id.to_string(),
-                    message: format!(
-                        "dep {dep} does not exist — {} can never become ready",
-                        t.fm.id
+            let (severity, message) = match s.tickets.get(dep) {
+                None => (
+                    Severity::Error,
+                    format!("dep {dep} does not exist — {id} can never become ready"),
+                ),
+                Some(d) if d.fm.state == transitions::State::Dropped => (
+                    Severity::Warning,
+                    format!(
+                        "dep {dep} was dropped; it counts as satisfied (D-17), so {id} is \
+                         claimable on work that never happened"
                     ),
-                    fix: format!("kanspec show {}", t.fm.id),
-                    fixable: false,
-                }),
-                Some(d) if d.fm.state == transitions::State::Dropped => out.push(Finding {
-                    check: "orphan_deps",
-                    severity: Severity::Warning,
-                    subject: t.fm.id.to_string(),
-                    message: format!(
-                        "dep {dep} was dropped; it counts as satisfied (D-17), so {} is claimable \
-                         on work that never happened",
-                        t.fm.id
-                    ),
-                    fix: format!("kanspec show {}", t.fm.id),
-                    fixable: false,
-                }),
-                Some(_) => {}
-            }
+                ),
+                Some(_) => continue,
+            };
+            out.push(Finding::new(
+                "orphan_deps",
+                severity,
+                id,
+                message,
+                format!("kanspec show {id}"),
+            ));
         }
     }
     out
@@ -567,17 +550,16 @@ fn check_dep_cycles(s: &Snapshot) -> Vec<Finding> {
         .map(|cycle| {
             let ids: Vec<String> = cycle.iter().map(|i| i.to_string()).collect();
             let first = ids.first().cloned().unwrap_or_default();
-            Finding {
-                check: "dep_cycles",
-                severity: Severity::Error,
-                subject: first.clone(),
-                message: format!(
+            Finding::new(
+                "dep_cycles",
+                Severity::Error,
+                &first,
+                format!(
                     "dependency cycle: {} → {first} — every ticket on it is permanently blocked",
                     ids.join(" → ")
                 ),
-                fix: format!("kanspec show {first}"),
-                fixable: false,
-            }
+                format!("kanspec show {first}"),
+            )
         })
         .collect()
 }
@@ -595,94 +577,92 @@ fn check_dead_globs(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
     for (id, dead) in &s.git.decision_dead_globs {
         let total = s.decisions.get(id).map_or(0, |d| d.scope.len());
-        let all_dead = total > 0 && dead.len() >= total;
-        out.push(Finding {
-            check: "dead_globs",
-            severity: if all_dead {
-                Severity::Error
-            } else {
-                Severity::Warning
-            },
-            subject: format!("decision {id}"),
-            message: if all_dead {
-                format!(
-                    "EVERY scope glob matches no files: {} — this decision steers nothing in \
-                     full; `prime` lists it as a one-liner for every path and injects its \
-                     body for none",
-                    dead.join(", ")
-                )
-            } else {
-                format!("scope globs match no files: {}", dead.join(", "))
-            },
-            fix: format!("kanspec why {id}"),
-            fixable: false,
-        });
+        rot(
+            &mut out,
+            format!("decision {id}"),
+            total,
+            dead,
+            format!(
+                "EVERY scope glob matches no files: {} — this decision steers nothing in \
+                 full; `prime` lists it as a one-liner for every path and injects its \
+                 body for none",
+                dead.join(", ")
+            ),
+            format!("scope globs match no files: {}", dead.join(", ")),
+            format!("kanspec why {id}"),
+        );
     }
     for (id, dead) in &s.git.quirk_dead_globs {
         let total = s.quirks.get(id).map_or(0, |q| q.fm.paths.len());
-        let all_dead = total > 0 && dead.len() >= total;
-        out.push(Finding {
-            check: "dead_globs",
-            severity: if all_dead {
-                Severity::Error
-            } else {
-                Severity::Warning
-            },
-            subject: format!("quirk {id}"),
-            message: if all_dead {
-                format!(
-                    "EVERY path glob matches no files: {} — this quirk now warns nobody; \
-                     `prime` and the PostToolUse hook inject it for no path",
-                    dead.join(", ")
-                )
-            } else {
-                format!("path globs match no files: {}", dead.join(", "))
-            },
-            fix: format!("kanspec quirks --touch {}", dead[0]),
-            fixable: false,
-        });
+        rot(
+            &mut out,
+            format!("quirk {id}"),
+            total,
+            dead,
+            format!(
+                "EVERY path glob matches no files: {} — this quirk now warns nobody; \
+                 `prime` and the PostToolUse hook inject it for no path",
+                dead.join(", ")
+            ),
+            format!("path globs match no files: {}", dead.join(", ")),
+            format!(
+                "kanspec quirks --touch {}",
+                dead.first().map(String::as_str).unwrap_or_default()
+            ),
+        );
     }
     for (name, anchor) in &s.git.specs {
-        if anchor.dead_globs.is_empty() {
-            continue;
-        }
         // A spec that lost SOME globs still steers the files it kept; one that lost them
         // ALL steers nothing at all — `prime` injects none of its rules for any path, and
         // the staleness tripwire has nothing to count. That is indistinguishable from
         // having deleted the spec, and a refactor is how it happens: rename the one file a
         // spec names and its rules stop reaching the code they govern, silently.
-        //
-        // So the severity follows the damage. Warning while the spec is partially moored;
-        // Error once it is fully adrift, because at that point CI is the only thing left
-        // that will notice.
+        let dead = &anchor.dead_globs;
         let total = s.specs.get(name).map_or(0, |sp| sp.fm.code.len());
-        let all_dead = total > 0 && anchor.dead_globs.len() >= total;
-        out.push(Finding {
-            check: "dead_globs",
-            severity: if all_dead {
-                Severity::Error
-            } else {
-                Severity::Warning
-            },
-            subject: format!("spec {name}"),
-            message: if all_dead {
-                format!(
-                    "EVERY code glob matches no files: {} — this spec now steers nothing, \
-                     and `prime` injects none of its rules for any path",
-                    anchor.dead_globs.join(", ")
-                )
-            } else {
-                format!(
-                    "code globs match no files: {} — the staleness tripwire cannot fire for \
-                     this spec",
-                    anchor.dead_globs.join(", ")
-                )
-            },
-            fix: format!("kanspec spec show {name}"),
-            fixable: false,
-        });
+        rot(
+            &mut out,
+            format!("spec {name}"),
+            total,
+            dead,
+            format!(
+                "EVERY code glob matches no files: {} — this spec now steers nothing, \
+                 and `prime` injects none of its rules for any path",
+                dead.join(", ")
+            ),
+            format!(
+                "code globs match no files: {} — the staleness tripwire cannot fire for \
+                 this spec",
+                dead.join(", ")
+            ),
+            format!("kanspec spec show {name}"),
+        );
     }
     out
+}
+
+/// One rotted record, graded. Warning while the record is partially moored; Error once it
+/// is fully adrift (`dead` covers every glob it has), because at that point CI is the only
+/// thing left that will notice.
+fn rot(
+    out: &mut Vec<Finding>,
+    subject: String,
+    total: usize,
+    dead: &[String],
+    all_dead_msg: String,
+    some_dead_msg: String,
+    fix: String,
+) {
+    // `scan` records only rotted entries, but the cache is a plain file anyone can write:
+    // an empty list is nothing to report, never something to index into.
+    if dead.is_empty() {
+        return;
+    }
+    let (severity, message) = if total > 0 && dead.len() >= total {
+        (Severity::Error, all_dead_msg)
+    } else {
+        (Severity::Warning, some_dead_msg)
+    };
+    out.push(Finding::new("dead_globs", severity, subject, message, fix));
 }
 
 /// Every `[pN]` must be typed: `(temp until t-x)` dies when its guard ticket lands,
@@ -695,17 +675,16 @@ fn check_untyped_prescriptions(s: &Snapshot) -> Vec<Finding> {
             if !matches!(item.prescription, Some(Prescription::Untyped)) {
                 continue;
             }
-            out.push(Finding {
-                check: "untyped_prescriptions",
-                severity: Severity::Warning,
-                subject: p.fm.id.to_string(),
-                message: format!(
+            out.push(Finding::new(
+                "untyped_prescriptions",
+                Severity::Warning,
+                &p.fm.id,
+                format!(
                     "{} is an untyped prescription — say `(temp until t-x)` or `(promote: …)`",
                     item.id
                 ),
-                fix: format!("kanspec close {}", p.fm.id),
-                fixable: false,
-            });
+                format!("kanspec close {}", p.fm.id),
+            ));
         }
     }
     out
@@ -730,18 +709,17 @@ fn check_ledger_complete(s: &Snapshot) -> Vec<Finding> {
         if open.is_empty() {
             continue;
         }
-        out.push(Finding {
-            check: "ledger_complete",
-            severity: Severity::Error,
-            subject: p.fm.id.to_string(),
-            message: format!(
+        out.push(Finding::new(
+            "ledger_complete",
+            Severity::Error,
+            &p.fm.id,
+            format!(
                 "closed with {} undispositioned item(s): {}",
                 open.len(),
                 open.join(", ")
             ),
-            fix: format!("kanspec close {}", p.fm.id),
-            fixable: false,
-        });
+            format!("kanspec close {}", p.fm.id),
+        ));
     }
     out
 }
@@ -756,16 +734,18 @@ fn check_closed_agree(s: &Snapshot) -> Vec<Finding> {
             continue;
         }
         out.push(Finding {
-            check: "closed_agree",
-            severity: Severity::Error,
-            subject: p.fm.id.to_string(),
-            message: format!(
-                "says `status: closed` but still lives at {} — closed prose must be unreachable \
-                 (invariant 4)",
-                p.dir.display()
-            ),
-            fix: "kanspec doctor --fix".to_string(),
             fixable: true,
+            ..Finding::new(
+                "closed_agree",
+                Severity::Error,
+                &p.fm.id,
+                format!(
+                    "says `status: closed` but still lives at {} — closed prose must be \
+                     unreachable (invariant 4)",
+                    p.dir.display()
+                ),
+                "kanspec doctor --fix".to_string(),
+            )
         });
     }
     out
@@ -778,14 +758,13 @@ fn check_closed_agree(s: &Snapshot) -> Vec<Finding> {
 fn check_half_applied(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut broke = |subject: String, message: String, fix: String| {
-        out.push(Finding {
-            check: "half_applied",
-            severity: Severity::Error,
+        out.push(Finding::new(
+            "half_applied",
+            Severity::Error,
             subject,
             message,
             fix,
-            fixable: false,
-        });
+        ));
     };
 
     for t in s.tickets.values() {
@@ -894,19 +873,18 @@ fn check_duplicate_ids(s: &Snapshot) -> Vec<Finding> {
         if !s.closed_ids.contains(p.fm.id.as_str()) {
             continue;
         }
-        out.push(Finding {
-            check: "duplicate_ids",
-            severity: Severity::Error,
-            subject: p.fm.id.to_string(),
-            message: format!(
+        out.push(Finding::new(
+            "duplicate_ids",
+            Severity::Error,
+            &p.fm.id,
+            format!(
                 "{} is claimed by an open proposal at {} AND by one under proposals/closed/ — \
                  4 hex is 65,536 ids and the exclusion guarantee is per-machine (R-7)",
                 p.fm.id,
                 p.dir.display()
             ),
-            fix: format!("kanspec show {}", p.fm.id),
-            fixable: false,
-        });
+            format!("kanspec show {}", p.fm.id),
+        ));
     }
     out
 }
@@ -919,22 +897,20 @@ fn check_duplicate_ids(s: &Snapshot) -> Vec<Finding> {
 fn check_immutable_decisions(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
     for d in s.decisions.values() {
-        if d.fm.status == DecisionStatus::Accepted && d.fm.superseded_by.is_some() {
-            out.push(Finding {
-                check: "immutable_decisions",
-                severity: Severity::Error,
-                subject: d.fm.id.to_string(),
-                message: format!(
-                    "is still `status: accepted` while `superseded_by: {}` — it is binding agents \
-                     right now",
-                    d.fm.superseded_by
-                        .as_ref()
-                        .map(|i| i.to_string())
-                        .unwrap_or_default()
+        if d.fm.status != DecisionStatus::Accepted {
+            continue;
+        }
+        if let Some(by) = &d.fm.superseded_by {
+            out.push(Finding::new(
+                "immutable_decisions",
+                Severity::Error,
+                &d.fm.id,
+                format!(
+                    "is still `status: accepted` while `superseded_by: {by}` — it is binding \
+                     agents right now"
                 ),
-                fix: format!("kanspec supersede {} --with \"...\"", d.fm.id),
-                fixable: false,
-            });
+                format!("kanspec supersede {} --with \"...\"", d.fm.id),
+            ));
         }
     }
     out
@@ -1760,7 +1736,7 @@ mod tests {
 
     #[test]
     fn the_registry_ids_are_unique_and_every_entry_is_reachable() {
-        let mut ids = check_ids();
+        let mut ids: Vec<&str> = CHECKS.iter().map(|c| c.id).collect();
         let n = ids.len();
         ids.sort();
         ids.dedup();
