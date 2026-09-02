@@ -21,195 +21,47 @@ pub trait FmKey: Copy + PartialEq + 'static {
     fn as_str(self) -> &'static str;
 }
 
-/// Every writable ticket frontmatter key, in DESIGN.md's order.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TicketKey {
-    Id,
-    Title,
-    State,
-    Spec,
-    Proposal,
-    Item,
-    Deps,
-    FollowupOf,
-    DiscoveredIn,
-    Branch,
-    Worktree,
-    ClaimedBy,
-    Pr,
-    Head,
-    SpecUnchanged,
-    Created,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SpecKey {
-    Feature,
-    Code,
-    StaleAck,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProposalKey {
-    Id,
-    Title,
-    Status,
-    Specs,
-    Approved,
-    Ledger,
-    Created,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DecisionKey {
-    Id,
-    Title,
-    Status,
-    Date,
-    Source,
-    Scope,
-    Supersedes,
-    SupersededBy,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuirkKey {
-    Id,
-    Title,
-    Paths,
-    Severity,
-    Status,
-    Source,
-    FixedBy,
-}
-
-impl FmKey for TicketKey {
-    const ORDER: &'static [TicketKey] = &[
-        TicketKey::Id,
-        TicketKey::Title,
-        TicketKey::State,
-        TicketKey::Spec,
-        TicketKey::Proposal,
-        TicketKey::Item,
-        TicketKey::Deps,
-        TicketKey::FollowupOf,
-        TicketKey::DiscoveredIn,
-        TicketKey::Branch,
-        TicketKey::Worktree,
-        TicketKey::ClaimedBy,
-        TicketKey::Pr,
-        TicketKey::Head,
-        TicketKey::SpecUnchanged,
-        TicketKey::Created,
-    ];
-    fn as_str(self) -> &'static str {
-        match self {
-            TicketKey::Id => "id",
-            TicketKey::Title => "title",
-            TicketKey::State => "state",
-            TicketKey::Spec => "spec",
-            TicketKey::Proposal => "proposal",
-            TicketKey::Item => "item",
-            TicketKey::Deps => "deps",
-            TicketKey::FollowupOf => "followup_of",
-            TicketKey::DiscoveredIn => "discovered_in",
-            TicketKey::Branch => "branch",
-            TicketKey::Worktree => "worktree",
-            TicketKey::ClaimedBy => "claimed_by",
-            TicketKey::Pr => "pr",
-            TicketKey::Head => "head",
-            TicketKey::SpecUnchanged => "spec_unchanged",
-            TicketKey::Created => "created",
+/// One list per entity kind emits the enum, its `FmKey` impl and the `&[&str]` order
+/// constant, so the four could never disagree.
+macro_rules! fm_keys {
+    ($(#[$m:meta])* $name:ident, $order:ident { $($var:ident => $s:literal),+ $(,)? }) => {
+        $(#[$m])*
+        #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name { $($var),+ }
+        impl FmKey for $name {
+            const ORDER: &'static [$name] = &[$($name::$var),+];
+            fn as_str(self) -> &'static str {
+                match self { $($name::$var => $s),+ }
+            }
         }
-    }
+        pub const $order: &[&str] = &[$($s),+];
+    };
 }
 
-impl FmKey for SpecKey {
-    const ORDER: &'static [SpecKey] = &[SpecKey::Feature, SpecKey::Code, SpecKey::StaleAck];
-    fn as_str(self) -> &'static str {
-        match self {
-            SpecKey::Feature => "feature",
-            SpecKey::Code => "code",
-            SpecKey::StaleAck => "stale_ack",
-        }
+fm_keys!(
+    /// Every writable ticket frontmatter key, in DESIGN.md's order.
+    TicketKey, TICKET_ORDER {
+        Id => "id", Title => "title", State => "state", Spec => "spec", Proposal => "proposal",
+        Item => "item", Deps => "deps", FollowupOf => "followup_of",
+        DiscoveredIn => "discovered_in", Branch => "branch", Worktree => "worktree",
+        ClaimedBy => "claimed_by", Pr => "pr", Head => "head", SpecUnchanged => "spec_unchanged",
+        Created => "created",
     }
-}
-
-impl FmKey for ProposalKey {
-    const ORDER: &'static [ProposalKey] = &[
-        ProposalKey::Id,
-        ProposalKey::Title,
-        ProposalKey::Status,
-        ProposalKey::Specs,
-        ProposalKey::Approved,
-        ProposalKey::Ledger,
-        ProposalKey::Created,
-    ];
-    fn as_str(self) -> &'static str {
-        match self {
-            ProposalKey::Id => "id",
-            ProposalKey::Title => "title",
-            ProposalKey::Status => "status",
-            ProposalKey::Specs => "specs",
-            ProposalKey::Approved => "approved",
-            ProposalKey::Ledger => "ledger",
-            ProposalKey::Created => "created",
-        }
-    }
-}
-
-impl FmKey for DecisionKey {
-    const ORDER: &'static [DecisionKey] = &[
-        DecisionKey::Id,
-        DecisionKey::Title,
-        DecisionKey::Status,
-        DecisionKey::Date,
-        DecisionKey::Source,
-        DecisionKey::Scope,
-        DecisionKey::Supersedes,
-        DecisionKey::SupersededBy,
-    ];
-    fn as_str(self) -> &'static str {
-        match self {
-            DecisionKey::Id => "id",
-            DecisionKey::Title => "title",
-            DecisionKey::Status => "status",
-            DecisionKey::Date => "date",
-            DecisionKey::Source => "source",
-            DecisionKey::Scope => "scope",
-            DecisionKey::Supersedes => "supersedes",
-            DecisionKey::SupersededBy => "superseded_by",
-        }
-    }
-}
-
-impl FmKey for QuirkKey {
-    const ORDER: &'static [QuirkKey] = &[
-        QuirkKey::Id,
-        QuirkKey::Title,
-        QuirkKey::Paths,
-        QuirkKey::Severity,
-        QuirkKey::Status,
-        QuirkKey::Source,
-        QuirkKey::FixedBy,
-    ];
-    fn as_str(self) -> &'static str {
-        match self {
-            QuirkKey::Id => "id",
-            QuirkKey::Title => "title",
-            QuirkKey::Paths => "paths",
-            QuirkKey::Severity => "severity",
-            QuirkKey::Status => "status",
-            QuirkKey::Source => "source",
-            QuirkKey::FixedBy => "fixed_by",
-        }
-    }
-}
+);
+fm_keys!(SpecKey, SPEC_ORDER { Feature => "feature", Code => "code", StaleAck => "stale_ack" });
+fm_keys!(ProposalKey, PROPOSAL_ORDER {
+    Id => "id", Title => "title", Status => "status", Specs => "specs", Approved => "approved",
+    Ledger => "ledger", Created => "created",
+});
+fm_keys!(DecisionKey, DECISION_ORDER {
+    Id => "id", Title => "title", Status => "status", Date => "date", Source => "source",
+    Scope => "scope", Supersedes => "supersedes", SupersededBy => "superseded_by",
+});
+fm_keys!(QuirkKey, QUIRK_ORDER {
+    Id => "id", Title => "title", Paths => "paths", Severity => "severity", Status => "status",
+    Source => "source", FixedBy => "fixed_by",
+});
 
 /// The single key type that crosses a module boundary.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize)]
@@ -251,42 +103,6 @@ impl std::fmt::Display for Key {
     }
 }
 
-pub const TICKET_ORDER: &[&str] = &[
-    "id",
-    "title",
-    "state",
-    "spec",
-    "proposal",
-    "item",
-    "deps",
-    "followup_of",
-    "discovered_in",
-    "branch",
-    "worktree",
-    "claimed_by",
-    "pr",
-    "head",
-    "spec_unchanged",
-    "created",
-];
-pub const SPEC_ORDER: &[&str] = &["feature", "code", "stale_ack"];
-pub const PROPOSAL_ORDER: &[&str] = &[
-    "id", "title", "status", "specs", "approved", "ledger", "created",
-];
-pub const DECISION_ORDER: &[&str] = &[
-    "id",
-    "title",
-    "status",
-    "date",
-    "source",
-    "scope",
-    "supersedes",
-    "superseded_by",
-];
-pub const QUIRK_ORDER: &[&str] = &[
-    "id", "title", "paths", "severity", "status", "source", "fixed_by",
-];
-
 /// READ-side deny-list. A file that ARRIVES with `merged: true` — a hand-edit, an import,
 /// a bad merge — has no write path to blame, so `doctor` scans every entity's
 /// `#[serde(flatten)] extra` map against this.
@@ -309,19 +125,6 @@ pub const RESERVED_DERIVED: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn order_arrays_agree_with_the_enums() {
-        fn check<K: FmKey>(order: &[&str]) {
-            let from_enum: Vec<&str> = K::ORDER.iter().map(|k| k.as_str()).collect();
-            assert_eq!(from_enum, order);
-        }
-        check::<TicketKey>(TICKET_ORDER);
-        check::<SpecKey>(SPEC_ORDER);
-        check::<ProposalKey>(PROPOSAL_ORDER);
-        check::<DecisionKey>(DECISION_ORDER);
-        check::<QuirkKey>(QUIRK_ORDER);
-    }
 
     #[test]
     fn no_writable_key_is_a_derived_key() {
