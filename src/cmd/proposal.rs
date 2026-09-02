@@ -690,7 +690,34 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
                     });
                     continue;
                 }
+                // A `(promote: spec)` prescription ships the way a change does: as a rule
+                // bullet written on the implementing branch, carrying `{p-x#pN}`. The exact
+                // token is required — a bare `{p-x}` names the proposal, not the item, and
+                // a prescription is never handed the positional fallback a change gets.
+                if matches!(
+                    &i.prescription,
+                    Some(crate::model::Prescription::Promote(
+                        crate::model::PromoteAs::Spec
+                    ))
+                ) {
+                    if let Some(rule) = evidence.exact.get(&i.id.to_string()).cloned() {
+                        ledger.push(format!("{} shipped→{rule}", i.id));
+                        dispositions.push(Disposition::Shipped {
+                            item: i.id.clone(),
+                            rule,
+                        });
+                        continue;
+                    }
+                }
                 let fixes = match &i.prescription {
+                    // `promote --as spec` refuses by design (a rule is written, not minted),
+                    // so the advice must name the write, not the verb that bounces.
+                    Some(crate::model::Prescription::Promote(crate::model::PromoteAs::Spec)) => {
+                        vec![format!(
+                            "add `- [<spec>.<rule>] … {{{}}}` to .kanspec/specs/<spec>.md, then {} close {id}",
+                            i.id, ctx.invoked_as
+                        )]
+                    }
                     Some(crate::model::Prescription::Promote(kind)) => vec![format!(
                         "{} promote {} --as {} --scope \"src/**\"",
                         ctx.invoked_as,

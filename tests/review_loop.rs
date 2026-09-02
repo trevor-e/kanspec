@@ -220,6 +220,56 @@ fn close_refuses_to_drop_an_item_silently_and_names_the_command_per_item() {
 }
 
 #[test]
+fn a_promote_spec_prescription_ships_as_a_rule_carrying_its_exact_item_token() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n- [p1] (promote: spec) a lockout is always logged\n\n## Tickets\n",
+    );
+    repo.ks(["review", id]).ok();
+    repo.ks(["approve", id]).ok();
+
+    // The verb the old advice pointed at refuses by design, and says what to write.
+    let r = repo.ks(["promote", &format!("{id}#p1"), "--as", "spec"]);
+    assert_eq!(r.code, 1);
+    assert!(r.stderr.contains(&format!("{{{id}#p1}}")), "{}", r.stderr);
+
+    // A bare proposal token ships the CHANGE (positional) but never the prescription —
+    // a prescription is a specific promise, and only its own token can answer it.
+    let spec = repo.read(".kanspec/specs/auth.md");
+    repo.write(
+        ".kanspec/specs/auth.md",
+        &format!("{spec}- [auth.lockout] 5 failed logins lock the account. {{{id}}}\n"),
+    );
+    let r = repo.ks(["close", id]);
+    assert_eq!(r.code, 1, "{}", r.stdout);
+    assert!(r.stderr.contains("[p1]"), "{}", r.stderr);
+    assert!(
+        !r.stderr.contains("promote") || r.stderr.contains(&format!("{{{id}#p1}}")),
+        "the advice must not ring back to the refusing verb: {}",
+        r.stderr
+    );
+
+    // The exact item token is the disposition.
+    let spec = repo.read(".kanspec/specs/auth.md");
+    repo.write(
+        ".kanspec/specs/auth.md",
+        &format!("{spec}- [auth.lockout-logged] Every lockout is logged. {{{id}#p1}}\n"),
+    );
+    let done = repo.ks(["close", id]).ok();
+    assert!(
+        done.stdout.contains("p1 shipped→auth#auth.lockout-logged"),
+        "{}",
+        done.stdout
+    );
+    assert_eq!(repo.ks(["doctor"]).code, 0);
+}
+
+#[test]
 fn a_promoted_decision_lands_proposed_so_an_agent_never_self_accepts() {
     let repo = TestRepo::new();
     seed(&repo);

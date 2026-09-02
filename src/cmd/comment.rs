@@ -630,11 +630,12 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                 "promote_spec_ships_in_code",
                 format!(
                     "a spec rule is written on the branch that implements it, not minted \
-                     here — add the bullet with its {{{pid}}} token and `close` will \
+                     here — add the bullet with the exact item token {{{item}}} (a bare \
+                     {{{pid}}} names the proposal, not this prescription) and `close` will \
                      recognise {item} as shipped"
                 ),
                 fixes![
-                    fix!("add `- [<spec>.<rule>] … {{{pid}}}` in .kanspec/specs/"),
+                    fix!("add `- [<spec>.<rule>] … {{{item}}}` in .kanspec/specs/"),
                     fix!("{} rules --audit", ctx.invoked_as),
                     fix!("{} close {pid}", ctx.invoked_as),
                 ],
