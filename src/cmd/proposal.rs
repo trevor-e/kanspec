@@ -15,12 +15,12 @@ use crate::error::{KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{ItemRef, ProposalId, SpecName, TicketId};
 use crate::keys::{Key, ProposalKey};
+use crate::model::ProposalStatus;
 use crate::model::{Proposal, Snapshot};
 use crate::out::{glyph, Line};
+use crate::out::{Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::store::Store;
-use crate::model::ProposalStatus;
-use crate::out::{Render, Style};
 use crate::{fix, fixes};
 
 #[derive(Debug, Serialize)]
@@ -39,7 +39,12 @@ pub struct ProposeReport {
 /// The `[cN]`/`[pN]`/`[tN]` ids are VISIBLE TEXT because they are the comment anchors and
 /// the disposition keys; the scaffold seeds `c1` so the first bullet is written in the
 /// shape the rest of the machinery reads.
-fn scaffold(id: &ProposalId, title: &str, specs: &[SpecName], created: chrono::NaiveDate) -> String {
+fn scaffold(
+    id: &ProposalId,
+    title: &str,
+    specs: &[SpecName],
+    created: chrono::NaiveDate,
+) -> String {
     format!(
         "---\nid: {id}\ntitle: {}\nstatus: draft\nspecs: {}\napproved: null\nledger: []\n\
          created: {created}\n---\n\
@@ -94,8 +99,8 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
         plan.mint(EntityRef::Proposal(id));
         Ok(plan)
     })?;
-    let id = minted
-        .ok_or_else(|| KsError::internal(anyhow::anyhow!("`propose` minted no proposal")))?;
+    let id =
+        minted.ok_or_else(|| KsError::internal(anyhow::anyhow!("`propose` minted no proposal")))?;
 
     let after = ctx.snapshot()?;
     let path = after
@@ -107,9 +112,10 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
     Ok(ProposeReport {
         status: crate::model::ProposalStatus::Draft,
         path,
-        next: vec![
-            format!("edit the Changes bullets, then {} review {id}", ctx.invoked_as),
-        ],
+        next: vec![format!(
+            "edit the Changes bullets, then {} review {id}",
+            ctx.invoked_as
+        )],
         title: a.title.clone(),
         id,
     })
@@ -217,10 +223,7 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
         Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
             Ok(Plan::of(vec![Op::SetFields {
                 entity: EntityRef::Proposal(id.clone()),
-                sets: vec![(
-                    Key::Proposal(ProposalKey::Status),
-                    Yv::s("review"),
-                )],
+                sets: vec![(Key::Proposal(ProposalKey::Status), Yv::s("review"))],
             }]))
         })?;
     }
@@ -312,10 +315,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
             ),
             fixes![
                 fix!("{} comments {id} --unresolved", ctx.invoked_as),
-                fix!(
-                    "{} comment resolve <cm-id> --note \"...\"",
-                    ctx.invoked_as
-                ),
+                fix!("{} comment resolve <cm-id> --note \"...\"", ctx.invoked_as),
             ],
         ));
     }
@@ -341,7 +341,11 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         .filter(|t| t.fm.proposal.as_ref() == Some(&id))
         .count();
 
-    let stamp = format!("{} {}", ctx.now.format("%Y-%m-%dT%H:%MZ"), ctx.actor.label());
+    let stamp = format!(
+        "{} {}",
+        ctx.now.format("%Y-%m-%dT%H:%MZ"),
+        ctx.actor.label()
+    );
     let spec = p.fm.specs.first().map(ToString::to_string);
     let pid = id.clone();
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
@@ -639,8 +643,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
         // A `--followup` is dispositioned by THIS invocation: its ledger entry cannot be
         // written until the ticket is minted inside the transaction, so the gate has to
         // know about it from the command line, not from the ledger it is about to grow.
-        if crate::derive::dispositioned(&ledger, &i.id)
-            || followups.iter().any(|(f, _)| *f == i.id)
+        if crate::derive::dispositioned(&ledger, &i.id) || followups.iter().any(|(f, _)| *f == i.id)
         {
             continue;
         }
@@ -695,7 +698,10 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
                     )],
                     Some(crate::model::Prescription::TempUntil(t)) => vec![
                         format!("{} scan --confirm", ctx.invoked_as),
-                        format!("{} expire {} --reason \"{t} is not landing\"", ctx.invoked_as, i.id),
+                        format!(
+                            "{} expire {} --reason \"{t} is not landing\"",
+                            ctx.invoked_as, i.id
+                        ),
                     ],
                     // An untyped prescription is a close blocker BY DESIGN: nobody can say
                     // what it was supposed to become, which is exactly the silent drop this
@@ -801,9 +807,11 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     })?;
 
     for (item, _) in &followups {
-        if let Some(EntityRef::Ticket(t)) = done.minted.iter().find(|e| {
-            matches!(e, EntityRef::Ticket(_))
-        }) {
+        if let Some(EntityRef::Ticket(t)) = done
+            .minted
+            .iter()
+            .find(|e| matches!(e, EntityRef::Ticket(_)))
+        {
             dispositions.push(Disposition::Followup {
                 item: item.clone(),
                 ticket: t.clone(),
@@ -1019,17 +1027,16 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
         })
         .collect();
 
-    let context = p
-        .fm
-        .specs
-        .iter()
-        .filter_map(|n| s.specs.get(n))
-        .map(|sp| SpecContext {
-            spec: sp.name.clone(),
-            feature: sp.fm.feature.clone(),
-            rules: sp.rules.clone(),
-        })
-        .collect();
+    let context =
+        p.fm.specs
+            .iter()
+            .filter_map(|n| s.specs.get(n))
+            .map(|sp| SpecContext {
+                spec: sp.name.clone(),
+                feature: sp.fm.feature.clone(),
+                rules: sp.rules.clone(),
+            })
+            .collect();
 
     let open = unresolved(&s, p);
     Ok(ProposalPage {

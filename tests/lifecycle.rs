@@ -1248,7 +1248,10 @@ fn set_worktree_default(repo: &TestRepo, on: bool) {
     let cfg = repo.read(p);
     // Replace the key if it is there, append if not — a duplicate key is a TOML error,
     // and the fixture writes a minimal config rather than the full `init` scaffold.
-    let next = match cfg.lines().find(|l| l.trim_start().starts_with("worktree ")) {
+    let next = match cfg
+        .lines()
+        .find(|l| l.trim_start().starts_with("worktree "))
+    {
         Some(line) => cfg.replace(line, &format!("worktree = {on}")),
         None => format!("{cfg}\nworktree = {on}\n"),
     };

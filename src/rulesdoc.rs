@@ -15,9 +15,19 @@
 //! for: an agent working in `src/auth/` never pays for the billing quirks, but it is still
 //! told they exist.
 //!
+//! **The spec-rules budget** is the same bargain one level down. Full text is earned by a
+//! path match, but on a real corpus a single touched file can match several capabilities
+//! and a wide branch can match twenty (measured on an 83-spec / 666-rule repo: a median
+//! commit injects ~1.1k tokens of spec rules, the widest ~14.6k). So matched specs are
+//! RANKED — the most specific glob first, then the spec covering most of the touched paths
+//! — and shown in that order while `[prime] spec_budget_tokens` is unspent; every spec
+//! past the budget is still NAMED, with its rule count and the command that shows it.
+//! Nothing is hidden silently, the first-ranked spec always shows in full, and the budget
+//! lives here so `rules --path` and `prime` elide identically (invariant 3).
+//!
 //! Owner: **S6**.
 
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use crate::error::{KsError, Result};
@@ -35,6 +45,25 @@ pub const ADOPTED_TOKEN: &str = "{pre-kanspec}";
 pub struct Scope {
     pub paths: Vec<String>,
     set: GlobSet,
+    /// `paths`, compiled one by one, so [`Scope::rank`] can count WHICH paths an entity
+    /// reaches rather than only whether any did.
+    each: Vec<GlobMatcher>,
+}
+
+/// How strongly an entity's globs reach into a scope — what orders specs for the budget.
+/// Derived `Ord` is field order, so a plain `>` reads "more deserving of the budget":
+/// the more specific glob wins, and between equals the entity covering more of the touched
+/// paths does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct Rank {
+    /// The most specific glob that matched: leading literal segments, then whether the glob
+    /// names an exact path at all. `src/auth/login.ts` (3, exact) beats `src/auth/**`
+    /// (2, glob) beats `src/**` (1, glob): a spec that names the file is more this file's
+    /// spec than a spec that owns the directory.
+    pub specificity: (usize, bool),
+    /// How many of the scope's paths some glob matched — how much of the branch this
+    /// entity is about.
+    pub paths: usize,
 }
 
 impl Scope {
@@ -46,13 +75,17 @@ impl Scope {
             set: GlobSetBuilder::new()
                 .build()
                 .unwrap_or_else(|_| GlobSet::empty()),
+            each: Vec::new(),
         }
     }
 
     pub fn of(paths: &[String]) -> Result<Scope> {
         let mut b = GlobSetBuilder::new();
+        let mut each = Vec::with_capacity(paths.len());
         for p in paths {
-            b.add(compile(p)?);
+            let g = compile(p)?;
+            each.push(g.compile_matcher());
+            b.add(g);
         }
         let set = b.build().map_err(|e| {
             KsError::invalid(
@@ -63,6 +96,7 @@ impl Scope {
         Ok(Scope {
             paths: paths.to_vec(),
             set,
+            each,
         })
     }
 
@@ -99,23 +133,39 @@ impl Scope {
     /// `--path src/auth/login.ts` names a file while `--path "src/**"` names a glob, and a
     /// human typing either means the same question.
     pub fn touches(&self, globs: &[String]) -> bool {
+        self.rank(globs).is_some()
+    }
+
+    /// [`touches`](Scope::touches) with the strength of the overlap: `None` is no overlap
+    /// (so `touches` is exactly `rank(..).is_some()` — ONE definition of "in scope"), and a
+    /// `Some` carries what the budget sorts on. Same two-direction matching as before.
+    pub fn rank(&self, globs: &[String]) -> Option<Rank> {
         if self.paths.is_empty() || globs.is_empty() {
-            return false;
+            return None;
         }
-        if globs.iter().any(|g| self.set.is_match(g)) {
-            return true;
-        }
-        let mut b = GlobSetBuilder::new();
-        for g in globs {
-            // A rotted glob is `doctor`'s finding, not a reason to refuse an answer here.
-            if let Ok(g) = compile(g) {
-                b.add(g);
+        // A rotted glob is `doctor`'s finding, not a reason to refuse an answer here.
+        let theirs: Vec<(&str, GlobMatcher)> = globs
+            .iter()
+            .filter_map(|g| compile(g).ok().map(|c| (g.as_str(), c.compile_matcher())))
+            .collect();
+        let mut specificity: Option<(usize, bool)> = None;
+        let mut paths = 0usize;
+        for (p, mine) in self.paths.iter().zip(&self.each) {
+            let mut hit = false;
+            for (g, m) in &theirs {
+                if m.is_match(p) || mine.is_match(g) {
+                    hit = true;
+                    let s = glob_specificity(g);
+                    if specificity.is_none_or(|best| s > best) {
+                        specificity = Some(s);
+                    }
+                }
+            }
+            if hit {
+                paths += 1;
             }
         }
-        match b.build() {
-            Ok(set) => self.paths.iter().any(|p| set.is_match(p)),
-            Err(_) => false,
-        }
+        specificity.map(|specificity| Rank { specificity, paths })
     }
 
     /// Does an entity reach into this scope, counting **an entity with no globs at all as
@@ -135,6 +185,14 @@ impl Scope {
     pub fn is_unscoped(&self) -> bool {
         self.paths.is_empty()
     }
+}
+
+/// (leading literal segments, no wildcard anywhere). `src/auth/login.ts` → `(3, true)`;
+/// `src/auth/**` → `(2, false)`; `src/auth/Badge*` → `(2, false)`; `**` → `(0, false)`.
+fn glob_specificity(g: &str) -> (usize, bool) {
+    let wild = |s: &str| s.contains(['*', '?', '[', '{']);
+    let literal = g.split('/').take_while(|seg| !wild(seg)).count();
+    (literal, !wild(g))
 }
 
 /// `literal_separator` matches git's `:(glob)` semantics — `src/*.ts` is one directory
@@ -164,10 +222,27 @@ pub struct RulesDoc {
     pub decisions: Vec<StandingDecision>,
     /// ACTIVE only, path-matched
     pub quirks: Vec<StandingQuirk>,
-    /// with `{p-xxxx}` provenance tokens
+    /// with `{p-xxxx}` provenance tokens; matched specs in rank order, within the budget
     pub spec_rules: Vec<StandingRule>,
+    /// matched specs past the budget — NAMED, never silently dropped
+    pub elided: Vec<ElidedSpec>,
     pub counts: Counts,
 }
+
+/// A spec the scope matched whose rules the budget did not reach. It rides in the payload
+/// as one line — name, rule count, the command that shows it — so an agent is told what it
+/// was not shown, and `rules --full` lifts the budget for the human checking.
+#[derive(Debug, Clone, Serialize)]
+pub struct ElidedSpec {
+    pub spec: SpecName,
+    pub rules: usize,
+    pub rank: Rank,
+}
+
+/// The token estimate the budget is spent in. Four bytes per token is the usual English
+/// prose figure and errs on the generous side for the `[anchor]`-heavy lines here; the
+/// budget is a ceiling on context cost, not a promise of an exact count.
+pub const CHARS_PER_TOKEN: usize = 4;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StandingDecision {
@@ -208,8 +283,24 @@ pub struct Counts {
     pub capabilities: usize,
 }
 
-/// THE generator. `rules`, `rules --path`, and `prime` all call exactly this.
+/// THE generator. `rules`, `rules --path`, and `prime` all call exactly this, under the
+/// configured `[prime] spec_budget_tokens`.
 pub fn build(s: &Snapshot, scope: &Scope) -> RulesDoc {
+    let budget = match s.cfg.prime.spec_budget_tokens {
+        0 => None,
+        t => Some(t.saturating_mul(CHARS_PER_TOKEN)),
+    };
+    build_within(s, scope, budget)
+}
+
+/// `rules --full`: the same generator with the budget lifted. It is a separate entry
+/// point rather than a flag on [`build`] so that the injection path cannot reach it by
+/// accident — `prime` has no `--full`.
+pub fn build_full(s: &Snapshot, scope: &Scope) -> RulesDoc {
+    build_within(s, scope, None)
+}
+
+fn build_within(s: &Snapshot, scope: &Scope, budget_chars: Option<usize>) -> RulesDoc {
     let mut decisions = Vec::new();
     for d in s.decisions.values() {
         // PROPOSED is not standing: a pending decision sits in the YOU section of `status`
@@ -255,20 +346,51 @@ pub fn build(s: &Snapshot, scope: &Scope) -> RulesDoc {
     // Landmine before gotcha before debt: the thing that costs you an afternoon leads.
     quirks.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.id.cmp(&b.id)));
 
-    let mut spec_rules = Vec::new();
+    // Rank the matched specs: most specific glob first, then the one covering more of the
+    // touched paths, then name — so the order is a function of the corpus and the scope,
+    // never of `BTreeMap` iteration luck.
     let mut total_rules = 0usize;
+    let mut ranked: Vec<(Rank, &crate::model::Spec)> = Vec::new();
     for spec in s.specs.values() {
         total_rules += spec.rules.len();
-        if !scope.touches(&spec.fm.code) {
+        if spec.rules.is_empty() {
             continue;
         }
+        if let Some(rank) = scope.rank(&spec.fm.code) {
+            ranked.push((rank, spec));
+        }
+    }
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+    // The budget is SOFT and spent in rank order: a spec is shown while the budget is not
+    // yet spent, so the payload overshoots by at most one spec and the first-ranked spec
+    // always shows in full, however large. Skipping a big spec to fit a small one behind it
+    // would put a lesser match in front of an agent and hide the file's own spec — the
+    // opposite of what the ranking is for. Spent is measured in the RENDERED bytes, from
+    // the same line builders `render_text` uses, so the budget is a fact about the payload
+    // and not about a second estimate of it.
+    let mut spec_rules = Vec::new();
+    let mut elided = Vec::new();
+    let mut spent = 0usize;
+    for (rank, spec) in ranked {
+        if budget_chars.is_some_and(|b| spent >= b) {
+            elided.push(ElidedSpec {
+                spec: spec.name.clone(),
+                rules: spec.rules.len(),
+                rank,
+            });
+            continue;
+        }
+        spent += spec_line(&spec.name).len();
         for r in &spec.rules {
-            spec_rules.push(StandingRule {
+            let sr = StandingRule {
                 spec: spec.name.clone(),
                 anchor: r.anchor.clone(),
                 text: r.text.clone(),
                 provenance: r.provenance.clone(),
-            });
+            };
+            spent += rule_line(&sr).len();
+            spec_rules.push(sr);
         }
     }
 
@@ -282,7 +404,23 @@ pub fn build(s: &Snapshot, scope: &Scope) -> RulesDoc {
         decisions,
         quirks,
         spec_rules,
+        elided,
     }
+}
+
+/// The spec heading line, exactly as rendered — the budget is charged in these bytes.
+fn spec_line(name: &SpecName) -> String {
+    format!("  {name}\n")
+}
+
+/// One rule bullet, exactly as rendered — the budget is charged in these bytes.
+fn rule_line(r: &StandingRule) -> String {
+    let mut o = format!("   [{}] {}", r.anchor, r.text);
+    for p in &r.provenance {
+        o.push_str(&format!(" {{{p}}}"));
+    }
+    o.push('\n');
+    o
 }
 
 /// THE renderer — the ONLY way a `RulesDoc` becomes bytes.
@@ -345,14 +483,21 @@ pub fn render_text(d: &RulesDoc) -> String {
     let mut last: Option<&SpecName> = None;
     for r in &d.spec_rules {
         if last != Some(&r.spec) {
-            o.push_str(&format!("  {}\n", r.spec));
+            o.push_str(&spec_line(&r.spec));
             last = Some(&r.spec);
         }
-        o.push_str(&format!("   [{}] {}", r.anchor, r.text));
-        for p in &r.provenance {
-            o.push_str(&format!(" {{{p}}}"));
-        }
-        o.push('\n');
+        o.push_str(&rule_line(r));
+    }
+    // Past the budget: still NAMED. The line carries the count, the reason and the fix, so
+    // an agent knows what it was not shown and a human knows why the payload stopped.
+    for e in &d.elided {
+        o.push_str(&format!(
+            "  {} — {} rule{} not shown, over the prime budget → kanspec spec show {}\n",
+            e.spec,
+            e.rules,
+            if e.rules == 1 { "" } else { "s" },
+            e.spec,
+        ));
     }
 
     o.push_str("Nothing outside this list is served to agents. Closed proposals bind nothing.\n");
@@ -700,6 +845,182 @@ mod tests {
         s.specs.get_mut(&name).unwrap().rules[0].text =
             format!("Alert over 100/hr. {ADOPTED_TOKEN}");
         assert!(audit(&s, &d).iter().all(|x| !x.adoptable));
+    }
+
+    fn one_rule_spec(name: &str, code: &[&str]) -> Spec {
+        spec(
+            name,
+            code,
+            &[(
+                &format!("{name}.rule"),
+                "A rule of ordinary length, like the real ones.",
+            )],
+        )
+    }
+
+    fn scope(paths: &[&str]) -> Scope {
+        Scope::of(&paths.iter().map(|p| p.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn shown(d: &RulesDoc) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for r in &d.spec_rules {
+            let n = r.spec.to_string();
+            if out.last() != Some(&n) {
+                out.push(n);
+            }
+        }
+        out
+    }
+
+    fn named(d: &RulesDoc) -> Vec<String> {
+        d.elided.iter().map(|e| e.spec.to_string()).collect()
+    }
+
+    #[test]
+    fn a_glob_that_names_the_file_outranks_one_that_owns_the_directory() {
+        assert!(glob_specificity("src/auth/login.ts") > glob_specificity("src/auth/**"));
+        assert!(glob_specificity("src/auth/**") > glob_specificity("src/**"));
+        assert!(glob_specificity("src/auth/Badge*") > glob_specificity("src/**"));
+        assert_eq!(glob_specificity("src/auth/Badge*"), (2, false));
+        assert_eq!(glob_specificity("**"), (0, false));
+        assert_eq!(glob_specificity("src/auth/login.ts"), (3, true));
+    }
+
+    #[test]
+    fn matched_specs_rank_by_specificity_then_by_how_much_of_the_branch_they_cover() {
+        let mut s = snap();
+        for sp in [
+            one_rule_spec("wide", &["src/**"]),
+            one_rule_spec("dir", &["src/auth/**"]),
+            one_rule_spec("file", &["src/auth/login.ts"]),
+            one_rule_spec("two", &["src/auth/**", "src/billing/**"]),
+            one_rule_spec("elsewhere", &["docs/**"]),
+        ] {
+            s.specs.insert(sp.name.clone(), sp);
+        }
+        let d = build(&s, &scope(&["src/auth/login.ts", "src/billing/charge.ts"]));
+        // `file` names the file; `two` and `dir` are equally specific but `two` covers both
+        // touched paths; `wide` owns everything and so says the least about this branch.
+        assert_eq!(shown(&d), ["file", "two", "dir", "wide"]);
+        assert!(
+            named(&d).is_empty(),
+            "the default budget holds five one-liners"
+        );
+        assert_eq!(
+            s.specs
+                .values()
+                .filter(|x| scope(&["src/auth/login.ts"]).touches(&x.fm.code))
+                .count(),
+            4,
+            "`touches` is `rank(..).is_some()` — one definition of in-scope"
+        );
+    }
+
+    #[test]
+    fn the_budget_is_spent_in_rank_order_and_names_what_it_did_not_show() {
+        let mut s = snap();
+        for sp in [
+            one_rule_spec("wide", &["src/**"]),
+            one_rule_spec("dir", &["src/auth/**"]),
+            one_rule_spec("file", &["src/auth/login.ts"]),
+        ] {
+            s.specs.insert(sp.name.clone(), sp);
+        }
+        let sc = scope(&["src/auth/login.ts"]);
+
+        // One token: spent by the first spec, however small it is.
+        s.cfg.prime.spec_budget_tokens = 1;
+        let d = build(&s, &sc);
+        assert_eq!(shown(&d), ["file"], "the first-ranked spec always shows");
+        assert_eq!(
+            named(&d),
+            ["dir", "wide"],
+            "the rest are NAMED, in rank order"
+        );
+        assert_eq!(d.elided[0].rules, 1);
+        assert_eq!(
+            d.counts.spec_rules, 3,
+            "the corpus count is not the shown count"
+        );
+        let text = render_text(&d);
+        assert!(
+            text.contains(
+                "  dir — 1 rule not shown, over the prime budget → kanspec spec show dir\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("[file.rule]") && !text.contains("[dir.rule]"),
+            "{text}"
+        );
+
+        // Zero lifts it; so does `rules --full`, whatever the config says.
+        s.cfg.prime.spec_budget_tokens = 0;
+        assert_eq!(shown(&build(&s, &sc)), ["file", "dir", "wide"]);
+        s.cfg.prime.spec_budget_tokens = 1;
+        let full = build_full(&s, &sc);
+        assert_eq!(shown(&full), ["file", "dir", "wide"]);
+        assert!(full.elided.is_empty());
+        assert!(!render_text(&full).contains("not shown"));
+    }
+
+    #[test]
+    fn the_budget_is_soft_so_the_spec_that_crosses_it_still_shows_whole() {
+        let mut s = snap();
+        let first = one_rule_spec("file", &["src/auth/login.ts"]);
+        let second = spec(
+            "dir",
+            &["src/auth/**"],
+            &[
+                ("dir.a", "First of three."),
+                ("dir.b", "Second of three."),
+                ("dir.c", "Third of three."),
+            ],
+        );
+        let third = one_rule_spec("wide", &["src/**"]);
+        for sp in [first, second, third] {
+            s.specs.insert(sp.name.clone(), sp);
+        }
+        let sc = scope(&["src/auth/login.ts"]);
+
+        // The exact bytes the first spec renders to, so the budget lands INSIDE the second.
+        let alone = build(&s, &scope(&["src/auth/login.ts"]));
+        let first_bytes: usize = spec_line(&alone.spec_rules[0].spec).len()
+            + alone
+                .spec_rules
+                .iter()
+                .filter(|r| r.spec.as_str() == "file")
+                .map(|r| rule_line(r).len())
+                .sum::<usize>();
+        s.cfg.prime.spec_budget_tokens = first_bytes / CHARS_PER_TOKEN + 1;
+
+        let d = build(&s, &sc);
+        assert_eq!(
+            shown(&d),
+            ["file", "dir"],
+            "dir crossed the budget and still shows"
+        );
+        assert_eq!(
+            d.spec_rules
+                .iter()
+                .filter(|r| r.spec.as_str() == "dir")
+                .count(),
+            3,
+            "whole, not truncated mid-spec"
+        );
+        assert_eq!(named(&d), ["wide"]);
+    }
+
+    #[test]
+    fn a_rule_less_spec_is_neither_shown_nor_named() {
+        let mut s = corpus();
+        let empty = spec("scaffold", &["src/auth/**"], &[]);
+        s.specs.insert(empty.name.clone(), empty);
+        s.cfg.prime.spec_budget_tokens = 1;
+        let d = build(&s, &scope(&["src/auth/login.ts"]));
+        assert_eq!(shown(&d), ["auth"]);
+        assert!(named(&d).is_empty(), "nothing to show is nothing to elide");
     }
 
     #[test]

@@ -1359,7 +1359,11 @@ mod tests {
         let mut s = snap();
         // `partial` keeps one live glob; `adrift` keeps none.
         for (name, code, dead) in [
-            ("partial", vec!["a/**".to_string(), "b/**".to_string()], vec!["a/**"]),
+            (
+                "partial",
+                vec!["a/**".to_string(), "b/**".to_string()],
+                vec!["a/**"],
+            ),
             ("adrift", vec!["c/**".to_string()], vec!["c/**"]),
         ] {
             let sp = mk(name, code);

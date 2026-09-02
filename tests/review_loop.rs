@@ -72,10 +72,23 @@ fn propose_scaffolds_the_one_page_format_and_nothing_else() {
 #[test]
 fn a_proposal_directory_is_slugged_and_still_resolves_by_bare_id() {
     let repo = TestRepo::new();
-    repo.ks(["spec", "new", "auth", "--feature", "Login", "--code", "src/**"])
-        .ok();
-    repo.ks(["propose", "Move browser auth to HttpOnly cookies", "--spec", "auth"])
-        .ok();
+    repo.ks([
+        "spec",
+        "new",
+        "auth",
+        "--feature",
+        "Login",
+        "--code",
+        "src/**",
+    ])
+    .ok();
+    repo.ks([
+        "propose",
+        "Move browser auth to HttpOnly cookies",
+        "--spec",
+        "auth",
+    ])
+    .ok();
     let dir = only_proposal(&repo);
     assert!(
         dir.contains("-move-browser-auth-to-httponly-cookies"),
@@ -128,7 +141,11 @@ fn approve_refuses_while_a_thread_is_unresolved_and_resolving_it_is_the_waiver()
     let ok = repo.ks(["approve", id]).ok();
     assert!(ok.stdout.contains("approved"), "{}", ok.stdout);
     // `[tN]` bullets became real board tickets.
-    assert!(repo.ks(["ls"]).ok().stdout.contains("Rate-limit login endpoint"));
+    assert!(repo
+        .ks(["ls"])
+        .ok()
+        .stdout
+        .contains("Rate-limit login endpoint"));
     // Re-approving is refused rather than re-stamping and re-minting.
     assert_eq!(repo.ks(["approve", id]).code, 1);
 }
@@ -186,7 +203,12 @@ fn close_refuses_to_drop_an_item_silently_and_names_the_command_per_item() {
     let closed = repo.read(&format!(".kanspec/proposals/closed/{p}/proposal.md"));
     assert!(closed.contains("status: closed"), "{closed}");
     assert!(!repo.exists(&format!(".kanspec/proposals/{p}/proposal.md")));
-    assert_eq!(repo.ks(["doctor"]).code, 0, "{}", repo.ks(["doctor"]).stdout);
+    assert_eq!(
+        repo.ks(["doctor"]).code,
+        0,
+        "{}",
+        repo.ks(["doctor"]).stdout
+    );
     // Leftover scope became a VISIBLE board ticket, which is the whole point of followup.
     assert!(repo.ks(["ls"]).ok().stdout.contains("emit an event"));
 }
@@ -292,7 +314,11 @@ fn an_item_level_token_beats_the_positional_fallback() {
         done.stdout
     );
     // The token still counts as ordinary provenance, so nothing else has to know about it.
-    assert!(!repo.ks(["rules", "--audit"]).ok().stdout.contains("no provenance"));
+    assert!(!repo
+        .ks(["rules", "--audit"])
+        .ok()
+        .stdout
+        .contains("no provenance"));
 }
 
 /// …and the fallback still holds when nobody named an item: pair in order, and REFUSE for
@@ -351,10 +377,18 @@ fn the_review_page_carries_the_threads_the_badges_and_the_spec_as_it_stands() {
 
     assert_eq!(model.why, "credential stuffing hit staging");
     // The prescription markers become BADGES, and the text does not repeat them.
-    let p1 = model.items.iter().find(|i| i.kind == 'p' && i.id.n == 1).unwrap();
+    let p1 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 'p' && i.id.n == 1)
+        .unwrap();
     assert_eq!(p1.badge.as_deref(), Some("PROMOTE → decision"));
     assert!(!p1.text.contains("promote:"), "{}", p1.text);
-    let p2 = model.items.iter().find(|i| i.kind == 'p' && i.id.n == 2).unwrap();
+    let p2 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 'p' && i.id.n == 2)
+        .unwrap();
     assert!(p2.badge.as_deref().unwrap().starts_with("TEMP"), "{p2:?}");
 
     // The thread is attached to the item it targets, not to a flat list the page must sort.
@@ -367,7 +401,10 @@ fn the_review_page_carries_the_threads_the_badges_and_the_spec_as_it_stands() {
     // …and the spec as it stands today rides along, so the delta is reviewed against
     // current truth without opening a file.
     assert_eq!(model.context.len(), 1);
-    assert!(model.context[0].rules.iter().any(|r| r.anchor == "auth.jwt"));
+    assert!(model.context[0]
+        .rules
+        .iter()
+        .any(|r| r.anchor == "auth.jwt"));
 }
 
 /// `abandon` makes no claim that anything was dispositioned, so it must never stamp a
@@ -382,7 +419,10 @@ fn abandon_records_a_why_without_claiming_a_disposition() {
     let src = repo.read(&format!(".kanspec/proposals/{p}/proposal.md"));
     assert!(src.contains("status: abandoned"), "{src}");
     assert!(src.contains("superseded"), "{src}");
-    assert!(src.contains("ledger: []"), "an abandon dispositions nothing: {src}");
+    assert!(
+        src.contains("ledger: []"),
+        "an abandon dispositions nothing: {src}"
+    );
     assert!(!repo.exists(&format!(".kanspec/proposals/closed/{p}/proposal.md")));
     assert_eq!(repo.ks(["abandon", id, "--why", "again"]).code, 1);
 }
@@ -397,7 +437,10 @@ fn abandon_records_a_why_without_claiming_a_disposition() {
 fn spec_grep_missing_names_the_specs_with_no_matching_rule() {
     let repo = TestRepo::new();
     for (name, rule) in [
-        ("auth", "- [auth.tenant] Another household's session is 404."),
+        (
+            "auth",
+            "- [auth.tenant] Another household's session is 404.",
+        ),
         ("appearance", "- [appearance.accent] The accent is cobalt."),
     ] {
         repo.ks(["spec", "new", name, "--feature", "F", "--code", "src/**"])
@@ -414,9 +457,15 @@ fn spec_grep_missing_names_the_specs_with_no_matching_rule() {
     // The inverse names the OTHER one — and never the covered one.
     let missing = repo.ks(["spec", "grep", "tenant", "--missing"]).ok().stdout;
     assert!(missing.contains("appearance"), "{missing}");
-    assert!(!missing.contains("auth"), "a covered spec must not be listed: {missing}");
+    assert!(
+        !missing.contains("auth"),
+        "a covered spec must not be listed: {missing}"
+    );
     // A `--missing` row is about the SPEC, so it carries no rule anchor to render.
-    assert!(!missing.contains("[]"), "empty anchor leaked into the render: {missing}");
+    assert!(
+        !missing.contains("[]"),
+        "empty anchor leaked into the render: {missing}"
+    );
 }
 
 /// The reverse of the dead-glob check. `doctor` asks "does this glob match a file"; the
@@ -430,7 +479,13 @@ fn features_uncovered_names_tracked_files_no_spec_claims() {
     repo.git(&["add", "-A"]);
     repo.commit("add sources");
     repo.ks([
-        "spec", "new", "auth", "--feature", "F", "--code", "src/covered.rs",
+        "spec",
+        "new",
+        "auth",
+        "--feature",
+        "F",
+        "--code",
+        "src/covered.rs",
     ])
     .ok();
 
@@ -459,8 +514,16 @@ fn features_uncovered_names_tracked_files_no_spec_claims() {
 #[test]
 fn features_without_uncovered_still_renders_its_table() {
     let repo = TestRepo::new();
-    repo.ks(["spec", "new", "auth", "--feature", "Login", "--code", "src/**"])
-        .ok();
+    repo.ks([
+        "spec",
+        "new",
+        "auth",
+        "--feature",
+        "Login",
+        "--code",
+        "src/**",
+    ])
+    .ok();
     let out = repo.ks(["features"]).ok().stdout;
     assert!(out.contains("Login"), "{out}");
     assert!(!out.contains("claimed by a spec"), "{out}");

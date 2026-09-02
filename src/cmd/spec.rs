@@ -149,8 +149,7 @@ fn grep(ctx: &Ctx, pattern: &str, missing: bool) -> Result<SpecReport> {
         let mut absent: Vec<GrepHit> = Vec::new();
         for spec in snap.specs.values() {
             let covered = spec.rules.iter().any(|r| {
-                r.text.to_lowercase().contains(&needle)
-                    || r.anchor.to_lowercase().contains(&needle)
+                r.text.to_lowercase().contains(&needle) || r.anchor.to_lowercase().contains(&needle)
             });
             if !covered {
                 absent.push(GrepHit {

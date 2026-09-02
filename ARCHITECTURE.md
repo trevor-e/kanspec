@@ -1664,13 +1664,24 @@ impl Scope {
 #[derive(Serialize)] pub struct RulesDoc {
     pub decisions:  Vec<StandingDecision>,   // ACCEPTED only; full text iff scope matches
     pub quirks:     Vec<StandingQuirk>,      // ACTIVE only, path-matched
-    pub spec_rules: Vec<StandingRule>,       // with {p-xxxx} provenance tokens
+    pub spec_rules: Vec<StandingRule>,       // with {p-xxxx} provenance tokens; rank order, within budget
+    pub elided:     Vec<ElidedSpec>,         // matched specs past the budget — NAMED, never dropped
     pub counts:     Counts,
 }
-/// THE generator. `rules`, `rules --path`, and `prime` all call exactly this.
-/// PURE: `&Snapshot` cannot contain a closed proposal body, so invariant 4 is
+/// How strongly an entity's globs reach into a scope; `touches` is `rank(..).is_some()`.
+/// Ordered: most specific glob (leading literal segments, then exact-path) first, then
+/// the entity covering more of the scope's paths.
+pub struct Rank { pub specificity: (usize, bool), pub paths: usize }
+impl Scope { pub fn rank(&self, globs: &[String]) -> Option<Rank>; }
+
+/// THE generator. `rules`, `rules --path`, and `prime` all call exactly this, under
+/// `[prime] spec_budget_tokens` (0 = unlimited). Matched specs are shown in rank order
+/// while the budget is unspent — soft, so the first spec always shows whole — and named
+/// past it. PURE: `&Snapshot` cannot contain a closed proposal body, so invariant 4 is
 /// enforced by what the input TYPE can hold.
 pub fn build(s: &Snapshot, scope: &Scope) -> RulesDoc;
+/// `rules --full`: the budget lifted. A separate entry point so `prime` cannot reach it.
+pub fn build_full(s: &Snapshot, scope: &Scope) -> RulesDoc;
 
 /// THE renderer — the ONLY way a RulesDoc becomes bytes. `kanspec rules` writes
 /// exactly this and stops. `kanspec prime` writes exactly this, then "\n", then
@@ -2306,6 +2317,8 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-56 | `require`'s second fix was `allowed_slice(from)[0]`, which for a TERMINAL state names `Confirm` — a verb that bounces straight back. The advice chain never terminated. | **Fixed in `transitions::onward`.** A closed ticket is told the true final thing: look at what happened (`show`), or open a NEW ticket for the work that still wants doing. Both exit 0 on the spot, so the chain ends in a SUCCESS rather than merely giving up. Non-terminal refusals are byte-for-byte unchanged. The general lesson is recorded in D-57: runnability is a property of one arrow, termination is a property of the chain, and only the chain test finds a ring. |
 | D-57 | Two more non-terminating advice chains were found at integration, both outside the four fix agents' file lists. | **Both fixed in round F.** (1) `src/triage.rs` — the `done` gates each suggested the flag that answers THEM and dropped every answer already given, so `--no-followups` → `--no-quirks` → `--no-followups` rang for ever on the ORDINARY close-out of a genuinely merged ticket (verified against the real binary). Every suggestion is now built as *what you already said* + *this gate's answer* via a private `carried(a, adds)`. `adds` is load-bearing: `--spawn`/`--no-followups`, `--quirk`/`--no-quirks` and `--decision`/`--no-decisions` are declared `conflicts_with` in `cli.rs`, so carrying the negative into a suggestion that supplies the positive emits a command clap REFUSES — a worse failure than the ring, because it does not even parse. (2) `src/git.rs::worktree_add` offered three fixes the CLI rejects: `kanspec where {branch}` (`where` takes `--branch`) and `kanspec start --no-worktree` twice (no such flag; a worktree is opt-in via `--worktree`, so plain `start <id>` IS the no-worktree claim). All three sat a dozen lines from a `cmd/flow.rs` refusal that spells the same advice correctly. |
 | D-58 | Nothing parsed the fix strings raised OUTSIDE the transition layer, which is how the three `src/git.rs` commands in D-57 rotted unnoticed. | **Closed by a crate-wide guard**, `tests/cli_well_formed.rs::every_fix_that_names_kanspec_is_a_command_the_real_cli_accepts` (owner F). It extracts every `fix!("…")` literal under `src/` (skipping comment lines, so the doc comments that quote `fix!("kanspec …")` as prose are not mistaken for commands), substitutes each `{…}`/`<…>` hole by the flag it follows, and parses the result through the real `Cli::try_parse_from`. It fails RED on all three D-57 commands. Its declared boundary: it checks the SHAPE clap sees, not that the values are realistic, and it says nothing about whether following the arrows TERMINATES — that is the chain property D-56 covers. |
+
+| D-59 | On the first migrated corpus (83 specs, 666 rules) the path-scoped spec section had no ceiling: the median commit's touched files injected ~1.1k tokens, a quarter over 2.5k, the widest 36-file commit ~14.6k — into every SessionStart and PreCompact. The "~1.5k" in DESIGN.md was written before any corpus existed. | **A ranked, soft, named budget — in the generator.** `[prime] spec_budget_tokens` (default 2 000; `0` lifts it). Matched specs rank by `Scope::rank` — most specific glob first (a spec that names the file is more that file's spec than one that owns the directory), then coverage of the touched paths, then name — and are shown in that order while the budget is unspent, so the first spec always shows whole and the payload overshoots by at most one spec; strict order rather than first-fit, because skipping a big spec to fit a small one behind it would put a lesser match in front of the agent and hide the file's own spec. Everything past the budget is NAMED with its rule count and `kanspec spec show <name>`. Spent is measured in the bytes the renderer emits, via the same line builders. The budget lives in `rulesdoc::build` so `rules --path` and `prime` elide identically (invariant 3, now proved under a spent budget too); `rules --full` is the human's way past it and `prime` has no such flag by construction (`build_full` is a separate entry point). Measured after: the widest branches inject ~2.5–3.3k tokens; a single-file scope shows the file's three exact-match specs and names the directory-level one. |
 
 ### Known limits carried forward, stated out loud
 

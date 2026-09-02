@@ -647,14 +647,20 @@ fn adopt_stamps_the_pre_kanspec_bullet_so_the_audit_goes_quiet() {
     // The audit it existed to answer is now quiet…
     let audit = repo.ks(["rules", "--audit"]).ok();
     assert!(
-        audit.stdout.contains("every standing rule still points home"),
+        audit
+            .stdout
+            .contains("every standing rule still points home"),
         "{}",
         audit.stdout
     );
 
     // …and a second adopt is a no-op, not a second token.
     let again = repo.ks(["rules", "--adopt"]).ok();
-    assert!(again.stdout.contains("nothing left to adopt"), "{}", again.stdout);
+    assert!(
+        again.stdout.contains("nothing left to adopt"),
+        "{}",
+        again.stdout
+    );
     let after = std::fs::read_to_string(repo.root.join(".kanspec/specs/auth.md")).unwrap();
     assert_eq!(body, after, "adoption must be idempotent byte for byte");
 
@@ -668,7 +674,11 @@ fn adopt_stamps_the_pre_kanspec_bullet_so_the_audit_goes_quiet() {
 fn adopt_prints_only_its_summary_so_the_default_stdout_stays_the_injection_surface() {
     let repo = TestRepo::new();
     seed(&repo);
-    append_rule(&repo, "auth", "- [auth.oauth] GitHub OAuth is the only SSO.");
+    append_rule(
+        &repo,
+        "auth",
+        "- [auth.oauth] GitHub OAuth is the only SSO.",
+    );
     let r = repo.ks(["rules", "--adopt"]).ok();
     assert!(
         !r.stdout.contains("STANDING RULES"),
@@ -723,6 +733,52 @@ fn the_prime_payload_stays_inside_its_token_budget() {
             "prime{scope:?} is ≈{tokens} tokens, past the ~1.5k budget:\n{out}"
         );
     }
+}
+
+/// The budget is part of the generator, so `rules --path` and `prime` elide the same specs
+/// and print the same naming line — invariant 3 holds under a spent budget too. `--full`
+/// is the human's way past it and is deliberately absent from `prime`.
+#[test]
+fn a_spent_budget_names_what_it_did_not_show_identically_in_rules_and_prime() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let cfg = repo.read(".kanspec/config.toml");
+    assert!(
+        !cfg.contains("[prime]"),
+        "the harness config is the three-line minimum:\n{cfg}"
+    );
+    let tight = format!("{cfg}\n[prime]\nspec_budget_tokens = 1\n");
+    repo.write(".kanspec/config.toml", &tight);
+
+    let both = ["src/auth/login.ts", "src/billing/charge.ts"];
+    let r = repo.ks(with_paths("rules", &both)).ok().stdout;
+    let p = repo.ks(with_paths("prime", &both)).ok().stdout;
+    assert!(p.starts_with(&r), "--- rules ---\n{r}\n--- prime ---\n{p}");
+
+    // Equal specificity, one touched path each: name order. auth shows, billing is named.
+    assert!(r.contains("[auth.lockout]"), "{r}");
+    assert!(!r.contains("[billing.cents]"), "{r}");
+    assert!(
+        r.contains(
+            "  billing — 1 rule not shown, over the prime budget → kanspec spec show billing\n"
+        ),
+        "{r}"
+    );
+
+    let full = repo
+        .ks(["rules", "--full", "--path", both[0], "--path", both[1]])
+        .ok()
+        .stdout;
+    assert!(full.contains("[billing.cents]"), "{full}");
+    assert!(!full.contains("not shown"), "{full}");
+
+    let audit = repo.ks(["rules", "--full", "--audit"]);
+    assert_ne!(
+        audit.code, 0,
+        "--full is a rendering flag; --audit renders nothing"
+    );
+    let primed = repo.ks(["prime", "--full"]);
+    assert_ne!(primed.code, 0, "prime has no way past the budget");
 }
 
 #[test]

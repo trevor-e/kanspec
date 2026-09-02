@@ -1,9 +1,11 @@
-//! `rules [--path <file>] [--audit] [--adopt]`.
+//! `rules [--path <file>] [--full] [--audit] [--adopt]`.
 //!
 //! Invariant 3: this command's stdout is **byte-identical** to the standing-rules section
 //! of `kanspec prime`, because both call `rulesdoc::build` then `rulesdoc::render_text`
 //! and there is physically no second formatter. `tests/invariants_rules.rs` asserts it on
-//! the real binary, across several scopes.
+//! the real binary, across several scopes. `--full` is the one deliberate departure: it
+//! lifts the spec-rules budget for a human checking what the budget named but did not
+//! show, and `prime` has no such flag.
 //!
 //! Owner: **S6**.
 
@@ -38,7 +40,11 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
     ctx.require_initialized()?;
     let snap = ctx.snapshot()?;
     let scope = Scope::of(&a.paths)?;
-    let data = rulesdoc::build(&snap, &scope);
+    let data = if a.full {
+        rulesdoc::build_full(&snap, &scope)
+    } else {
+        rulesdoc::build(&snap, &scope)
+    };
     let warnings = if a.audit || a.adopt {
         rulesdoc::audit(&snap, &data)
     } else {
@@ -110,7 +116,10 @@ impl Render for RulesReport {
         // invariant 3 is about — exactly `render_text` and nothing else.
         if self.adopt {
             if self.adopted.is_empty() {
-                writeln!(w, " ✓ nothing left to adopt — every standing rule points home")?;
+                writeln!(
+                    w,
+                    " ✓ nothing left to adopt — every standing rule points home"
+                )?;
                 return Ok(());
             }
             writeln!(

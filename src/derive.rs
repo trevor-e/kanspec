@@ -296,8 +296,7 @@ pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
         // `Unknown` deliberately does NOT disqualify — a genuinely old close whose branch
         // was deleted and gc'd reads unknown forever, and flagging it would punish the
         // legitimate case to catch nothing the next rung does not already catch.
-        let contradicted =
-            merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::NotMerged);
+        let contradicted = merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::NotMerged);
         if !contradicted {
             return Some(CloseEvidence::Proof(sha.to_string()));
         }

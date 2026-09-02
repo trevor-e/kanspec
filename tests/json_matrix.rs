@@ -427,7 +427,11 @@ fn landcheck_never_blocks_a_clean_session() {
     let repo = TestRepo::new();
     seed(&repo);
     let r = repo.ks(["landcheck", "--json"]);
-    assert_ne!(r.code, 2, "a clean session must never be blocked:\n{}", r.stdout);
+    assert_ne!(
+        r.code, 2,
+        "a clean session must never be blocked:\n{}",
+        r.stdout
+    );
     assert_eq!(r.code, 0, "stderr:\n{}", r.stderr);
     // Opt-in per repo (D-14): with the hook off it is silent as well as clean.
     let dry = repo.ks(["landcheck", "--dry-run", "--json"]);

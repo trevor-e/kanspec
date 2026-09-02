@@ -313,6 +313,7 @@ async fn api_rules(State(st): State<AppState>) -> ApiResult<crate::cmd::rules::R
                     paths: Vec::new(),
                     audit: false,
                     adopt: false,
+                    full: false,
                 },
             )
         })

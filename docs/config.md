@@ -95,6 +95,29 @@ else `gh` when `gh` is authed, else none. A red build never moves a card. The re
 itself lands in v0.2; v0.1 parses the table and detects the provider so the config you
 write today keeps working.
 
+## `[prime]` — the injection budget
+
+```toml
+[prime]
+spec_budget_tokens = 2000   # spec rules `prime` injects, in tokens; 0 = no budget
+```
+
+`prime` (and `rules --path`, which is byte-identical to it) injects the rules of every spec
+whose `code:` globs touch the scoped paths. On a real corpus that is several specs per file
+and twenty on a wide branch — measured at ~14k tokens in the worst case, into every
+SessionStart and PreCompact. So matched specs are **ranked** — the spec whose glob names
+the file first, then the one covering the most touched paths, then name — and shown in that
+order while the budget is unspent. The budget is soft: the spec that crosses it still shows
+whole, so the first-ranked spec is never cut and the payload overshoots by at most one spec.
+Every spec past it is **named**, with its rule count and the command that shows it:
+
+```
+  assets — 19 rules not shown, over the prime budget → kanspec spec show assets
+```
+
+Tokens are estimated at four bytes each. `0` lifts the budget; so does `kanspec rules
+--full`, for a human checking what was named but not shown. `prime` has no such flag.
+
 ## `[hooks]`
 
 ```toml

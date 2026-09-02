@@ -38,6 +38,7 @@ pub struct Config {
     pub git: GitCfg,
     pub ci: CiCfg,
     pub hooks: HooksCfg,
+    pub prime: PrimeCfg,
 }
 
 impl Default for Config {
@@ -56,6 +57,31 @@ impl Default for Config {
             git: GitCfg::default(),
             ci: CiCfg::default(),
             hooks: HooksCfg::default(),
+            prime: PrimeCfg::default(),
+        }
+    }
+}
+
+/// The injection surface's context economy.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PrimeCfg {
+    /// The spec-rules budget of `prime` (and so of `rules --path`), in tokens at four
+    /// bytes each; `0` lifts it. Matched specs are shown in rank order while the budget is
+    /// unspent and named past it, so the payload overshoots by at most one spec.
+    ///
+    /// 2 000 is a floor on usefulness rather than a ceiling on cost: it fits a file's own
+    /// spec plus its neighbours on a 666-rule corpus, and trims the widest branches there
+    /// from ~14k tokens to ~2.5k. DESIGN.md's "~1.5k" was written before any corpus
+    /// existed; the number is a knob precisely because one repo's specs are another's
+    /// noise.
+    pub spec_budget_tokens: usize,
+}
+
+impl Default for PrimeCfg {
+    fn default() -> PrimeCfg {
+        PrimeCfg {
+            spec_budget_tokens: 2_000,
         }
     }
 }
@@ -290,6 +316,11 @@ api = "{hr_api}"
 
 [hooks]
 landcheck = {landcheck}         # the Stop hook. Opt-in; v0.2.
+
+[prime]
+spec_budget_tokens = {spec_budget}   # spec rules `prime` injects, in tokens; 0 = no budget.
+                                 # Matched specs show in rank order until it is spent;
+                                 # the rest are named. `rules --full` lifts it.
 "#,
             main = d.main,
             id_width = d.id_width,
@@ -315,6 +346,7 @@ landcheck = {landcheck}         # the Stop hook. Opt-in; v0.2.
             hr_db = d.ci.homerunner.db.display(),
             hr_api = d.ci.homerunner.api,
             landcheck = d.hooks.landcheck,
+            spec_budget = d.prime.spec_budget_tokens,
         )
     }
 
@@ -386,7 +418,8 @@ mod tests {
         assert_eq!(c.worktree, d.worktree);
         assert!(!d.worktree, "claiming in place stays the default");
         assert!(
-            text.lines().any(|l| l.trim_start().starts_with("worktree ")),
+            text.lines()
+                .any(|l| l.trim_start().starts_with("worktree ")),
             "the scaffold must carry the worktree knob:\n{text}"
         );
         assert_eq!(c.worktree_dir, d.worktree_dir);
@@ -399,6 +432,11 @@ mod tests {
         assert_eq!(c.git.gh, d.git.gh);
         assert_eq!(c.ci.provider, d.ci.provider);
         assert_eq!(c.hooks.landcheck, d.hooks.landcheck);
+        assert_eq!(c.prime.spec_budget_tokens, d.prime.spec_budget_tokens);
+        assert!(
+            text.contains("[prime]") && text.contains("spec_budget_tokens"),
+            "the scaffold must carry the budget knob, or nobody finds it:\n{text}"
+        );
     }
 
     #[test]

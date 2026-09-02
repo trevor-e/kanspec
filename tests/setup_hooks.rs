@@ -86,6 +86,8 @@ fn init_scaffolds_a_working_store_from_nothing() {
         "provider",
         "[hooks]",
         "landcheck",
+        "[prime]",
+        "spec_budget_tokens",
     ] {
         assert!(cfg.contains(knob), "config.toml never mentions {knob}");
     }

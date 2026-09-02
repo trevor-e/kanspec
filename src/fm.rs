@@ -1009,7 +1009,9 @@ Implement [auth.lockout].
             .body
             .contains("- [auth.jwt] Login issues a JWT valid 24h. {pre-kanspec}"));
         // the sibling rule is untouched, and the body still has the same line count
-        assert!(d.body.contains("- [auth.lockout] 5 failed logins lock the account. {p-7de2}\n"));
+        assert!(d
+            .body
+            .contains("- [auth.lockout] 5 failed logins lock the account. {p-7de2}\n"));
         assert_eq!(d.body.lines().count(), spec_doc().body.lines().count());
     }
 
@@ -1020,7 +1022,11 @@ Implement [auth.lockout].
         assert!(stamp_rule(&mut d, n, "auth.jwt", "{pre-kanspec}"));
         let once = d.render();
         assert!(stamp_rule(&mut d, n, "auth.jwt", "{pre-kanspec}"));
-        assert_eq!(once, d.render(), "a second stamp must not add a second token");
+        assert_eq!(
+            once,
+            d.render(),
+            "a second stamp must not add a second token"
+        );
     }
 
     /// The guard that makes a line number safe to carry in `Op::StampRule`: if the bullet
@@ -1030,7 +1036,10 @@ Implement [auth.lockout].
         let mut d = spec_doc();
         let n = line_of(&d, "auth.jwt");
         assert!(!stamp_rule(&mut d, n, "auth.lockout", "{pre-kanspec}"));
-        assert!(!stamp_rule(&mut d, 1, "auth.jwt", "{pre-kanspec}"), "# auth is not a bullet");
+        assert!(
+            !stamp_rule(&mut d, 1, "auth.jwt", "{pre-kanspec}"),
+            "# auth is not a bullet"
+        );
         assert!(!stamp_rule(&mut d, 9_999, "auth.jwt", "{pre-kanspec}"));
         assert!(!stamp_rule(&mut d, 0, "auth.jwt", "{pre-kanspec}"));
         assert_eq!(d.render(), SPEC, "a refused stamp must move no bytes");

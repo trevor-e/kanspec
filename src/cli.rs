@@ -520,6 +520,9 @@ pub struct RulesArgs {
     /// Adopt pre-kanspec spec rules that carry no provenance token
     #[arg(long)]
     pub adopt: bool,
+    /// Lift the `[prime] spec_budget_tokens` budget: every rule of every matched spec
+    #[arg(long, conflicts_with_all = ["audit", "adopt"])]
+    pub full: bool,
 }
 
 #[derive(Args, Debug)]

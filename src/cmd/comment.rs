@@ -146,7 +146,11 @@ pub fn fold_threads(p: &Proposal, ops: &[CommentOp]) -> (Vec<Thread>, Vec<Thread
             CommentOpKind::Reply => {
                 if let Some(t) = by_id.get_mut(&key) {
                     t.replies.push(Reply {
-                        by: op.by.clone().or_else(|| op.author.clone()).unwrap_or_default(),
+                        by: op
+                            .by
+                            .clone()
+                            .or_else(|| op.author.clone())
+                            .unwrap_or_default(),
                         body: op.body.clone().unwrap_or_default(),
                         at: op.at,
                     });
@@ -215,7 +219,10 @@ pub fn comments(ctx: &Ctx, a: &CommentsArgs) -> Result<CommentsReport> {
 
     let open = threads.iter().filter(|t| t.resolved.is_none()).count();
     let next = if open > 0 {
-        vec![format!("{} comment resolve <cm-id> --note \"...\"", ctx.invoked_as)]
+        vec![format!(
+            "{} comment resolve <cm-id> --note \"...\"",
+            ctx.invoked_as
+        )]
     } else {
         Vec::new()
     };
@@ -544,7 +551,10 @@ fn prescription<'a>(
         if s.closed_ids.contains(item.proposal.as_str()) {
             KsError::gate(
                 "proposal_closed",
-                format!("{} is closed — closed proposals bind nothing", item.proposal),
+                format!(
+                    "{} is closed — closed proposals bind nothing",
+                    item.proposal
+                ),
                 fixes![fix!("{} rules", ctx.invoked_as)],
             )
         } else {
@@ -666,7 +676,9 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                     crate::plan::EntityRef::Decision(d) => Some(d.clone()),
                     _ => None,
                 })
-                .ok_or_else(|| KsError::internal(anyhow::anyhow!("`promote` minted no decision")))?;
+                .ok_or_else(|| {
+                    KsError::internal(anyhow::anyhow!("`promote` minted no decision"))
+                })?;
             crate::project::regenerate(ctx)?;
             Ok(PromoteReport {
                 item,
