@@ -44,7 +44,7 @@ use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
 use crate::ids::TicketId;
 use crate::logentry::LOG_HEADING;
-use crate::model::{Snapshot, Spec, Ticket};
+use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Spec, Ticket};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::transitions::Verb;
 use crate::{fix, fixes};
@@ -831,7 +831,39 @@ pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<S
             .insert(name.clone(), spec_anchor(ctx, &main, spec));
     }
 
+    // Glob rot for the other two path-scoped records, recorded the same way — only the
+    // rotted globs, only for records that are standing. A revoked decision's scope and a
+    // fixed quirk's paths steer nobody, so their rot is nobody's finding.
+    for d in snap.decisions.values() {
+        if d.fm.status != DecisionStatus::Accepted {
+            continue;
+        }
+        let dead = dead_globs(&ctx.git, &d.scope);
+        if !dead.is_empty() {
+            state.decision_dead_globs.insert(d.fm.id.clone(), dead);
+        }
+    }
+    for q in snap.quirks.values() {
+        if q.fm.status != QuirkStatus::Active {
+            continue;
+        }
+        let dead = dead_globs(&ctx.git, &q.fm.paths);
+        if !dead.is_empty() {
+            state.quirk_dead_globs.insert(q.fm.id.clone(), dead);
+        }
+    }
+
     Ok((state, ScanToken(()), detections))
+}
+
+/// The globs among `globs` that match no tracked file — ONE definition, so a spec's
+/// `code:`, a decision's `scope:` and a quirk's `paths:` rot by the same test.
+fn dead_globs(git: &Git, globs: &[String]) -> Vec<String> {
+    globs
+        .iter()
+        .filter(|g| !glob_matches_anything(git, g))
+        .cloned()
+        .collect()
 }
 
 /// How many trailer-matched commits the fallback below will diff. A branch bigger than this
@@ -944,13 +976,7 @@ fn spec_anchor(ctx: &Ctx, main: &str, spec: &Spec) -> SpecAnchor {
         last_edit_sha: touch.as_ref().map(|(s, _)| s.as_str().to_string()),
         last_edit_at: touch.as_ref().map(|(_, at)| *at),
         merges_since,
-        dead_globs: spec
-            .fm
-            .code
-            .iter()
-            .filter(|g| !glob_matches_anything(&ctx.git, g))
-            .cloned()
-            .collect(),
+        dead_globs: dead_globs(&ctx.git, &spec.fm.code),
     }
 }
 

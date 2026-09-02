@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{KsError, Result};
 use crate::git::Method;
-use crate::ids::{SpecName, TicketId};
+use crate::ids::{DecisionId, QuirkId, SpecName, TicketId};
 use crate::paths::Layout;
 
 /// Bumped whenever a DTO below changes shape. A file stamped with anything else is
@@ -90,6 +90,12 @@ pub struct GitState {
     pub tickets: BTreeMap<TicketId, MergeFact>,
     pub branches: BTreeMap<TicketId, BranchFact>,
     pub specs: BTreeMap<SpecName, SpecAnchor>,
+    /// Glob rot beyond specs: an ACCEPTED decision's `scope:` globs that match zero
+    /// tracked files, keyed by id. Only rotted entries are recorded — an absent id is a
+    /// decision whose every glob is live (or one that is not standing).
+    pub decision_dead_globs: BTreeMap<DecisionId, Vec<String>>,
+    /// The same for an ACTIVE quirk's `paths:`.
+    pub quirk_dead_globs: BTreeMap<QuirkId, Vec<String>>,
 }
 
 impl Default for GitState {
@@ -102,6 +108,8 @@ impl Default for GitState {
             tickets: BTreeMap::new(),
             branches: BTreeMap::new(),
             specs: BTreeMap::new(),
+            decision_dead_globs: BTreeMap::new(),
+            quirk_dead_globs: BTreeMap::new(),
         }
     }
 }

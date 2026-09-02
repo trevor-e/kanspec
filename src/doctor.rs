@@ -118,11 +118,11 @@ pub static CHECKS: &[Check] = &[
     },
     Check {
         id: "dead_globs",
-        // Spec `code:` globs ONLY, and the string says so: `cache::SpecAnchor.dead_globs` is
-        // the only glob liveness `scan` records, and a registry that promises more than it
-        // checks is worse than one that checks less. Covering quirk `paths:` and decision
-        // `scope:` needs a scan-side change (a glob-liveness map in `GitState`) — v0.2.
-        about: "every spec `code:` glob matches at least one tracked file",
+        // All three path-scoped records: `scan` records liveness for a spec's `code:`
+        // (`SpecAnchor.dead_globs`), an accepted decision's `scope:` and an active quirk's
+        // `paths:` (`GitState.{decision,quirk}_dead_globs`), by one definition.
+        about: "every spec `code:`, decision `scope:` and quirk `paths:` glob matches at \
+                least one tracked file",
         run: check_dead_globs,
         fix: None,
     },
@@ -582,14 +582,66 @@ fn check_dep_cycles(s: &Snapshot) -> Vec<Finding> {
         .collect()
 }
 
-/// Glob rot. `scan` records which of a spec's `code:` globs matched zero files; nothing
-/// here re-walks the filesystem, because a check that shelled out would be a second, worse
-/// copy of `scan`.
+/// Glob rot. `scan` records which of a record's globs matched zero files; nothing here
+/// re-walks the filesystem, because a check that shelled out would be a second, worse copy
+/// of `scan`.
 ///
-/// Quirk `paths:` and decision `scope:` are NOT covered: the cache records glob liveness
-/// for specs only, so proving those needs a `scan`-side change (reported to F).
+/// Severity follows the damage, for all three kinds: a record that lost SOME globs still
+/// steers the files it kept (Warning); one that lost them ALL steers nothing — a quirk is
+/// never injected, a decision's body is never injected in full, a spec's rules reach no
+/// path — which is indistinguishable from having deleted it, and a rename is how it
+/// happens (Error, so CI notices).
 fn check_dead_globs(s: &Snapshot) -> Vec<Finding> {
     let mut out = Vec::new();
+    for (id, dead) in &s.git.decision_dead_globs {
+        let total = s.decisions.get(id).map_or(0, |d| d.scope.len());
+        let all_dead = total > 0 && dead.len() >= total;
+        out.push(Finding {
+            check: "dead_globs",
+            severity: if all_dead {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            subject: format!("decision {id}"),
+            message: if all_dead {
+                format!(
+                    "EVERY scope glob matches no files: {} — this decision steers nothing in \
+                     full; `prime` lists it as a one-liner for every path and injects its \
+                     body for none",
+                    dead.join(", ")
+                )
+            } else {
+                format!("scope globs match no files: {}", dead.join(", "))
+            },
+            fix: format!("kanspec why {id}"),
+            fixable: false,
+        });
+    }
+    for (id, dead) in &s.git.quirk_dead_globs {
+        let total = s.quirks.get(id).map_or(0, |q| q.fm.paths.len());
+        let all_dead = total > 0 && dead.len() >= total;
+        out.push(Finding {
+            check: "dead_globs",
+            severity: if all_dead {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            subject: format!("quirk {id}"),
+            message: if all_dead {
+                format!(
+                    "EVERY path glob matches no files: {} — this quirk now warns nobody; \
+                     `prime` and the PostToolUse hook inject it for no path",
+                    dead.join(", ")
+                )
+            } else {
+                format!("path globs match no files: {}", dead.join(", "))
+            },
+            fix: format!("kanspec quirks --touch {}", dead[0]),
+            fixable: false,
+        });
+    }
     for (name, anchor) in &s.git.specs {
         if anchor.dead_globs.is_empty() {
             continue;
@@ -1395,6 +1447,82 @@ mod tests {
             .unwrap()
             .message
             .contains("steers nothing"));
+    }
+
+    /// The same grading for the other two path-scoped records. A quirk whose every path
+    /// rotted is the worse case — a landmine that stopped warning — and a decision whose
+    /// every scope glob rotted is a body no session will ever be shown.
+    #[test]
+    fn a_decision_or_quirk_that_lost_every_glob_fails_ci_too() {
+        use crate::ids::{DecisionId, QuirkId};
+        use crate::model::{Decision, DecisionFm, Quirk, QuirkFm, Severity as Sev};
+        use chrono::NaiveDate;
+        let mut s = snap();
+        let scope = vec!["src/old/**".to_string(), "src/kept/**".to_string()];
+        let d = Decision {
+            fm: DecisionFm {
+                id: DecisionId::parse("D-1a2b").unwrap(),
+                title: "T".into(),
+                status: DecisionStatus::Accepted,
+                date: NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+                source: None,
+                scope: scope.clone(),
+                supersedes: None,
+                superseded_by: None,
+                extra: BTreeMap::new(),
+            },
+            path: PathBuf::from("x"),
+            body: String::new(),
+            scope,
+        };
+        s.decisions.insert(d.fm.id.clone(), d);
+        s.git.decision_dead_globs.insert(
+            DecisionId::parse("D-1a2b").unwrap(),
+            vec!["src/old/**".into()],
+        );
+        let q = Quirk {
+            fm: QuirkFm {
+                id: QuirkId::parse("q-3c4d").unwrap(),
+                title: "Landmine".into(),
+                paths: vec!["src/gone/**".into()],
+                severity: Sev::Landmine,
+                status: QuirkStatus::Active,
+                source: None,
+                fixed_by: None,
+                extra: BTreeMap::new(),
+            },
+            path: PathBuf::from("x"),
+            body: String::new(),
+        };
+        s.quirks.insert(q.fm.id.clone(), q);
+        s.git.quirk_dead_globs.insert(
+            QuirkId::parse("q-3c4d").unwrap(),
+            vec!["src/gone/**".into()],
+        );
+
+        let f = check_dead_globs(&s);
+        let by = |needle: &str| {
+            f.iter()
+                .find(|x| x.subject.contains(needle))
+                .unwrap_or_else(|| panic!("no finding for {needle}"))
+        };
+        assert_eq!(
+            by("D-1a2b").severity,
+            Severity::Warning,
+            "one live glob remains"
+        );
+        assert_eq!(
+            by("q-3c4d").severity,
+            Severity::Error,
+            "warns nobody: CI fails"
+        );
+        assert!(by("q-3c4d").message.contains("warns nobody"));
+        assert!(by("q-3c4d").fix.contains("quirks --touch"));
+
+        // Nothing recorded, nothing found — the cache carries only rotted entries.
+        s.git.decision_dead_globs.clear();
+        s.git.quirk_dead_globs.clear();
+        assert!(check_dead_globs(&s).is_empty());
     }
 
     #[test]
