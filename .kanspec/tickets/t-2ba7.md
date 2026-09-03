@@ -1,16 +1,16 @@
 ---
 id: t-2ba7
 title: 'prime ranking: a broad-glob spec must not outrank a specific match on coverage'
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-2ba7-prime-ranking-a-broad-glob-spec-must-not
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ In the trial the 52-rule `tasks` spec outranked the relevant 16-rule `materializ
 
 ## Log
 - 2026-09-02T03:50Z  todo     trevor                new
+- 2026-09-03T03:12Z  doing    noreply               start (branch created)
