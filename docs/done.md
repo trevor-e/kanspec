@@ -60,7 +60,12 @@ spec owns and you did not edit that spec, it asks for one of:
 
 - the spec edit (the normal answer — specs are edited on the implementation branch and
   reviewed in the PR like code), or
-- `--spec-unchanged "reason"`, recorded on the ticket and visible on the board.
+- `--spec-unchanged "<spec>:<reason>"`, recorded on the ticket and visible on the board.
+
+The gate names every uncovered spec on its own line with the glob that caught it, and takes
+one answer per spec. A bare reason is accepted only when exactly one spec is uncovered; over
+several it is refused as a blanket, so a real change in one of five specs matched through
+broad globs cannot hide behind one answer for all of them.
 
 Then the two one-key captures, while the burn is fresh: quirks discovered, decisions made.
 Both are skippable and every skip is auditable.
@@ -80,7 +85,7 @@ close-out is prompted rather than remembered.
 ```
 kanspec done t-9c41 --json \
   --spawn "test concurrent same-key requests" \
-  --no-quirks --spec-unchanged "refactor only, no behaviour change"
+  --no-quirks --spec-unchanged "auth:refactor only, no behaviour change"
 ```
 
 Everything the interactive prompts collect has a flag, and both front doors build the same

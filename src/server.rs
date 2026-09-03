@@ -373,7 +373,7 @@ pub struct DoneBody {
     #[serde(default)]
     pub no_followups: bool,
     #[serde(default)]
-    pub spec_unchanged: Option<String>,
+    pub spec_unchanged: Vec<String>,
     #[serde(default)]
     pub quirk: Vec<String>,
     #[serde(default)]

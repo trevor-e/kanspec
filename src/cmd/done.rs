@@ -490,15 +490,16 @@ impl Render for DoneReport {
                 join(specs, ", "),
                 glyph::OK
             )?,
-            SpecCheck::Unchanged { why } => writeln!(
+            SpecCheck::Unchanged { waivers } => writeln!(
                 w,
                 "Knowledge check — branch touched {}: spec unchanged, recorded on the \
-                 ticket — {why}",
+                 ticket — {}",
                 if self.spec_globs.is_empty() {
                     "no spec's code".to_string()
                 } else {
                     self.spec_globs.join(", ")
-                }
+                },
+                join(waivers, " · ")
             )?,
             SpecCheck::NotApplicable => {}
         }

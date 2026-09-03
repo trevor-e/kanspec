@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::cli::DoneArgs;
 use crate::error::{KsError, Result};
 use crate::git::ChangedPath;
-use crate::ids::SpecName;
+use crate::ids::{SpecName, TicketId};
 use crate::model::{Severity, Snapshot, Step, Ticket};
 use crate::{fix, fixes};
 
@@ -68,12 +68,30 @@ pub enum SpecCheck {
     EditedOnBranch {
         specs: Vec<SpecName>,
     },
-    /// the recorded `--spec-unchanged` waiver, visible on the board
+    /// the recorded `--spec-unchanged` waivers, one per spec, visible on the board
     Unchanged {
-        why: String,
+        waivers: Vec<SpecWaiver>,
     },
     /// the branch touched no spec's globs
     NotApplicable,
+}
+
+/// One `--spec-unchanged "<spec>:<reason>"`. The spec is `None` only for a reason offered
+/// where nothing demanded one — recorded anyway, because an explicit "no behaviour change"
+/// is never worse than silence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpecWaiver {
+    pub spec: Option<SpecName>,
+    pub why: String,
+}
+
+impl std::fmt::Display for SpecWaiver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.spec {
+            Some(s) => write!(f, "{s}: {}", self.why),
+            None => write!(f, "{}", self.why),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,10 +171,14 @@ fn carried(a: &DoneArgs, adds: &[&str]) -> String {
     for n in &a.actually_done {
         f.push(format!("--actually-done {n}"));
     }
-    for (name, v) in [("--spec-unchanged", &a.spec_unchanged), ("--why", &a.why)] {
-        if let Some(v) = v {
-            f.push(format!("{name} \"{v}\""));
+    // A blanket `--spec-unchanged` being replaced by per-spec ones must not ride along.
+    if !adds.contains(&"--spec-unchanged") {
+        for v in &a.spec_unchanged {
+            f.push(format!("--spec-unchanged \"{v}\""));
         }
+    }
+    if let Some(v) = &a.why {
+        f.push(format!("--why \"{v}\""));
     }
     if f.is_empty() {
         String::new()
@@ -226,7 +248,7 @@ impl Triage {
         let steps = steps_from_args(t, a)?;
         let quirks = quirks_from_args(t, a)?;
         let decisions = decisions_from_args(a, touched, s);
-        let spec = spec_check(t, a.spec_unchanged.as_deref(), touched, s, a)?;
+        let spec = spec_check(t, &a.spec_unchanged, touched, s, a)?;
         assemble(t, steps, quirks, decisions, spec, a)
     }
 
@@ -277,36 +299,39 @@ impl Triage {
         }
 
         // ── the knowledge checkpoint ─────────────────────────────────────────
-        let matched = specs_matching(touched, s);
-        let spec = match spec_check(t, a.spec_unchanged.as_deref(), touched, s, a) {
-            Ok(c) => {
-                if let SpecCheck::EditedOnBranch { specs } = &c {
-                    io.say(&format!(
-                        "Knowledge check — branch touched {} (spec: {}): spec edited on this branch ✓",
-                        globs_of_specs(&matched, s).join(", "),
-                        names(specs)
-                    ))?;
-                }
-                c
-            }
-            // The one refusal a prompt can discharge: the spec was not edited and no
-            // reason was passed, so ask for one. Empty stays a refusal — a waiver with no
-            // reason is the "fourth option" this gate exists to remove.
-            Err(e) => {
+        // Flags answer first; a flag that is itself wrong (a blanket reason over several
+        // specs, a spec the branch never touched) is refused here exactly as it would be
+        // non-interactively. Then one question per spec still uncovered — never one answer
+        // for all of them (t-852e).
+        let st = spec_state(touched, s);
+        let mut waivers = parse_waivers(&t.fm.id, &a.spec_unchanged, &st, touched, s, a)?;
+        let remaining = st.remaining(&waivers);
+        if remaining.is_empty() {
+            if let SpecCheck::EditedOnBranch { specs } = st.resolve(&waivers) {
                 io.say(&format!(
-                    "Knowledge check — branch touched {} (spec: {}): spec NOT edited on this branch",
-                    globs_of_specs(&matched, s).join(", "),
-                    names(&matched)
+                    "Knowledge check — branch touched {} (spec: {}): spec edited on this branch ✓",
+                    globs_of_specs(&st.matched, s).join(", "),
+                    names(&specs)
                 ))?;
-                let why = io.ask("  spec unchanged — why? ")?;
-                if why.trim().is_empty() {
-                    return Err(e);
-                }
-                SpecCheck::Unchanged {
-                    why: why.trim().to_string(),
-                }
             }
-        };
+        }
+        for name in &remaining {
+            io.say(&format!(
+                "Knowledge check — branch touched {} (spec: {name}): spec NOT edited on this branch",
+                where_matched(name, touched, s)
+            ))?;
+            // Empty stays a refusal — a waiver with no reason is the "fourth option" this
+            // gate exists to remove.
+            let why = io.ask(&format!("  {name} unchanged — why? "))?;
+            if why.trim().is_empty() {
+                return Err(uncovered(&t.fm.id, &st, &waivers, touched, s, a));
+            }
+            waivers.push(SpecWaiver {
+                spec: Some(name.clone()),
+                why: why.trim().to_string(),
+            });
+        }
+        let spec = st.resolve(&waivers);
 
         // ── one-key capture, while the burn is fresh ─────────────────────────
         let default = default_scope(touched, s);
@@ -372,10 +397,17 @@ impl Triage {
             .collect()
     }
 
-    /// The `--spec-unchanged` waiver, if this triage recorded one.
-    pub fn spec_unchanged(&self) -> Option<&str> {
+    /// The `--spec-unchanged` waivers this triage recorded, as the one line the ticket
+    /// carries: `auth: refactor only · billing: no behaviour change`.
+    pub fn spec_unchanged(&self) -> Option<String> {
         match &self.spec {
-            SpecCheck::Unchanged { why } => Some(why),
+            SpecCheck::Unchanged { waivers } if !waivers.is_empty() => Some(
+                waivers
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+            ),
             _ => None,
         }
     }
@@ -654,55 +686,232 @@ fn decisions_from_args(a: &DoneArgs, touched: &[ChangedPath], s: &Snapshot) -> V
 }
 
 /// DESIGN's anti-rot gear 2: the branch touched a spec's `code:` globs, so either the spec
-/// moved with it or somebody said out loud why it did not.
+/// moved with it or somebody said out loud why it did not — per spec, so a real change in
+/// one of five cannot hide behind one blanket answer (t-852e).
 fn spec_check(
     t: &Ticket,
-    waiver: Option<&str>,
+    raw: &[String],
     touched: &[ChangedPath],
     s: &Snapshot,
     // The answers already supplied — this gate is reached last of all. See [`carried`].
     a: &DoneArgs,
 ) -> Result<SpecCheck> {
     let id = &t.fm.id;
+    let st = spec_state(touched, s);
+    let waivers = parse_waivers(id, raw, &st, touched, s, a)?;
+    if st.remaining(&waivers).is_empty() {
+        return Ok(st.resolve(&waivers));
+    }
+    Err(uncovered(id, &st, &waivers, touched, s, a))
+}
+
+/// What the branch did to the specs whose code it touched.
+struct SpecState {
+    /// specs whose `code:` globs the branch's changed paths fall inside
+    matched: Vec<SpecName>,
+    /// of those, and any other, the specs whose file the branch edited
+    edited: Vec<SpecName>,
+    /// matched but not edited — each owed a spec edit or a waiver
+    unedited: Vec<SpecName>,
+}
+
+impl SpecState {
+    /// The unedited specs no waiver answers for.
+    fn remaining(&self, waivers: &[SpecWaiver]) -> Vec<SpecName> {
+        self.unedited
+            .iter()
+            .filter(|n| !waivers.iter().any(|w| w.spec.as_ref() == Some(n)))
+            .cloned()
+            .collect()
+    }
+
+    /// The check's outcome once nothing remains. A waiver is recorded whenever it was
+    /// offered, even where nothing demanded it: an explicit "no behaviour change" on the
+    /// ticket is never worse than silence.
+    fn resolve(&self, waivers: &[SpecWaiver]) -> SpecCheck {
+        if !waivers.is_empty() {
+            return SpecCheck::Unchanged {
+                waivers: waivers.to_vec(),
+            };
+        }
+        if self.matched.is_empty() && self.edited.is_empty() {
+            return SpecCheck::NotApplicable;
+        }
+        SpecCheck::EditedOnBranch {
+            specs: self.edited.clone(),
+        }
+    }
+}
+
+fn spec_state(touched: &[ChangedPath], s: &Snapshot) -> SpecState {
     let matched = specs_matching(touched, s);
     let edited = specs_edited(touched, s);
-
-    // A waiver is recorded whenever it is offered, even where nothing demanded it: an
-    // explicit "no behaviour change" on the ticket is never worse than silence.
-    if let Some(why) = waiver.map(str::trim).filter(|w| !w.is_empty()) {
-        return Ok(SpecCheck::Unchanged {
-            why: why.to_string(),
-        });
-    }
-    if matched.is_empty() && edited.is_empty() {
-        return Ok(SpecCheck::NotApplicable);
-    }
-    let unedited: Vec<SpecName> = matched
+    let unedited = matched
         .iter()
         .filter(|n| !edited.contains(n))
         .cloned()
         .collect();
-    if unedited.is_empty() {
-        return Ok(SpecCheck::EditedOnBranch { specs: edited });
+    SpecState {
+        matched,
+        edited,
+        unedited,
     }
+}
 
-    let first = &unedited[0];
-    Err(KsError::gate(
+/// `--spec-unchanged` × N into typed waivers. `<spec>:<reason>` names its spec; a bare
+/// reason is taken for the one unedited spec when there is exactly one, and refused when
+/// there are several — that is the blanket answer a real change hides behind.
+fn parse_waivers(
+    id: &TicketId,
+    raw: &[String],
+    st: &SpecState,
+    touched: &[ChangedPath],
+    s: &Snapshot,
+    a: &DoneArgs,
+) -> Result<Vec<SpecWaiver>> {
+    let mut out: Vec<SpecWaiver> = Vec::new();
+    for r in raw {
+        let r = r.trim();
+        let named = r
+            .split_once(':')
+            .and_then(|(n, why)| SpecName::parse(n.trim()).ok().map(|n| (n, why.trim())))
+            .filter(|(n, _)| s.specs.contains_key(n));
+        let (spec, why) = match named {
+            Some((n, why)) => {
+                if !st.matched.contains(&n) {
+                    return Err(KsError::invalid(
+                        format!(
+                            "{id}: --spec-unchanged names {n}, but the branch touched none of its code (touched: {})",
+                            names(&st.matched)
+                        ),
+                        fixes![fix!(
+                            "kanspec done {id}{}{}",
+                            carried(a, &["--spec-unchanged"]),
+                            per_spec_flags(&st.unedited, "no behaviour change")
+                        )],
+                    ));
+                }
+                (Some(n), why)
+            }
+            None => match st.unedited.as_slice() {
+                [one] => (Some(one.clone()), r),
+                [] => (None, r),
+                many => {
+                    return Err(KsError::gate(
+                        "spec_unchanged_blanket",
+                        format!(
+                            "{id}: --spec-unchanged \"{r}\" answers for {} specs at once — say which:{}",
+                            many.len(),
+                            per_spec_lines(many, touched, s)
+                        ),
+                        fixes![fix!(
+                            "kanspec done {id}{}{}",
+                            carried(a, &["--spec-unchanged"]),
+                            per_spec_flags(many, r)
+                        )],
+                    ));
+                }
+            },
+        };
+        if why.is_empty() {
+            return Err(KsError::invalid(
+                format!("{id}: --spec-unchanged needs a reason, not just a spec"),
+                fixes![fix!(
+                    "kanspec done {id}{}{}",
+                    carried(a, &["--spec-unchanged"]),
+                    per_spec_flags(&st.unedited, "no behaviour change")
+                )],
+            ));
+        }
+        if out.iter().any(|w| w.spec == spec) {
+            continue;
+        }
+        out.push(SpecWaiver {
+            spec,
+            why: why.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+/// The refusal: one line per uncovered spec with the glob that caught it, and a fix that
+/// answers for each one by name.
+fn uncovered(
+    id: &TicketId,
+    st: &SpecState,
+    waivers: &[SpecWaiver],
+    touched: &[ChangedPath],
+    s: &Snapshot,
+    a: &DoneArgs,
+) -> KsError {
+    let remaining = st.remaining(waivers);
+    let mut fixes: Vec<crate::error::Fix> = remaining
+        .iter()
+        .take(3)
+        .map(|n| crate::error::Fix::cmd(format!("edit .kanspec/specs/{n}.md on this branch")))
+        .collect();
+    fixes.push(crate::error::Fix::cmd(format!(
+        "kanspec done {id}{}{}",
+        carried(a, &[]),
+        per_spec_flags(&remaining, "no behaviour change")
+    )));
+    fixes.push(crate::error::Fix::cmd(format!(
+        "kanspec spec show {}",
+        remaining[0]
+    )));
+    let head = fixes.remove(0);
+    KsError::gate(
         "spec_unchanged_unrecorded",
         format!(
-            "{id}: the branch touched {}'s code but {} was not edited on it",
-            names(&matched),
-            names(&unedited)
+            "{id}: the branch touched code {} own{} without editing {}:{}",
+            plural_specs(remaining.len()),
+            if remaining.len() == 1 { "s" } else { "" },
+            if remaining.len() == 1 { "it" } else { "them" },
+            per_spec_lines(&remaining, touched, s)
         ),
-        fixes![
-            fix!("edit .kanspec/specs/{}.md on this branch", first.as_str()),
-            fix!(
-                "kanspec done {id}{} --spec-unchanged \"no behaviour change\"",
-                carried(a, &["--spec-unchanged"])
-            ),
-            fix!("kanspec spec show {}", first.as_str()),
-        ],
-    ))
+        crate::error::Fixes::new(head, fixes),
+    )
+}
+
+fn plural_specs(n: usize) -> String {
+    if n == 1 {
+        "1 spec".to_string()
+    } else {
+        format!("{n} specs")
+    }
+}
+
+/// `\n  auth — src/auth/** matched src/auth/login.ts`, one per spec.
+fn per_spec_lines(specs: &[SpecName], touched: &[ChangedPath], s: &Snapshot) -> String {
+    specs
+        .iter()
+        .map(|n| format!("\n  {n} — {}", where_matched(n, touched, s)))
+        .collect()
+}
+
+/// ` --spec-unchanged "auth:<why>" --spec-unchanged "billing:<why>"`.
+fn per_spec_flags(specs: &[SpecName], why: &str) -> String {
+    specs
+        .iter()
+        .map(|n| format!(" --spec-unchanged \"{n}:{why}\""))
+        .collect()
+}
+
+/// `src/auth/** matched src/auth/login.ts` — the spec's glob that caught the branch, and
+/// the first changed path it caught, so a spec named through a broad glob is visibly so.
+fn where_matched(name: &SpecName, touched: &[ChangedPath], s: &Snapshot) -> String {
+    let Some(spec) = s.specs.get(name) else {
+        return "(spec missing)".to_string();
+    };
+    for g in &spec.fm.code {
+        let Some(set) = compile(std::slice::from_ref(g)) else {
+            continue;
+        };
+        if let Some(c) = touched.iter().find(|c| set.is_match(&c.path)) {
+            return format!("{g} matched {}", c.path);
+        }
+    }
+    globs_of_specs(std::slice::from_ref(name), s).join(", ")
 }
 
 /// Specs whose `code:` globs the branch's changed paths fall inside — the input to both
@@ -965,6 +1174,128 @@ mod tests {
         s
     }
 
+    fn snap_with_specs(specs: &[(&str, &str)]) -> Snapshot {
+        let mut s = snap_with_spec();
+        s.specs.clear();
+        for (name, glob) in specs {
+            let name = SpecName::parse(name).unwrap();
+            let fm: SpecFm =
+                serde_yaml_ng::from_str(&format!("feature: F\ncode: [{glob}]\n")).unwrap();
+            s.specs.insert(
+                name.clone(),
+                Spec {
+                    path: std::path::PathBuf::from(format!(".kanspec/specs/{name}.md")),
+                    name,
+                    fm,
+                    body: String::new(),
+                    rules: Vec::new(),
+                },
+            );
+        }
+        s
+    }
+
+    /// t-852e: five specs matched through broad globs were named as one clump, and one
+    /// blanket reason answered for all of them. Now: one line per spec with the glob that
+    /// caught it, and one answer per spec.
+    #[test]
+    fn several_unedited_specs_are_answered_one_by_one_never_with_a_blanket_reason() {
+        let t = ticket(&[]);
+        let s = snap_with_specs(&[
+            ("auth", "src/auth/**"),
+            ("billing", "src/billing/**"),
+            ("wide", "src/**"),
+        ]);
+        let touched = changed(&["src/auth/login.ts", "src/billing/charge.ts"]);
+        let base = ["--no-followups", "--no-quirks"];
+
+        // Unanswered: every uncovered spec on its own line, with the glob that caught it.
+        let e = Triage::from_args(&t, &args(&base), &touched, &s).unwrap_err();
+        assert_eq!(e.code(), Some("spec_unchanged_unrecorded"));
+        let msg = e.to_string();
+        for line in [
+            "auth — src/auth/** matched src/auth/login.ts",
+            "billing — src/billing/** matched src/billing/charge.ts",
+            "wide — src/** matched src/auth/login.ts",
+        ] {
+            assert!(msg.contains(line), "{msg}");
+        }
+        let fix = e
+            .fixes()
+            .iter()
+            .map(|f| f.as_str().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            fix.iter().any(|f| f.contains("--spec-unchanged \"auth:")
+                && f.contains("--spec-unchanged \"billing:")
+                && f.contains("--spec-unchanged \"wide:")),
+            "the fix answers for each spec by name: {fix:?}"
+        );
+
+        // A blanket reason over three specs is the thing a real change hides behind.
+        let mut blanket = base.to_vec();
+        blanket.extend(["--spec-unchanged", "refactor only"]);
+        let e = Triage::from_args(&t, &args(&blanket), &touched, &s).unwrap_err();
+        assert_eq!(e.code(), Some("spec_unchanged_blanket"), "{e}");
+        assert!(e.to_string().contains("3 specs at once"), "{e}");
+        let fix = e.fixes().iter().next().unwrap().as_str().to_string();
+        assert!(
+            fix.contains("--spec-unchanged \"auth:refactor only\"")
+                && !fix.contains("--spec-unchanged \"refactor only\""),
+            "the blanket is replaced, not carried: {fix}"
+        );
+
+        // Two of three answered by name: the third is still owed, alone.
+        let mut two = base.to_vec();
+        two.extend([
+            "--spec-unchanged",
+            "auth: renamed a helper",
+            "--spec-unchanged",
+            "wide:no behaviour change",
+        ]);
+        let e = Triage::from_args(&t, &args(&two), &touched, &s).unwrap_err();
+        assert_eq!(e.code(), Some("spec_unchanged_unrecorded"));
+        let msg = e.to_string();
+        assert!(
+            msg.contains("billing —") && !msg.contains("auth —"),
+            "{msg}"
+        );
+
+        // All three: recorded per spec, in the order given.
+        let mut three = two.clone();
+        three.extend(["--spec-unchanged", "billing:same"]);
+        let ok = Triage::from_args(&t, &args(&three), &touched, &s).unwrap();
+        assert_eq!(
+            ok.spec_unchanged().as_deref(),
+            Some("auth: renamed a helper · wide: no behaviour change · billing: same")
+        );
+
+        // A spec the branch never touched cannot be waived — that is a typo or a lie.
+        let mut wrong = base.to_vec();
+        wrong.extend(["--spec-unchanged", "auth:x", "--spec-unchanged", "wide:x"]);
+        let s2 = snap_with_specs(&[
+            ("auth", "src/auth/**"),
+            ("wide", "src/**"),
+            ("docs", "docs/**"),
+        ]);
+        let ok = Triage::from_args(&t, &args(&wrong), &changed(&["src/auth/a.ts"]), &s2).unwrap();
+        assert!(ok.spec_unchanged().is_some());
+        wrong.extend(["--spec-unchanged", "docs:x"]);
+        let e =
+            Triage::from_args(&t, &args(&wrong), &changed(&["src/auth/a.ts"]), &s2).unwrap_err();
+        assert!(
+            e.to_string()
+                .contains("names docs, but the branch touched none of its code"),
+            "{e}"
+        );
+
+        // A reason with no spec where nothing was demanded is still recorded.
+        let mut free = base.to_vec();
+        free.extend(["--spec-unchanged", "docs only"]);
+        let ok = Triage::from_args(&t, &args(&free), &changed(&["README.md"]), &s).unwrap();
+        assert_eq!(ok.spec_unchanged().as_deref(), Some("docs only"));
+    }
+
     fn changed(paths: &[&str]) -> Vec<ChangedPath> {
         paths
             .iter()
@@ -1202,7 +1533,11 @@ mod tests {
             &s,
         )
         .expect("a recorded waiver satisfies the checkpoint");
-        assert_eq!(ok.spec_unchanged(), Some("refactor only"));
+        assert_eq!(
+            ok.spec_unchanged().as_deref(),
+            Some("auth: refactor only"),
+            "a bare reason with one spec unedited is that spec's"
+        );
 
         let edited = Triage::from_args(
             &t,

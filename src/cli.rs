@@ -331,9 +331,10 @@ pub struct DoneArgs {
     pub no_followups: bool,
 
     // ── knowledge checkpoint ──────────────────────────────────────────────────
-    /// Record why the branch touched a spec's globs without editing the spec
-    #[arg(long, value_name = "REASON", allow_hyphen_values = true)]
-    pub spec_unchanged: Option<String>,
+    /// Record why the branch touched a spec's globs without editing it: `<spec>:<reason>`,
+    /// one per spec; a bare reason is accepted when exactly one spec is unedited
+    #[arg(long, value_name = "SPEC:REASON", allow_hyphen_values = true)]
+    pub spec_unchanged: Vec<String>,
     /// Capture a quirk learned on this ticket; repeatable
     #[arg(long, value_name = "TITLE", allow_hyphen_values = true)]
     pub quirk: Vec<String>,
