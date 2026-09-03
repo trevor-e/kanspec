@@ -670,3 +670,61 @@ fn a_proposal_in_review_is_listed_under_you_until_a_human_approves_or_comments()
         you(&repo)
     );
 }
+
+/// t-85de: three tickets minted from one proposal all got its first spec, and the content
+/// ticket belonged to another. A `[tN]` names its spec, or inherits it from the `[cN]` it
+/// implements, or falls back to the proposal's first.
+#[test]
+fn a_minted_ticket_takes_its_own_spec_or_the_spec_of_the_change_it_implements() {
+    let repo = TestRepo::new();
+    for (name, code) in [("auth", "src/auth/**"), ("playbooks", "docs/**")] {
+        repo.ks(["spec", "new", name, "--feature", "F", "--code", code])
+            .ok();
+    }
+    repo.ks([
+        "propose",
+        "Onboarding interview",
+        "--spec",
+        "auth",
+        "--spec",
+        "playbooks",
+    ])
+    .ok();
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] auth: ask the three questions\n- [c2] playbooks: write the runbook\n\n## Prescriptions\n\n## Tickets\n- [t1] Interview flow · S\n- [t2] (spec: playbooks) Runbook content · S\n- [t3] Runbook wiring · S · implements: c2\n- [t4] Alerts · c1, c2\n",
+    );
+    repo.ks(["review", id]).ok();
+    let r: serde_json::Value = repo.json(&["approve", id]);
+    let minted: Vec<String> = r["minted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(minted.len(), 4, "{r}");
+    let spec_of = |t: &str| -> String {
+        let v: serde_json::Value = repo.json(&["show", t]);
+        v["spec"].as_str().unwrap_or("").to_string()
+    };
+    assert_eq!(
+        spec_of(&minted[0]),
+        "auth",
+        "the proposal's first spec, as before"
+    );
+    assert_eq!(spec_of(&minted[1]), "playbooks", "named on the bullet");
+    assert_eq!(spec_of(&minted[2]), "playbooks", "inherited from [c2]");
+    assert_eq!(
+        spec_of(&minted[3]),
+        "auth",
+        "inherited from the first change named"
+    );
+    let t2 = repo.read(&format!(".kanspec/tickets/{}.md", minted[1]));
+    assert!(
+        t2.contains("title: Runbook content") && !t2.contains("(spec:"),
+        "the marker is not the title: {t2}"
+    );
+}

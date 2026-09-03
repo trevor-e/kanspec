@@ -366,14 +366,16 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
 
     // `[tN]` bullets become real board tickets. The text before the first `·` is the
     // title; the rest is the DESIGN.md `· S · deps: t-31aa` tail, which `new` already
-    // knows how to take as flags.
-    let wanted: Vec<(ItemRef, String, Vec<String>)> = p
+    // knows how to take as flags. The spec is the bullet's own `(spec: x)`, else the spec
+    // of the `[cN]` it names, else the proposal's first (t-85de).
+    let wanted: Vec<(ItemRef, String, Vec<String>, Option<String>)> = p
         .items
         .iter()
         .filter(|i| i.id.kind == crate::ids::ItemKind::Ticket)
         .map(|i| {
-            let (title, deps) = split_ticket_bullet(&i.text);
-            (i.id.clone(), title, deps)
+            let bullet = split_ticket_bullet(&i.text);
+            let spec = ticket_spec(p, &bullet);
+            (i.id.clone(), bullet.title, bullet.deps, spec)
         })
         .collect();
 
@@ -390,7 +392,6 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         ctx.now.format("%Y-%m-%dT%H:%MZ"),
         ctx.actor.label()
     );
-    let spec = p.fm.specs.first().map(ToString::to_string);
     let pid = id.clone();
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
         let p = live(sn, &pid)?;
@@ -404,7 +405,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
             let f = facts(ctx);
-            for (anchor, title, deps) in &wanted {
+            for (anchor, title, deps, spec) in &wanted {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
                     spec: spec.clone(),
@@ -457,28 +458,95 @@ fn stamp_tail(p: &Proposal) -> String {
         .unwrap_or_default()
 }
 
-/// `Rate-limit login endpoint · S · deps: t-31aa` -> title + dep ids.
+/// A `[tN]` bullet, taken apart.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TicketBullet {
+    title: String,
+    deps: Vec<String>,
+    /// `(spec: playbooks)` at the head of the bullet
+    spec: Option<String>,
+    /// the `[cN]` tags the bullet says it implements: `· implements: c1, c2` or `· c1`
+    changes: Vec<String>,
+}
+
+/// `(spec: playbooks) Rate-limit login endpoint · S · deps: t-31aa · implements: c1`
+/// -> title, dep ids, the named spec, the named changes.
 ///
 /// The estimate segment is dropped on purpose: `new` has no estimate flag, and inventing a
 /// place to put it would be a field the board never reads.
-fn split_ticket_bullet(text: &str) -> (String, Vec<String>) {
-    let mut title = text.trim();
-    let mut deps = Vec::new();
+fn split_ticket_bullet(text: &str) -> TicketBullet {
+    let mut b = TicketBullet::default();
+    let mut text = text.trim();
+    if let Some(rest) = text.strip_prefix("(spec:") {
+        if let Some((name, tail)) = rest.split_once(')') {
+            b.spec = Some(name.trim().to_string());
+            text = tail.trim();
+        }
+    }
+    let mut title = text;
     if let Some((head, rest)) = text.split_once('·') {
         title = head.trim();
         for seg in rest.split('·') {
             let seg = seg.trim();
-            if let Some(list) = seg.strip_prefix("deps:") {
-                deps.extend(
-                    list.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToString::to_string),
-                );
+            let list = |l: &str| -> Vec<String> {
+                l.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            };
+            if let Some(l) = seg.strip_prefix("deps:") {
+                b.deps.extend(list(l));
+            } else if let Some(l) = seg.strip_prefix("implements:") {
+                b.changes.extend(list(l));
+            } else {
+                // A bare `c1, c2` segment: every entry is a change tag, or it is not a
+                // change list at all (the estimate `S` is one such segment).
+                let items = list(seg);
+                if !items.is_empty() && items.iter().all(|i| is_change_tag(i)) {
+                    b.changes.extend(items);
+                }
             }
         }
     }
-    (title.to_string(), deps)
+    b.title = title.to_string();
+    b
+}
+
+/// `c1`, `c12` — a change anchor's tag, without its proposal.
+fn is_change_tag(s: &str) -> bool {
+    s.strip_prefix('c')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Which spec a minted ticket belongs to (t-85de). On the trial all three tickets minted
+/// from one proposal got its first spec, and the content ticket belonged to another.
+///
+/// 1. the bullet's own `(spec: x)`;
+/// 2. the spec of the first `[cN]` the bullet names — a change bullet opens with its spec,
+///    `- [c1] auth: 5 failed logins …` (DESIGN.md), when the proposal spans several;
+/// 3. the proposal's first spec.
+fn ticket_spec(p: &Proposal, b: &TicketBullet) -> Option<String> {
+    if let Some(s) = &b.spec {
+        return Some(s.clone());
+    }
+    let named: Vec<&SpecName> = p.fm.specs.iter().collect();
+    for tag in &b.changes {
+        let Some(change) = p
+            .items
+            .iter()
+            .find(|i| format!("{}{}", i.id.kind.letter(), i.id.n) == *tag)
+        else {
+            continue;
+        };
+        let Some((head, _)) = change.text.split_once(':') else {
+            continue;
+        };
+        if let Some(s) = named.iter().find(|s| s.as_str() == head.trim()) {
+            return Some(s.to_string());
+        }
+    }
+    p.fm.specs.first().map(ToString::to_string)
 }
 
 impl Render for ApproveReport {
