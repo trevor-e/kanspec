@@ -69,6 +69,10 @@ pub struct TrackerDrift {
     pub blocking: Vec<String>,
     /// every tracker path the recovery has to move, committed and pending alike
     pub paths: Vec<String>,
+    /// `main` has never carried `.kanspec/` at all: not a branch that swept the tracker
+    /// along, but a `main =` naming a branch the store does not integrate through. The
+    /// transplant would move the board somewhere nobody looks; the fix is the config line.
+    pub main_blind: bool,
     /// the recovery, verified end to end by `tests/lifecycle.rs`
     pub fix: String,
 }
@@ -203,7 +207,7 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
     // The name a human types. `main = "origin/main"` is the DEFAULT, and it is a REMOTE
     // ref — `git switch origin/main` DETACHES HEAD, so advice that pasted the configured
     // value straight through would hand the user a second wedge on top of the first.
-    let main = short_name(ctx, &resolved);
+    let main = ctx.git.short_name(&resolved);
     // Standing on main under either spelling: nothing has drifted anywhere. This is the
     // common case and it exits before a single diff runs.
     if branch == resolved || branch == main {
@@ -211,6 +215,31 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
     }
 
     let ps = [Pathspec::glob(TRACKER)];
+    // The whole store invisible from `resolved` is a different disease from a branch that
+    // swept a ticket file along: `main` names a branch the work never integrates through.
+    // Measured before the fork-point diff below, which is blind to it — a store that was
+    // there at the fork and removed on main's side "added" nothing. The same test `start`
+    // refuses on, with the same fix.
+    let store = ctx.store_marker();
+    if !ctx.git.carries(&resolved, &store) && ctx.git.carries("HEAD", &store) {
+        let suggest = if ctx.git.ref_exists(&format!("refs/remotes/origin/{branch}")) {
+            format!("origin/{branch}")
+        } else {
+            branch.clone()
+        };
+        // Two-dot on purpose: every tracker path HEAD has and main does not.
+        let mut committed = paths_of(ctx, &["diff", "--name-only", "-z", &resolved, "HEAD"], &ps);
+        committed.sort();
+        return Some(TrackerDrift {
+            branch,
+            main,
+            paths: committed.clone(),
+            committed,
+            blocking: Vec::new(),
+            main_blind: true,
+            fix: format!("set `main = \"{suggest}\"` in .kanspec/config.toml"),
+        });
+    }
     // Three-dot: what this branch ADDED since it forked. Two-dot would also count tracker
     // changes main made in the meantime, which are not this branch's doing and must not be
     // clobbered by the recovery below.
@@ -222,12 +251,11 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
     if committed.is_empty() {
         return None;
     }
-
     // From here on it IS drift, so the extra probes are worth their subprocesses. The
     // collision has to be measured against the commit `git switch {main}` would really land
     // on: the local branch when it exists, and otherwise the remote ref git's DWIM would
     // create it from.
-    let rev = if ref_exists(ctx, &format!("refs/heads/{main}")) {
+    let rev = if ctx.git.ref_exists(&format!("refs/heads/{main}")) {
         main.clone()
     } else {
         resolved.clone()
@@ -279,31 +307,9 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
         committed,
         blocking,
         paths,
+        main_blind: false,
         fix,
     })
-}
-
-/// The branch name a human would type for `resolved` — `origin/main` → `main`.
-///
-/// Structural rather than a guess: `refs/remotes/{resolved}` existing PROVES `resolved` is
-/// a remote-tracking ref, and git forbids a `/` in a remote name, so the first component is
-/// the remote and everything after it is the branch. `git switch` DWIMs that short name into
-/// a local branch when there is not one already, which is exactly what the recovery wants.
-fn short_name(ctx: &Ctx, resolved: &str) -> String {
-    if !ref_exists(ctx, &format!("refs/remotes/{resolved}")) {
-        return resolved.to_string();
-    }
-    match resolved.split_once('/') {
-        Some((_remote, branch)) if !branch.is_empty() => branch.to_string(),
-        _ => resolved.to_string(),
-    }
-}
-
-fn ref_exists(ctx: &Ctx, r: &str) -> bool {
-    ctx.git
-        .run(&["rev-parse", "--verify", "--quiet", r])
-        .map(|o| o.code == 0)
-        .unwrap_or(false)
 }
 
 /// Repo-relative paths out of a `-z` git listing. `--porcelain=v1 -z` prefixes each record
@@ -377,7 +383,14 @@ impl Render for StatusReport {
             // is the trap — following it commits the ship record where main never sees it.
             Some(d) => {
                 let n = d.paths.len();
-                let line = if d.blocking.is_empty() {
+                let line = if d.main_blind {
+                    format!(
+                        "{n} tracker file{} committed on {} — {} has never carried .kanspec/",
+                        plural(n),
+                        d.branch,
+                        d.main
+                    )
+                } else if d.blocking.is_empty() {
                     format!(
                         "{n} tracker file{} committed on {} — {} cannot see the board",
                         plural(n),

@@ -26,6 +26,14 @@ kanspec start t-9c41 --worktree  # ... and a linked worktree, so parallel agents
    log line proving it was reached legally; a hand-edited `state:` has none and fails at
    the next verb.
 
+Step 2 is checked before anything is created. If the configured `main` has never carried
+`.kanspec/` — the store lives on a branch main does not contain — `start` refuses with the
+config line to set (`main = "origin/<branch>"`), because a ticket branch that cannot see
+the board is not a claim. If `main` is merely behind (the store is committed locally, not
+pushed), the fix it names is `git push`. When the cut is fine but HEAD still carries commits
+main lacks, the claim goes through with one `⚠ base` line saying the ticket branch starts
+without them.
+
 ## What you get back
 
 ```

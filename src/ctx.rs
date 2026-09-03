@@ -192,6 +192,16 @@ impl Ctx {
         crate::store::load_snapshot(self)
     }
 
+    /// `.kanspec/config.toml` relative to the primary root, forward slashes — the one path
+    /// whose presence in a commit proves that commit carries the store
+    /// (`git cat-file -e <rev>:<this>`). Used by `start`, `init` and `status` to tell a
+    /// `main` that has never seen `.kanspec/` from one that is merely behind.
+    pub fn store_marker(&self) -> String {
+        crate::hooks::relative_to(self.repo.primary_root(), &self.layout.config_toml())
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
     /// `"kanspec ship --pr 142"` — the Log note, and `Store::transact`'s `cmdline`.
     pub fn invocation(&self) -> String {
         self.invocation.clone()

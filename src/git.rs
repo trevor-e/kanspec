@@ -377,6 +377,34 @@ impl Git {
         self.rev_resolves(s.as_str())
     }
 
+    /// Does the tree at `rev` carry `path` (repo-relative, forward slashes)?
+    /// `cat-file -e rev:path` — no checkout, no diff, one exit code.
+    pub fn carries(&self, rev: &str, path: &str) -> bool {
+        let spec = format!("{rev}:{path}");
+        self.succeeds(&["cat-file", "-e", &spec])
+    }
+
+    /// Does `name` exist as a full ref (`refs/heads/x`, `refs/remotes/origin/x`)?
+    pub fn ref_exists(&self, name: &str) -> bool {
+        self.succeeds(&["rev-parse", "--verify", "--quiet", name])
+    }
+
+    /// The branch name a human would type for `resolved` — `origin/main` → `main`.
+    ///
+    /// Structural rather than a guess: `refs/remotes/{resolved}` existing PROVES `resolved`
+    /// is a remote-tracking ref, and git forbids a `/` in a remote name, so the first
+    /// component is the remote and everything after it is the branch. `git switch` DWIMs
+    /// that short name into a local branch when there is not one already.
+    pub fn short_name(&self, resolved: &str) -> String {
+        if !self.ref_exists(&format!("refs/remotes/{resolved}")) {
+            return resolved.to_string();
+        }
+        match resolved.split_once('/') {
+            Some((_remote, branch)) if !branch.is_empty() => branch.to_string(),
+            _ => resolved.to_string(),
+        }
+    }
+
     /// The configured `main`, or `symbolic-ref refs/remotes/origin/HEAD` when it does not
     /// resolve. Never guesses silently: the fallbacks are ordered and the failure names
     /// the config key.

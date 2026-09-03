@@ -16,7 +16,10 @@ lock_timeout_secs = 5               # how long a verb waits for the advisory loc
 
 **`main`** is what "did it land?" means here. It is a git revision, so `origin/main`,
 `upstream/trunk` and `origin/develop` all work. Detection compares against this and nothing
-else.
+else, and `start` cuts every ticket branch from it. A repo that integrates through some
+other branch says so at scaffold time — `kanspec init --main origin/develop` — or by editing
+this line; `init` warns when the branch it runs on is not on `main`'s history, and `start`
+refuses to cut a ticket branch from a `main` that has never carried `.kanspec/`.
 
 **`sync`** decides what happens to the files kanspec writes:
 

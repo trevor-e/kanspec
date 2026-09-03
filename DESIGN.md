@@ -252,7 +252,8 @@ Every command: `--json`, typed errors that name the exact next command, color + 
 
 ```
 SETUP
-  kanspec init                        scaffold .kanspec/, .gitattributes (merge=union), git hooks, gitignore cache/
+  kanspec init [--main <rev>]         scaffold .kanspec/, .gitattributes (merge=union), git hooks, gitignore cache/;
+                                      --main names the branch tickets integrate through (default origin/main)
   kanspec setup claude|cursor|codex   install CLAUDE.md snippet + hooks (+ --remove to uninstall symmetrically)
   kanspec doctor [--fix]              prove invariants: log-trail legality, untyped prescriptions, dead globs,
                                       orphan deps, ledger completeness; exit 1 on violation (run in CI)

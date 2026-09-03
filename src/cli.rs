@@ -207,6 +207,10 @@ pub struct InitArgs {
     /// Reinstall the git hooks over an existing store, preserving foreign hooks
     #[arg(long)]
     pub refresh_hooks: bool,
+    /// The branch tickets integrate through (e.g. origin/develop) — written to config.toml
+    /// as `main`. Omit and `start` cuts from origin/main.
+    #[arg(long, value_name = "REV")]
+    pub main: Option<String>,
 }
 
 #[derive(Args, Debug)]

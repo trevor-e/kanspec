@@ -48,6 +48,10 @@ pub struct InitReport {
     pub created: Vec<PathBuf>,
     pub already_present: Vec<PathBuf>,
     pub hooks: Vec<HookReport>,
+    /// HEAD is not on the configured main's history, so `start` would cut ticket branches
+    /// from somewhere this branch's commits — the store among them — never reach. See
+    /// [`integration_note`].
+    pub main_note: Option<String>,
     pub next: Vec<String>,
 }
 
@@ -55,8 +59,19 @@ pub fn init(ctx: &Ctx, a: &InitArgs) -> Result<InitReport> {
     // Before a single byte moves: `init` must not claim a projection path somebody else
     // wrote. See `refuse_taken_projections`.
     refuse_taken_projections(ctx)?;
+    // `--main` names a rev that must exist NOW: a config that points at nothing fails every
+    // later verb with a message about origin/HEAD, three steps away from the typo.
+    if let Some(m) = &a.main {
+        if ctx.git.head_sha(m).is_err() {
+            return Err(KsError::invalid(
+                format!("`--main {m}` does not resolve to a commit"),
+                fixes![fix!("git fetch origin"), fix!("git branch --all")],
+            ));
+        }
+    }
 
-    let scaffold = plan_scaffold(ctx);
+    let scaffold = plan_scaffold(ctx, a);
+    let config_created = scaffold.created.iter().any(|p| p.ends_with("config.toml"));
     apply(&scaffold.edits)?;
 
     // Hooks are a separately idempotent step `init` always runs, so a repo initialised
@@ -68,16 +83,79 @@ pub fn init(ctx: &Ctx, a: &InitArgs) -> Result<InitReport> {
     for h in &mut hooks {
         h.path = rel(&root, &h.path);
     }
+    let (main_note, main_fix) = integration_note(ctx, a, config_created);
+    let mut next = Vec::new();
+    next.extend(main_fix);
+    next.push(format!("{} setup claude", ctx.invoked_as));
+    next.push(format!("{} new \"the first thing to do\"", ctx.invoked_as));
     Ok(InitReport {
         created: scaffold.created,
         already_present: scaffold.already_present,
         hooks,
-        next: vec![
-            format!("{} setup claude", ctx.invoked_as),
-            format!("{} new \"the first thing to do\"", ctx.invoked_as),
-        ],
+        main_note,
+        next,
         root,
     })
+}
+
+/// Which branch integrates? `init` cannot ask interactively — agents run it — so it looks:
+/// when HEAD carries commits the configured main does not, the branch `start` would cut
+/// from is not the branch the work is on, and the store `init` just scaffolded will never
+/// reach it. Found on a trial that integrated through a migration branch: `start` silently
+/// cut ticket branches with no `.kanspec/`, and the fix (`main = "<branch>"`) was nowhere.
+///
+/// Returns the notice and the one-line fix, both `None` when HEAD is on main's history. A
+/// `--main` that could not be written because config.toml already existed is reported
+/// the same way, with the manual edit as the fix — the config is the user's file and `init`
+/// never rewrites it.
+fn integration_note(
+    ctx: &Ctx,
+    a: &InitArgs,
+    config_created: bool,
+) -> (Option<String>, Option<String>) {
+    let manual = |main: &str| format!("set `main = \"{main}\"` in .kanspec/config.toml");
+    if let (Some(m), false) = (&a.main, config_created) {
+        if m != &ctx.cfg.main {
+            return (
+                Some(format!(
+                    "config.toml already present — `--main {m}` was not written (it says `main = \"{}\"`)",
+                    ctx.cfg.main
+                )),
+                Some(manual(m)),
+            );
+        }
+    }
+    let effective = a.main.clone().unwrap_or_else(|| ctx.cfg.main.clone());
+    let Ok(resolved) = ctx.git.resolve_main(&effective) else {
+        return (None, None);
+    };
+    let Some(on) = ctx.git.current_branch() else {
+        return (None, None);
+    };
+    if on == ctx.git.short_name(&resolved) {
+        return (None, None);
+    }
+    let ahead = ctx
+        .git
+        .ahead_behind(&resolved, "HEAD")
+        .map(|(ahead, _)| ahead)
+        .unwrap_or(0);
+    if ahead == 0 {
+        return (None, None);
+    }
+    let suggest = if ctx.git.ref_exists(&format!("refs/remotes/origin/{on}")) {
+        format!("origin/{on}")
+    } else {
+        on.clone()
+    };
+    (
+        Some(format!(
+            "{on} is {ahead} commit{} ahead of {resolved} — `start` cuts ticket branches from \
+             {resolved}, which would not see this store; if tickets integrate through {on}, say so",
+            if ahead == 1 { "" } else { "s" }
+        )),
+        Some(manual(&suggest)),
+    )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -90,7 +168,7 @@ struct Scaffold {
     already_present: Vec<PathBuf>,
 }
 
-fn plan_scaffold(ctx: &Ctx) -> Scaffold {
+fn plan_scaffold(ctx: &Ctx, a: &InitArgs) -> Scaffold {
     let root = ctx.repo.primary_root().to_path_buf();
     // `Layout` is the only thing allowed to name a file in the store, and it deliberately
     // exposes no accessor for the store root itself — the config lives at its top, so its
@@ -112,7 +190,11 @@ fn plan_scaffold(ctx: &Ctx) -> Scaffold {
 
     // config.toml, with every default present and commented so the knobs are discoverable.
     // NEVER rewritten: this is the file a user edits.
-    s.create(&root, ctx.layout.config_toml(), Config::render_default());
+    let mut cfg = Config::default();
+    if let Some(m) = &a.main {
+        cfg.main = m.clone();
+    }
+    s.create(&root, ctx.layout.config_toml(), cfg.render());
 
     for d in ENTITY_DIRS {
         let dir = store.join(d);
@@ -320,6 +402,13 @@ impl Render for InitReport {
                 line = line.dim(n.clone());
             }
             line.write(w, st)?;
+        }
+        if let Some(n) = &self.main_note {
+            writeln!(
+                w,
+                " {} {n}",
+                crate::out::paint("⚠ main", Color::Yellow, st.color)
+            )?;
         }
         for n in &self.next {
             writeln!(w, " {} {n}", glyph::FIX)?;

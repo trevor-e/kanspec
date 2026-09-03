@@ -270,7 +270,13 @@ impl Config {
     /// What `init` writes — every default made visible, with the comments that explain
     /// which knob is which. Round-trips through [`Config::parse`] (asserted in tests).
     pub fn render_default() -> String {
-        let d = Config::default();
+        Config::default().render()
+    }
+
+    /// [`Config::render_default`] for a config that already differs from the default —
+    /// `init --main origin/develop` writes the branch it was told, not the one it guessed.
+    pub fn render(&self) -> String {
+        let d = self;
         format!(
             r#"# kanspec config. Every key below is the default; delete any line to keep it.
 # Docs: `kanspec instructions config`
