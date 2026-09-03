@@ -298,6 +298,30 @@ fn a_promoted_decision_lands_proposed_so_an_agent_never_self_accepts() {
     assert!(rules.contains("DECISIONS (0)"), "{rules}");
     // And it points home, so `why` can walk the chain.
     assert!(r.stdout.contains(&format!("{id}#p1")), "{}", r.stdout);
+    // The `(promote: decision)` marker typed the prescription; it is not the title
+    // (t-5f2b: D-0174 on the trial carried it in every listing).
+    let did = r
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("D-"))
+        .expect("the minted id")
+        .to_string();
+    let file = std::fs::read_dir(repo.root.join(".kanspec/decisions"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(&did))
+        .unwrap_or_else(|| panic!("a file for {did}"));
+    let record = std::fs::read_to_string(&file).unwrap();
+    let title = record
+        .lines()
+        .find_map(|l| l.strip_prefix("title:"))
+        .expect("a title line")
+        .trim();
+    assert!(
+        title.contains("lockout state lives in Redis") && !title.contains("promote:"),
+        "{title}"
+    );
 }
 
 #[test]

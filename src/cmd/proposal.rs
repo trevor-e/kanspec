@@ -1105,7 +1105,11 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
 }
 
 /// `(promote: decision) rate-limit state in Redis` -> `rate-limit state in Redis`.
-fn strip_marker(text: &str) -> String {
+///
+/// Shared with `promote`: the marker is the prescription's TYPE, and a minted decision or
+/// quirk records its type in its own frontmatter, so a title that kept the marker would say
+/// it twice — and say it forever, on every `rules` line and every page (t-5f2b).
+pub(crate) fn strip_marker(text: &str) -> String {
     let t = text.trim();
     if !t.starts_with('(') {
         return t.to_string();

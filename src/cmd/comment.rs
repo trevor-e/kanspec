@@ -557,7 +557,10 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
 
     let pid = item.proposal.clone();
     let anchor = item.to_string();
-    let title = text.trim().to_string();
+    // `(promote: decision) lockout state lives in Redis` is the prescription; the record's
+    // title is what follows the marker. The marker typed the item, and the record's own
+    // frontmatter now carries that type.
+    let title = crate::cmd::proposal::strip_marker(&text);
     if title.is_empty() {
         return Err(KsError::invalid(
             format!("{item} has no text to promote"),
