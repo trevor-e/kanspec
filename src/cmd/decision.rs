@@ -30,7 +30,6 @@ use crate::keys::{DecisionKey, Key};
 use crate::model::{DecisionStatus, Snapshot};
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Facts, Op, Plan};
-use crate::project;
 use crate::store::{Committed, Store};
 use crate::{fix, fixes};
 
@@ -58,7 +57,6 @@ pub fn decide(ctx: &Ctx, a: &DecideArgs) -> Result<DecideReport> {
     let done =
         Store::open(ctx).transact(None, &ctx.invocation(), |s, m| plan_decide(s, &f, a, m))?;
     let id = minted_decision(&done)?;
-    project::regenerate(ctx)?;
 
     Ok(DecideReport {
         title: a.title.trim().to_string(),
@@ -187,7 +185,6 @@ fn flip(
     let f = facts(ctx);
     let done =
         Store::open(ctx).transact(None, &ctx.invocation(), |s, m| plan(s, &f, &who, &id, m))?;
-    project::regenerate(ctx)?;
     Ok((id, done))
 }
 

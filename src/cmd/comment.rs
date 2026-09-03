@@ -658,7 +658,6 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
             )
         }
     };
-    crate::project::regenerate(ctx)?;
     Ok(PromoteReport {
         item,
         record,

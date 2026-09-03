@@ -18,7 +18,6 @@ use crate::keys::{Key, QuirkKey};
 use crate::model::{QuirkStatus, Severity};
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
-use crate::project;
 use crate::rulesdoc::{severity_word, Scope};
 use crate::store::Store;
 use crate::{fix, fixes};
@@ -95,7 +94,6 @@ fn add(
         EntityRef::Quirk(id) => Some(id.clone()),
         _ => None,
     })?;
-    project::regenerate(ctx)?;
     Ok(QuirkReport::Added {
         next: vec![
             format!(
@@ -136,7 +134,6 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
             ],
         }]))
     })?;
-    project::regenerate(ctx)?;
 
     Ok(QuirkReport::Fixed {
         // `Committed::snapshot` is the post-write reload; the title did not move.

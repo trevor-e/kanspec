@@ -37,7 +37,6 @@
 use serde::Serialize;
 
 use crate::derive::{self, Staleness};
-use crate::error::Result;
 use crate::ids::SpecName;
 use crate::model::{DecisionStatus, QuirkStatus, Severity, Snapshot};
 use crate::paths::Layout;
@@ -225,63 +224,21 @@ pub fn plan_regenerate(s: &Snapshot, layout: &Layout) -> Vec<Op> {
     ]
 }
 
-/// Rewrite both projections from whatever is on disk **now**. `Ok(false)` means they
-/// already said the right thing and no byte moved.
-///
-/// **Every verb that mutates a spec, a decision or a quirk calls this**, not just `scan`.
-/// DESIGN.md's sanctioned workflow edits specs directly on the implementation branch and
-/// reviews them as an ordinary diff; if the committed feature map only caught up on the
-/// next `scan`, the reviewer of that very PR would read the old prose — the exact silent
-/// rot the projections exist to prevent. The verb that touched the source is the one that
+/// **Every verb that mutates a spec, a decision or a quirk republishes these**, not just
+/// `scan` — structurally: `Store::transact` renders them from the post-write snapshot and
+/// writes whichever changed, whenever a plan's ops [`Op::touches_projection`]. DESIGN.md's
+/// sanctioned workflow edits specs directly on the implementation branch and reviews them
+/// as an ordinary diff; if the committed feature map only caught up on the next `scan`,
+/// the reviewer of that very PR would read the old prose — the exact silent rot the
+/// projections exist to prevent. The verb that touched the source is the one that
 /// republishes it, so the two land in the same `git status`. Rendering the map with
 /// `features` is a READ and refreshes nothing; it must never be the only way to get a
 /// current file.
 ///
-/// D-20 asks for regeneration "inside the same lock" as the write that changed a spec or a
-/// decision. This deliberately runs as its own short transaction immediately after that
-/// write, for a reason the D-20 wording did not anticipate: a planner receives the
-/// snapshot as it was **before** its own plan applies. Regenerating from that snapshot
-/// would leave `KANSPEC-FEATURES.md` permanently one write behind — a brand-new spec would
-/// be missing from the table until some *later* verb happened to run. `Store::transact`
-/// reloads a fresh snapshot inside the lock, so a second transaction sees the write that
-/// just landed.
-///
-/// The cost is R-1's window, one lock cycle wide: a crash between the two leaves the
-/// projections one write stale, and the next verb or `scan` heals it. Being briefly stale
-/// after a crash is recoverable; being permanently stale by construction is not.
-/// Nothing is written when nothing changed. `scan` runs from the `post-merge` and
-/// `post-checkout` hooks, i.e. on every checkout: rewriting two identical files each time
-/// would take the advisory lock, bump `Snapshot::rev` and push an SSE frame at every open
-/// browser tab, for no change anyone can see.
-pub fn regenerate(ctx: &crate::ctx::Ctx) -> Result<bool> {
-    let want = plan_regenerate(&ctx.snapshot()?, &ctx.layout);
-    if want.iter().all(unchanged) {
-        return Ok(false);
-    }
-    crate::store::Store::open(ctx).transact(
-        // A projection rewrite transitions no ticket, which `transact` now says in the type
-        // (round C granted S3/S5/S6's shared request). Under `sync = "commit"` this commits
-        // as `kanspec: update <id>` rather than borrowing `Verb::Confirm`, whose meaning is
-        // the human merge override (D-11).
-        None,
-        &ctx.invocation(),
-        // Re-planned against the FRESH in-lock snapshot, never against the one read above:
-        // that read happened without exclusivity, and trusting it is the TOCTOU
-        // `Store::transact` reloads to avoid.
-        |s, _m| Ok(crate::plan::Plan::of(plan_regenerate(s, &ctx.layout))),
-    )?;
-    Ok(true)
-}
-
-fn unchanged(op: &Op) -> bool {
-    match op {
-        Op::WriteGenerated { path, contents } => {
-            std::fs::read_to_string(path).is_ok_and(|on_disk| &on_disk == contents)
-        }
-        _ => false,
-    }
-}
-
+/// D-20 asked for regeneration "inside the same lock" as the write; D-34 moved it to a
+/// second transaction because a planner sees the snapshot BEFORE its own plan applies.
+/// Both are satisfied now: `transact` reloads after its writes and renders from that,
+/// inside the same lock (t-0769). Nothing is written when nothing changed.
 /// `init` refuses to claim a path that already exists un-generated.
 pub fn is_ours(text: &str) -> bool {
     text.trim_start().starts_with(GENERATED_HEADER)

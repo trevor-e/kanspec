@@ -79,7 +79,6 @@ fn new(ctx: &Ctx, raw: &str, feature: Option<&str>, code: &[String]) -> Result<S
     })?;
     // D-20, second half: the committed projections are rewritten from the state this write
     // produced. See `project::regenerate` for why it is a second transaction.
-    project::regenerate(ctx)?;
 
     Ok(SpecReport::Created {
         path: rel_to(ctx, &ctx.layout.spec(&name)),

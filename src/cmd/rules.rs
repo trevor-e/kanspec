@@ -16,7 +16,6 @@ use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::out::{Color, Render, Style};
 use crate::plan::{Op, Plan};
-use crate::project;
 use crate::rulesdoc::{self, AuditWarning, RulesDoc, Scope};
 use crate::store::Store;
 
@@ -73,7 +72,6 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
         // deliberately is not — so this rewrites the same bytes. It is here anyway, because
         // the invariant is "a handler that writes a projected entity republishes", and
         // resting on a fact about today's renderers is how the committed page comes to rot.
-        project::regenerate(ctx)?;
     }
 
     // Read AFTER any stamps: the report must describe the corpus as it is now, or `--json`

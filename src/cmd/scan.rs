@@ -155,7 +155,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
     // was computed from the gitignored cache, so the same commit rendered different bytes
     // on different machines. The D-34 reason above is the one that still holds.)
     // See `project::regenerate`.
-    crate::project::regenerate(ctx)?;
     Ok(report)
 }
 

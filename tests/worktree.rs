@@ -414,7 +414,16 @@ Retries are not idempotent before the ledger write.
             }]))
         })
         .expect("a new quirk");
-    assert_eq!(done.touched.len(), 1);
+    // The quirk, plus the projections a new quirk changes — republished by the store
+    // itself, in the same transaction (t-0769).
+    assert_eq!(done.touched.len(), 1 + done.regenerated.len());
+    assert_eq!(
+        done.regenerated,
+        [
+            ctx.layout.features_md().to_path_buf(),
+            ctx.layout.architecture_md().to_path_buf()
+        ]
+    );
     assert_eq!(repo.read(".kanspec/quirks/q-11ba.md"), contents);
     assert!(done.snapshot.quirks.contains_key(&quirk));
 

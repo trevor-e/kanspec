@@ -165,7 +165,6 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     // LAST verb of the daily loop, so a landmine captured here would otherwise sit unseen
     // in the committed page until somebody happened to run `scan`. See
     // `project::regenerate` for why this is a second transaction rather than more ops.
-    crate::project::regenerate(ctx)?;
 
     // ── step 4: what the close-out actually produced ─────────────────────────
     let snap = &committed.snapshot;

@@ -398,6 +398,9 @@ pub struct Committed {
     pub snapshot: Snapshot,
     pub touched: Vec<PathBuf>,
     pub minted: Vec<EntityRef>,
+    /// The projections (`KANSPEC-FEATURES.md`, `KANSPEC-ARCHITECTURE.md`) this
+    /// transaction rewrote because a byte of them changed — a subset of `touched`.
+    pub regenerated: Vec<PathBuf>,
     pub rev: u64,
 }
 
@@ -488,6 +491,7 @@ impl<'c> Store<'c> {
                 snapshot: snap,
                 touched: Vec::new(),
                 minted: plan.minted,
+                regenerated: Vec::new(),
                 rev,
             });
         }
@@ -559,6 +563,33 @@ impl<'c> Store<'c> {
             touched.push(to.clone());
         }
 
+        // 9b — the post-write view, still under the lock. Loaded ONCE: it is what the
+        // projections are rendered from and what the caller gets back, so nothing can
+        // observe the pre-write state and no handler parses the store a third time.
+        let mut snapshot = load_snapshot(ctx)?;
+
+        // 9c — republish the committed projections whenever the plan changed what they
+        // are projected from (D-20). Structural, not a discipline: a handler cannot
+        // forget, and the render reads the snapshot AFTER its own writes — the reason
+        // D-34 once made this a second transaction. Nothing is written when nothing
+        // changed: `scan` runs from the `post-merge` and `post-checkout` hooks, and
+        // rewriting two identical files there would dirty nothing but still push an SSE
+        // frame at every open tab.
+        let mut regenerated = Vec::new();
+        if plan.ops.iter().any(Op::touches_projection) {
+            for op in crate::project::plan_regenerate(&snapshot, &ctx.layout) {
+                let Op::WriteGenerated { path, contents } = op else {
+                    continue;
+                };
+                if std::fs::read_to_string(&path).is_ok_and(|on_disk| on_disk == contents) {
+                    continue;
+                }
+                write_atomic(&path, contents.as_bytes(), &token)?;
+                touched.push(path.clone());
+                regenerated.push(path);
+            }
+        }
+
         // 10 — but only for a plan that changed something git tracks. A `scan`'s entire
         // plan is one write to the GITIGNORED cache, and committing for it would (a) sweep
         // whatever tracker edits were pending into a commit labelled after the scan, and
@@ -582,9 +613,7 @@ impl<'c> Store<'c> {
                 .commit_kanspec(&format!("kanspec: {label} {subject}"))?;
         }
 
-        // 11 — the post-write view, still under the lock, so the caller (and the server's
-        // memo) can never observe the pre-write state.
-        let mut snapshot = load_snapshot(ctx)?;
+        // 11 — the generation stamp on the view from 9b (a commit changes no store byte).
         let rev = REV.fetch_add(1, Ordering::Relaxed) + 1;
         snapshot.rev = rev;
         drop(token);
@@ -592,6 +621,7 @@ impl<'c> Store<'c> {
             snapshot,
             touched,
             minted: plan.minted,
+            regenerated,
             rev,
         })
     }
