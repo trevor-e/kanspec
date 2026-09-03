@@ -23,7 +23,7 @@ use serde::Serialize;
 use crate::cli::{AcceptArgs, DecideArgs, RevokeArgs, SupersedeArgs, WhyArgs};
 use crate::cmd::ticket::{facts, first_minted, join, rel_to, write_next};
 use crate::ctx::{Ctx, HumanActor};
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{DecisionId, ItemRef, Minter, ProposalId, QuirkId, RuleRef, TicketId};
 use crate::keys::{DecisionKey, Key};
@@ -223,7 +223,7 @@ pub fn plan_accept(s: &Snapshot, who: &HumanActor, id: &DecisionId) -> Result<Pl
     let d = s.decision(id)?;
     if d.fm.status != DecisionStatus::Proposed {
         return Err(KsError::gate(
-            "decision_not_proposed",
+            GateCode::DecisionNotProposed,
             format!(
                 "{id} is `{}`, not `proposed` — nothing to accept",
                 status_word(d.fm.status)
@@ -271,7 +271,7 @@ pub fn plan_supersede(
     let old = s.decision(id)?;
     if old.fm.status != DecisionStatus::Accepted {
         return Err(KsError::gate(
-            "decision_not_accepted",
+            GateCode::DecisionNotAccepted,
             format!(
                 "{id} is `{}` — only an accepted decision can be superseded",
                 status_word(old.fm.status)
@@ -351,7 +351,7 @@ pub fn plan_revoke(
         DecisionStatus::Revoked | DecisionStatus::Superseded
     ) {
         return Err(KsError::gate(
-            "decision_not_standing",
+            GateCode::DecisionNotStanding,
             format!(
                 "{id} is already `{}` — it steers nobody",
                 status_word(d.fm.status)

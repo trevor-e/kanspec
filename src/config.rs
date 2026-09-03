@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::paths::KanspecDir;
 use crate::{fix, fixes};
 
@@ -257,7 +257,7 @@ impl Config {
         // that would have said so. Refusing is the only honest answer until it is built.
         if cfg.sync == SyncMode::Branch {
             return Err(KsError::gate(
-                "sync_branch_v04",
+                GateCode::SyncBranchV04,
                 format!(
                     "{origin}: `sync = \"branch\"` lands in v0.4 — nothing implements it \
                      yet, and it would silently commit and push nothing"

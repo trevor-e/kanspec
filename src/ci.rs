@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::CiArgs;
 use crate::config::CiProvider;
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::ids::TicketId;
 use crate::out::{glyph, Line, Render, Style};
 use crate::{fix, fixes};
@@ -124,7 +124,7 @@ pub fn why(ctx: &Ctx, id: &TicketId) -> Result<Digest> {
 /// for a repository with no CI.
 fn not_yet_v02(ctx: &Ctx, provider: CiProvider) -> KsError {
     KsError::gate(
-        "ci_reader_v02",
+        GateCode::CiReaderV02,
         format!(
             "CI provider `{}` is detected, but reading it lands in v0.2 — kanspec will not \
              report a build state it did not read",

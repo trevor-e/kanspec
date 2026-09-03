@@ -40,7 +40,7 @@ use serde::Serialize;
 use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor};
 use crate::ctx::{Actor, Ctx};
 use crate::derive::note_sha;
-use crate::error::{GateDetail, KsError, Result};
+use crate::error::{GateCode, GateDetail, KsError, Result};
 use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
 use crate::ids::TicketId;
@@ -186,7 +186,7 @@ impl NoCodeWaiver {
         let why = why.trim();
         if why.is_empty() {
             return Err(KsError::gate(
-                "no_code_without_why",
+                GateCode::NoCodeWithoutWhy,
                 format!("`{id}` cannot close as no-code without a recorded reason"),
                 fixes![
                     fix!("kanspec done {id} --no-code --why \"docs only\""),
@@ -680,7 +680,7 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
         _ => format!("nothing on {main} carries this ticket's work"),
     };
     Err(KsError::gate_detail(
-        "not_landed",
+        GateCode::NotLanded,
         format!("{id} is not on {main} — {why}"),
         // The trace IS the refusal: pre-formatting it into the message would throw away
         // the `--explain`-grade output that makes the gate arguable rather than arbitrary.
@@ -989,7 +989,7 @@ pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<
     let why = f.why.trim();
     if why.is_empty() {
         return Err(KsError::gate(
-            "confirm_without_why",
+            GateCode::ConfirmWithoutWhy,
             format!("`{id}` cannot be confirmed in main without a recorded reason"),
             fixes![
                 fix!("kanspec scan --confirm {id} --why \"squash merged by hand, verified\""),
@@ -1006,7 +1006,7 @@ pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<
         .or_else(|| t.fm.head.clone())
         .ok_or_else(|| {
             KsError::gate(
-                "confirm_without_head",
+                GateCode::ConfirmWithoutHead,
                 format!("`{id}` records neither a `head:` SHA nor a resolvable branch to confirm"),
                 fixes![fix!("kanspec ship {id}"), fix!("kanspec show {id}"),],
             )

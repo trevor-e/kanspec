@@ -12,7 +12,7 @@ use serde::Serialize;
 use crate::cli::{AbandonArgs, ApproveArgs, CloseArgs, ProposeArgs, ReviewArgs};
 use crate::cmd::ticket::{facts, rel_to};
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{ItemRef, ProposalId, SpecName, TicketId};
 use crate::keys::{Key, ProposalKey};
@@ -139,7 +139,7 @@ pub(crate) fn proposal_or_refuse<'a>(
     s.proposals.get(id).ok_or_else(|| {
         if s.closed_ids.contains(id.as_str()) {
             KsError::gate(
-                "proposal_closed",
+                GateCode::ProposalClosed,
                 format!("{id} is closed — closed proposals bind nothing"),
                 fixes![fix!("{} rules", ctx.invoked_as)],
             )
@@ -180,7 +180,7 @@ fn refuse_terminal(ctx: &Ctx, p: &Proposal, already: bool) -> Result<()> {
     }
     let (id, word) = (&p.fm.id, status_word(p.fm.status));
     Err(KsError::gate(
-        "proposal_terminal",
+        GateCode::ProposalTerminal,
         if already {
             format!("{id} is already {word}")
         } else {
@@ -266,7 +266,7 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
     // proposal is the exception, because reopening it would unstamp the approval.
     if p.fm.status == S::Approved {
         return Err(KsError::gate(
-            "already_approved",
+            GateCode::AlreadyApproved,
             format!("{id} is already approved — reopening it would unstamp the approval"),
             fixes![fix!("{} close {id}", ctx.invoked_as)],
         ));
@@ -352,7 +352,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     let open = unresolved(&snap, p);
     if open > 0 {
         return Err(KsError::gate(
-            "unresolved_threads",
+            GateCode::UnresolvedThreads,
             format!(
                 "cannot approve {id} — {}",
                 plural(open, "unresolved review thread")
@@ -660,7 +660,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     refuse_terminal(ctx, p, true)?;
     if p.fm.status != S::Approved {
         return Err(KsError::gate(
-            "not_approved",
+            GateCode::NotApproved,
             format!(
                 "{id} is {} — close is the END of an approved proposal, not a way out \
                  of one",
@@ -833,7 +833,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
         flat.truncate(6);
         let head = flat.remove(0);
         return Err(KsError::gate(
-            "undispositioned_items",
+            GateCode::UndispositionedItems,
             msg,
             crate::error::Fixes::new(head, flat),
         ));

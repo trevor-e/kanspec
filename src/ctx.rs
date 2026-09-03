@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::error::{EnvCode, KsError, Result};
+use crate::error::{EnvCode, GateCode, KsError, Result};
 use crate::gh::Gh;
 use crate::git::Git;
 use crate::model::Snapshot;
@@ -113,7 +113,7 @@ impl HumanActor {
     pub fn require(a: &Actor, verb: &'static str) -> Result<HumanActor> {
         if a.is_agent() {
             return Err(KsError::gate(
-                "agent_cannot_self_accept",
+                GateCode::AgentCannotSelfAccept,
                 format!("`{verb}` is a human act — agents never self-accept standing rules"),
                 fixes![
                     fix!("ask your human to run `kanspec {verb} <id>`"),

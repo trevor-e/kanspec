@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::cache::GitState;
 use crate::ctx::Actor;
-use crate::error::{Fix, KsError, Result};
+use crate::error::{Fix, GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::{DecisionId, ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::{Key, TicketKey};
@@ -263,7 +263,7 @@ impl Plan {
                     for (k, _) in sets {
                         if crate::keys::RESERVED_DERIVED.contains(&k.as_str()) {
                             return Err(KsError::gate(
-                                "derived_key_write",
+                                GateCode::DerivedKeyWrite,
                                 format!("`{k}` is a derived fact — it has no write path"),
                                 fixes![fix!("kanspec scan"), fix!("kanspec doctor")],
                             ));

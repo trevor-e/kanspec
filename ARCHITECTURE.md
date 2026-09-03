@@ -183,7 +183,7 @@ pub enum KsError {
     #[error("{kind} {id} not found")]
     NotFound   { kind: &'static str, id: String, fix: Fixes },
     #[error("{message}")]
-    Gate       { code: &'static str, message: String, detail: GateDetail, fix: Fixes },
+    Gate       { code: GateCode, message: String, detail: GateDetail, fix: Fixes },
     #[error("{message}")]
     Environment{ code: EnvCode, message: String, fix: Fixes },
     #[error("{message}")]
@@ -197,7 +197,7 @@ pub enum KsError {
 }
 
 impl KsError {
-    pub fn gate(code: &'static str, message: impl Into<String>, fix: Fixes) -> KsError {
+    pub fn gate(code: GateCode, message: impl Into<String>, fix: Fixes) -> KsError {
         KsError::Gate { code, message: message.into(), detail: GateDetail::Plain, fix }
     }
     /// ✅ There is NO `#[from] std::io::Error`. A bare `?` on a file op cannot
@@ -1552,7 +1552,7 @@ impl Triage {
 ## 3. Error strategy
 
 **Shape, not situation.** Eight closed shapes (§2.1). A new refusal is
-`KsError::gate("undispositioned", msg, fixes![..])` **in the raising agent's own file** —
+`KsError::gate(GateCode::Undispositioned, msg, fixes![..])` **in the raising agent's own file** —
 `error.rs` never grows, which removes the single worst merge magnet from a 9-agent build. `code:
 &'static str` remains a stable JSON discriminator, so agent-facing error kinds stay as precise as
 a per-situation enum. The two errors whose output quality *is* the product keep structured

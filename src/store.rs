@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, MdDoc, SetOutcome, Yv};
 use crate::ids::{ItemKind, ItemRef, Minter, ProposalId, SpecName, TicketId};
 use crate::lock::{LockOwner, LockToken};
@@ -805,7 +805,7 @@ fn set_key(doc: &mut MdDoc, key: &str, val: &Yv, order: &[&str], path: &Path) ->
 /// re-attest (D-12).
 fn broken_log(id: &TicketId, v: crate::transitions::LogViolation) -> KsError {
     KsError::gate(
-        "log_violation",
+        GateCode::LogViolation,
         format!("{id}: {v}"),
         fixes![
             fix!("kanspec log {id}"),

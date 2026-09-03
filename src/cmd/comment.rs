@@ -16,7 +16,7 @@ use crate::cli::{CommentArgs, CommentCommand, CommentsArgs, ExpireArgs, PromoteA
 use crate::cmd::proposal::{live, next_lines, proposal_or_refuse};
 use crate::cmd::ticket::facts;
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::ids::{CommentId, ItemRef, ProposalId};
 use crate::model::{CommentOp, CommentOpKind, Proposal, Snapshot};
 use crate::out::{glyph, Color, Line, Render, Style};
@@ -576,7 +576,7 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
             // competing write path for the one record type that is deliberately edited as
             // ordinary code and reviewed in the PR.
             return Err(KsError::gate(
-                "promote_spec_ships_in_code",
+                GateCode::PromoteSpecShipsInCode,
                 format!(
                     "a spec rule is written on the branch that implements it, not minted \
                      here — add the bullet with the exact item token {{{item}}} (a bare \

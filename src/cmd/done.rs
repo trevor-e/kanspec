@@ -20,7 +20,7 @@ use serde::Serialize;
 use crate::cli::DoneArgs;
 use crate::cmd::ticket::{facts, join, minted};
 use crate::ctx::{Ctx, OutMode};
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::git::ChangedPath;
 use crate::ids::{DecisionId, Minter, ProposalId, QuirkId, TicketId};
@@ -411,7 +411,7 @@ pub fn plan_done(
 /// says it again, so no caller can reach the transition without passing it.
 fn no_code_from_review(id: &TicketId) -> KsError {
     KsError::gate(
-        "no_code_from_review",
+        GateCode::NoCodeFromReview,
         format!("{id} was shipped for review — `--no-code` cannot close work that has a branch"),
         fixes![
             fix!("kanspec scan --explain {id}"),

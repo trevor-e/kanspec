@@ -15,7 +15,7 @@ use crate::cli::{DropArgs, ParkArgs, ReadyArgs, ShipArgs, StartArgs};
 use crate::cmd::ticket::{facts, join};
 use crate::ctx::Ctx;
 use crate::derive::{self, Badge};
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::Minter;
 use crate::ids::{ProposalId, QuirkId, SpecName, TicketId};
@@ -664,7 +664,7 @@ fn integration_check(ctx: &Ctx, base: &str) -> Result<Option<String>> {
     if ctx.git.carries("HEAD", &store) && !ctx.git.carries(base, &store) {
         if on == main {
             return Err(KsError::gate(
-                "main_behind",
+                GateCode::MainBehind,
                 format!(
                     "{base} does not carry {store} yet — {on} is {ahead} commit{} ahead of \
                      it, and a ticket branch cut from {base} would have no store",
@@ -679,7 +679,7 @@ fn integration_check(ctx: &Ctx, base: &str) -> Result<Option<String>> {
             on.clone()
         };
         return Err(KsError::gate(
-            "main_blind",
+            GateCode::MainBlind,
             format!(
                 "{base} has never carried {store} — the store lives on {on}, and a ticket \
                  branch cut from {base} would have none"
@@ -750,7 +750,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
         // A ticket claimed without a branch, or a branch someone deleted: say which,
         // because "cannot resolve HEAD" is not actionable.
         KsError::gate(
-            "no_head_to_record",
+            GateCode::NoHeadToRecord,
             format!("{id}: cannot read a head SHA from `{rev}` — {e}"),
             fixes![
                 fix!("git switch -c {rev}"),
@@ -771,7 +771,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
             crate::git::Tri::Yes(0)
         ) {
             return Err(KsError::gate(
-                "nothing_to_ship",
+                GateCode::NothingToShip,
                 format!("{id}: `{rev}` carries no commits that {base} does not already have"),
                 fixes![
                     fix!("git commit -m \"...\" && git push origin {rev}"),
@@ -1013,7 +1013,7 @@ fn require_why(id: &TicketId, why: &str, verb: &'static str) -> Result<String> {
     let why = why.trim();
     if why.is_empty() {
         return Err(KsError::gate(
-            "why_is_required",
+            GateCode::WhyIsRequired,
             format!("`{verb} {id}` records a reason, so nothing rots silently"),
             fixes![
                 fix!("kanspec {verb} {id} --why \"what actually happened\""),

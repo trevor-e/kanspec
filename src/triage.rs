@@ -21,7 +21,7 @@ use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Serialize;
 
 use crate::cli::DoneArgs;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::git::ChangedPath;
 use crate::ids::{SpecName, TicketId};
 use crate::model::{Severity, Snapshot, Step, Ticket};
@@ -207,7 +207,7 @@ impl Triage {
         // is silence, and silence is exactly the failure mode `done` exists to close.
         if a.spawn.is_empty() && !a.no_followups {
             return Err(KsError::gate(
-                "followups_unanswered",
+                GateCode::FollowupsUnanswered,
                 format!(
                     "{id}: leftover work is a recorded claim — say whether any remains, \
                      even if none does"
@@ -227,7 +227,7 @@ impl Triage {
         }
         if a.quirk.is_empty() && !a.no_quirks {
             return Err(KsError::gate(
-                "quirks_unanswered",
+                GateCode::QuirksUnanswered,
                 format!(
                     "{id}: a landmine is cheapest to record while the burn is fresh — say \
                      whether you hit one"
@@ -471,7 +471,7 @@ fn assemble(
             .join(", ");
         let first = orphans[0].index;
         return Err(KsError::gate(
-            "steps_undispositioned",
+            GateCode::StepsUndispositioned,
             format!(
                 "{id}: {} unchecked step{} with no outcome — {listed}",
                 orphans.len(),
@@ -507,7 +507,7 @@ fn assemble(
             }
             StepDisposition::Drop { index, why } if why.trim().is_empty() => {
                 return Err(KsError::gate(
-                    "step_dropped_without_reason",
+                    GateCode::StepDroppedWithoutReason,
                     format!("{id}: step {index} was dropped without a reason"),
                     fixes![fix!(
                         "kanspec done {id}{} --drop-step \"{index}:why it will never be done\"",
@@ -533,7 +533,7 @@ fn assemble(
         // it by path match, so pathless is the same as absent, only harder to notice.
         if q.paths.is_empty() {
             return Err(KsError::gate(
-                "quirk_without_paths",
+                GateCode::QuirkWithoutPaths,
                 format!(
                     "{id}: quirk \"{}\" names no paths — a quirk nothing matches never warns \
                      anyone",
@@ -617,7 +617,7 @@ fn steps_from_args(t: &Ticket, a: &DoneArgs) -> Result<Vec<StepDisposition>> {
             // would make the ticket's own `## Steps` disagree with its followups. Work
             // that was never a step is `kanspec new`'s job.
             return Err(KsError::gate(
-                "spawn_without_step",
+                GateCode::SpawnWithoutStep,
                 format!(
                     "{id}: `--spawn \"{title}\"` has no unchecked step left to attach to — \
                      leftover triage spawns from the ticket's own steps"
@@ -797,8 +797,7 @@ fn parse_waivers(
                 [one] => (Some(one.clone()), r),
                 [] => (None, r),
                 many => {
-                    return Err(KsError::gate(
-                        "spec_unchanged_blanket",
+                    return Err(KsError::gate(GateCode::SpecUnchangedBlanket,
                         format!(
                             "{id}: --spec-unchanged \"{r}\" answers for {} specs at once — say which:{}",
                             many.len(),
@@ -861,7 +860,7 @@ fn uncovered(
     )));
     let head = fixes.remove(0);
     KsError::gate(
-        "spec_unchanged_unrecorded",
+        GateCode::SpecUnchangedUnrecorded,
         format!(
             "{id}: the branch touched code {} own{} without editing {}:{}",
             plural_specs(remaining.len()),
@@ -1040,7 +1039,7 @@ impl<'io> Prompter<'io> {
             // EOF mid-gate. Answering for the user is the one thing this gate may never
             // do, so it says which flags carry the answer instead.
             return Err(KsError::gate(
-                "triage_input_closed",
+                GateCode::TriageInputClosed,
                 "the close-out gate needs an answer and stdin closed",
                 fixes![
                     fix!("kanspec done <id> --json --no-followups --no-quirks"),
@@ -1082,7 +1081,7 @@ fn ask_step(io: &mut Prompter<'_>, st: &Step) -> Result<StepDisposition> {
         }
     }
     Err(KsError::gate(
-        "triage_unanswered",
+        GateCode::TriageUnanswered,
         format!("step {} was never dispositioned", st.index),
         fixes![
             fix!("kanspec done <id> --drop-step \"{}:reason\"", st.index),

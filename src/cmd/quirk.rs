@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::cli::{QuirkArgs, QuirkCommand, QuirksArgs, SeverityArg};
 use crate::cmd::ticket::{first_minted, write_next};
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{QuirkId, TicketId};
 use crate::keys::{Key, QuirkKey};
@@ -123,7 +123,7 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
         s.ticket(&by)?;
         if q.fm.status != QuirkStatus::Active {
             return Err(KsError::gate(
-                "quirk_not_active",
+                GateCode::QuirkNotActive,
                 format!("{id} is already `{}`", status_word(q.fm.status)),
                 fixes![fix!("kanspec quirks")],
             ));

@@ -19,7 +19,7 @@ use serde::Serialize;
 use crate::cli::InitArgs;
 use crate::config::Config;
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::hooks::{relative_to as rel, Edit, HookReport};
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::{fix, fixes};
@@ -284,7 +284,7 @@ fn refuse_taken_projections(ctx: &Ctx) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     Err(KsError::gate(
-        "projection_path_taken",
+        GateCode::ProjectionPathTaken,
         format!("{names} already exists and kanspec did not generate it — refusing to claim it"),
         fixes![
             fix!(

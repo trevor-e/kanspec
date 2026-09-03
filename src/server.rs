@@ -44,7 +44,7 @@ use crate::cli::{
     ShowArgs, StartArgs, StatusArgs,
 };
 use crate::ctx::Ctx;
-use crate::error::{code, KsError, Result};
+use crate::error::{code, GateCode, KsError, Result};
 use crate::ids::{ItemRef, ProposalId};
 use crate::{fix, fixes};
 
@@ -165,7 +165,7 @@ fn banner(ctx: &Ctx, port: u16) {
 fn bind_error(port: u16, e: &std::io::Error) -> KsError {
     if e.kind() == std::io::ErrorKind::AddrInUse {
         return KsError::gate(
-            "port_in_use",
+            GateCode::PortInUse,
             format!("127.0.0.1:{port} is already in use — kanspec up may already be running"),
             fixes![
                 fix!("kanspec open"),
@@ -174,7 +174,7 @@ fn bind_error(port: u16, e: &std::io::Error) -> KsError {
         );
     }
     KsError::gate(
-        "bind_failed",
+        GateCode::BindFailed,
         format!("cannot bind 127.0.0.1:{port}: {e}"),
         fixes![fix!("kanspec up --port {}", port.saturating_add(1))],
     )
