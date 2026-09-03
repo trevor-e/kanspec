@@ -32,6 +32,9 @@ pub enum Actor {
     Agent { session: String, tool: String },
 }
 
+/// The width `logentry::sanitize_actor` truncates to; a label is never longer.
+pub const LABEL_MAX: usize = 20;
+
 impl Actor {
     /// `KANSPEC_ACTOR` + `KANSPEC_ACTOR_KIND` (tests) >
     /// `CLAUDE_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`/`CURSOR_SESSION_ID`/`CODEX_SESSION_ID`
@@ -90,12 +93,21 @@ impl Actor {
 
     /// `"trevor"` | `"claude/sess-a91"`. Never contains whitespace: the `## Log` column
     /// grammar is parsed by splitting.
+    /// Never longer than the `## Log` actor column: the log line and `claimed_by:` must
+    /// carry the same bytes, or `double_claims` reads a session id the column truncated as
+    /// a second holder. A Claude Code session id is a 36-char UUID; twenty characters of
+    /// `claude/<uuid>` still identify it.
     pub fn label(&self) -> String {
         let raw = match self {
             Actor::Human { name } => name.clone(),
             Actor::Agent { session, tool } => format!("{tool}/{session}"),
         };
-        raw.split_whitespace().collect::<Vec<_>>().join("-")
+        raw.split_whitespace()
+            .collect::<Vec<_>>()
+            .join("-")
+            .chars()
+            .take(LABEL_MAX)
+            .collect()
     }
 
     pub fn is_agent(&self) -> bool {
@@ -335,6 +347,14 @@ mod tests {
         };
         assert_eq!(b.label(), "claude/sess-a91");
         assert!(b.is_agent() && !a.is_agent());
+        // A session id the log column would truncate is truncated in the label too, so
+        // `claimed_by:` and the log line agree byte for byte.
+        let c = Actor::Agent {
+            session: "3871e3aa-3ccf-5711-8fa2-694001ce730a".into(),
+            tool: "claude".into(),
+        };
+        assert_eq!(c.label(), "claude/3871e3aa-3ccf");
+        assert_eq!(c.label().chars().count(), LABEL_MAX);
     }
 
     #[test]

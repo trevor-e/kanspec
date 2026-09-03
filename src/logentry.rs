@@ -96,7 +96,7 @@ fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
 fn sanitize_actor(a: &str) -> String {
     a.chars()
         .map(|c| if c.is_whitespace() { '-' } else { c })
-        .take(20)
+        .take(crate::ctx::LABEL_MAX)
         .collect()
 }
 
