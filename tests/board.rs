@@ -855,3 +855,83 @@ fn plain_repo() -> TestRepo {
 fn new_ticket_in(repo: &TestRepo, title: &str) -> String {
     new_ticket(repo, &["new", title, "--spec", "auth"])
 }
+
+/// t-ec60: the Review-queue tab. A proposal in review is a row with its unresolved count
+/// and the one command that moves it; `status`'s YOU line and this row read the same
+/// `derive::unresolved`, so they cannot disagree.
+#[test]
+fn the_review_queue_lists_proposals_in_review_with_their_open_threads() {
+    let repo = TestRepo::new();
+    ks(
+        &repo,
+        &[
+            "spec",
+            "new",
+            "auth",
+            "--feature",
+            "Login",
+            "--code",
+            "src/**",
+        ],
+    )
+    .ok();
+    ks(&repo, &["propose", "Login rate limiting", "--spec", "auth"]).ok();
+    let dir = std::fs::read_dir(repo.root.join(".kanspec/proposals"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.starts_with("p-"))
+        .expect("a proposal directory");
+    let id = dir[..6].to_string();
+    let rel = format!(".kanspec/proposals/{dir}/proposal.md");
+    let src = repo.read(&rel);
+    let (fm, _) = src.split_once("\n---\n").expect("frontmatter");
+    repo.write(
+        &rel,
+        &format!("{fm}\n---\n## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n\n## Tickets\n"),
+    );
+
+    // A draft is nobody's to approve: not queued.
+    assert!(model(&repo)["review_queue"].as_array().unwrap().is_empty());
+
+    ks(&repo, &["review", &id]).ok();
+    let q = model(&repo)["review_queue"].as_array().unwrap().clone();
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert_eq!(q[0]["id"], id);
+    assert_eq!(q[0]["unresolved"], 0);
+    assert_eq!(q[0]["fix"], format!("kanspec approve {id}"), "{q:?}");
+    assert_eq!(q[0]["specs"], serde_json::json!(["auth"]));
+
+    // An open thread: the count moves and the fix becomes the page, where the thread is.
+    ks(
+        &repo,
+        &["comment", "add", &format!("{id}#c1"), "--body", "too broad"],
+    )
+    .ok();
+    let q = model(&repo)["review_queue"].as_array().unwrap().clone();
+    assert_eq!(q[0]["unresolved"], 1, "{q:?}");
+    assert!(
+        q[0]["fix"].as_str().unwrap().contains(&format!("/p/{id}")),
+        "{q:?}"
+    );
+
+    // The terminal and markdown boards carry the same queue.
+    let term = ks(&repo, &["board"]).ok().stdout;
+    assert!(
+        term.contains("REVIEW QUEUE") && term.contains("1 open"),
+        "{term}"
+    );
+    ks(&repo, &["board", "--export", "board.md"]).ok();
+    let md = repo.read("board.md");
+    assert!(
+        md.contains("## Review queue (1)") && md.contains(&id),
+        "{md}"
+    );
+
+    // Approved: gone from the queue.
+    let cm: Value = json(&repo, &["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    ks(&repo, &["comment", "resolve", &cid, "--note", "narrowed"]).ok();
+    ks(&repo, &["approve", &id]).ok();
+    assert!(model(&repo)["review_queue"].as_array().unwrap().is_empty());
+}

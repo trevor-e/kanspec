@@ -1,16 +1,16 @@
 ---
 id: t-ec60
 title: 'Board: Review-queue tab'
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-ec60-board-review-queue-tab
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ The board's review-queue tab (proposals in review, unresolved counts, approve fr
 
 ## Log
 - 2026-09-02T03:50Z  todo     trevor                new
+- 2026-09-03T04:01Z  doing    noreply               start (branch created)

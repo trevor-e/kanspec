@@ -624,7 +624,7 @@ async fn post_review(
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::proposal::ReviewReport> {
     mutate(&st, "", 0, format!("review {id}"), move |ctx, _: ()| {
-        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id })
+        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id, export: None })
     })
     .await
 }

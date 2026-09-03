@@ -361,6 +361,7 @@ expression: board
   ],
   "generated_at": "[ts]",
   "rev": 0,
+  "review_queue": [],
   "worktrees": [
     {
       "ahead": 0,

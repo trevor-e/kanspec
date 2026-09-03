@@ -792,3 +792,74 @@ fn a_row_an_agent_wrote_says_so_beside_its_label_and_a_humans_does_not() {
     let jsonl = repo.read(&format!(".kanspec/proposals/{p}/comments.jsonl"));
     assert_eq!(jsonl.matches("\"via\":\"agent\"").count(), 2, "{jsonl}");
 }
+
+/// t-f3a4: the page is loopback-only, and a reviewer on a phone had to have the proposal
+/// mirrored by hand. `review --export` writes the page as one static file: the proposal,
+/// every thread read-only, no script and no form.
+#[test]
+fn review_export_writes_the_page_as_one_static_comment_less_file() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nCredential stuffing hit staging.\n\n## Changes\n- [c1] auth: lockout after 5 failures\n\n## Testing\n- run the login suite\n\n## Prescriptions\n- [p1] (promote: decision) lockout state lives in Redis <only>\n\n## Tickets\n- [t1] Rate-limit login endpoint · S\n",
+    );
+    repo.ks([
+        "comment",
+        "add",
+        &format!("{id}#c1"),
+        "--body",
+        "too broad & vague",
+    ])
+    .ok();
+
+    let r: serde_json::Value = repo.json(&["review", id, "--export", "page.html"]);
+    assert_eq!(r["status"], "review");
+    let exported = r["exported"].as_str().expect("where it wrote");
+    assert!(exported.ends_with("page.html"), "{exported}");
+    let html = std::fs::read_to_string(exported).expect("the file");
+
+    for needle in [
+        "Credential stuffing hit staging.",
+        "lockout after 5 failures",
+        "[c1]",
+        "PROMOTE → decision",
+        "lockout state lives in Redis &lt;only&gt;",
+        "Rate-limit login endpoint",
+        "## Testing".trim_start_matches("## "),
+        "run the login suite",
+        "too broad &amp; vague",
+        "1 open",
+        "<style>",
+    ] {
+        assert!(html.contains(needle), "the page lost {needle:?}:\n{html}");
+    }
+    assert!(
+        !html.contains("<script") && !html.contains("<form") && !html.contains("<button"),
+        "static and comment-less: no script, no form, no button\n{html}"
+    );
+    assert!(
+        !html.contains("(promote:"),
+        "the marker is the badge, not the text"
+    );
+
+    // Re-running exports the page as it is now: the thread resolved shows resolved.
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    repo.ks(["comment", "resolve", &cid, "--note", "narrowed to /login"])
+        .ok();
+    repo.ks(["review", id, "--export", "page.html"]).ok();
+    let html = repo.read("page.html");
+    assert!(
+        html.contains("✓ narrowed to /login") && html.contains("nothing open"),
+        "{html}"
+    );
+    let human = repo.ks(["review", id, "--export", "page.html"]).ok().stdout;
+    assert!(
+        human.contains("exported") && human.contains("page.html"),
+        "{human}"
+    );
+}

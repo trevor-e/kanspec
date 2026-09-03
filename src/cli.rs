@@ -685,6 +685,10 @@ pub struct ProposeArgs {
 pub struct ReviewArgs {
     /// The proposal to put up for review
     pub id: String,
+    /// Also write the review page as one self-contained HTML file — static and
+    /// comment-less, for reading away from the machine that runs `kanspec up`
+    #[arg(long, value_name = "FILE")]
+    pub export: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

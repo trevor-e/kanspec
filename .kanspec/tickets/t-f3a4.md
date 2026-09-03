@@ -1,16 +1,16 @@
 ---
 id: t-f3a4
 title: Review page reachable away from the Mac
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-f3a4-review-page-reachable-away-from-the-mac
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ Found in the adulting trial: the page is loopback-only, Trevor was on his phone,
 
 ## Log
 - 2026-09-02T03:50Z  todo     trevor                new
+- 2026-09-03T04:01Z  doing    noreply               start (branch created)

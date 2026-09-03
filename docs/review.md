@@ -16,6 +16,7 @@ profile." then the column, the wire field, the validation.
 ```
 kanspec propose "Login rate limiting" --spec auth   # scaffolds proposals/p-7de2-.../proposal.md
 kanspec review p-7de2                               # draft -> review, prints the review URL
+kanspec review p-7de2 --export page.html            # ...and a static, comment-less copy of the page
 ```
 
 The bracket ids are **visible text on purpose**. They are the comment anchors, the

@@ -284,7 +284,9 @@ STATUS & GIT TRUTH
 
 PROPOSALS & REVIEW
   kanspec propose "title" [--spec S]  scaffold proposal.md (status draft), prints file path
-  kanspec review p-7de2               status -> review; prints review page URL
+  kanspec review p-7de2 [--export page.html]
+                                      status -> review; prints review page URL; --export writes the
+                                      page as one static, comment-less HTML file for reading elsewhere
   kanspec comments [p-x|t-x] [--unresolved --json]
   kanspec comment add|reply|resolve <target|cm-id> ...     (resolve requires --note)
   kanspec approve p-7de2              human act, recorded who/when; REFUSES with unresolved threads;

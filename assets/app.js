@@ -170,6 +170,7 @@ function render() {
   if (state.tab === 'all') main.appendChild(renderBoard(b.columns));
   else if (state.tab === 'spec') main.appendChild(renderBySpec(b));
   else if (state.tab === 'worktrees') main.appendChild(renderWorktrees(b.worktrees || []));
+  else if (state.tab === 'review') main.appendChild(renderReviewQueue(b));
   else main.appendChild(renderRules());
 
   for (const t of document.querySelectorAll('.tab')) {
@@ -375,6 +376,75 @@ function renderBySpec(b) {
   }
 
   if (!wrap.childNodes.length) wrap.appendChild(el('div', 'col-empty', 'no open tickets'));
+  return wrap;
+}
+
+// ── review queue: what a human owes a decision on ───────────────────────────
+//
+// Proposals in review (approve from here, or open the page to comment) and the tickets
+// sitting in the review column. The approve button posts to the SAME gated verb the CLI
+// runs, so a proposal with open threads is refused here exactly as it is there.
+
+function renderReviewQueue(b) {
+  const wrap = el('div', 'table-wrap');
+  const rows = b.review_queue || [];
+  wrap.appendChild(el('h2', 'sec-title', 'Proposals in review (' + rows.length + ')'));
+  const t = el('table', 'wt');
+  const head = el('tr');
+  for (const h of ['proposal', 'title', 'specs', 'threads', 'since', '']) head.appendChild(el('th', null, h));
+  t.appendChild(head);
+  if (!rows.length) {
+    const tr = el('tr');
+    const td = el('td', null, 'nothing in review');
+    td.colSpan = 6;
+    tr.appendChild(td);
+    t.appendChild(tr);
+  }
+  for (const r of rows) {
+    const tr = el('tr');
+    const id = el('td', 'ref');
+    const link = el('a', null, r.id);
+    link.href = '/p/' + r.id;
+    id.appendChild(link);
+    tr.appendChild(id);
+    tr.appendChild(el('td', null, r.title));
+    tr.appendChild(el('td', 'ref', (r.specs || []).join(', ') || '—'));
+    const th = el('td');
+    th.appendChild(el('span', 'pill' + (r.unresolved ? ' warn' : ' ok'),
+      r.unresolved ? r.unresolved + ' open' : 'nothing open'));
+    tr.appendChild(th);
+    tr.appendChild(el('td', null, r.created));
+    const act = el('td');
+    const btn = el('button', 'pill' + (r.unresolved ? ' ghost' : ' go'), 'approve');
+    btn.title = r.unresolved ? 'refuses while threads are open' : 'approve and mint the tickets';
+    btn.onclick = async () => {
+      const res = await fetch('/api/proposal/' + r.id + '/approve', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      });
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        const err = (payload && payload.error) || {};
+        toast(err.message || ('refused (HTTP ' + res.status + ')'), 'err', err.fix && err.fix[0]);
+      } else {
+        toast(r.id + ' approved', 'ok');
+        refresh();
+      }
+    };
+    act.appendChild(btn);
+    tr.appendChild(act);
+    t.appendChild(tr);
+  }
+  wrap.appendChild(t);
+
+  const review = (b.columns || []).find((c) => c.column === 'review');
+  const cards = review ? review.cards : [];
+  wrap.appendChild(el('h2', 'sec-title', 'Tickets in review (' + cards.length + ')'));
+  if (!cards.length) wrap.appendChild(el('p', 'dim', 'nothing shipped for review'));
+  else {
+    const col = el('div', 'col');
+    for (const c of cards) col.appendChild(renderCard(c));
+    wrap.appendChild(col);
+  }
   return wrap;
 }
 

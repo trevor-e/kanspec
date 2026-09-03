@@ -237,6 +237,8 @@ pub struct ReviewReport {
     pub status: ProposalStatus,
     pub url: String,
     pub unresolved: usize,
+    /// where `--export` wrote the static page
+    pub exported: Option<String>,
     pub next: Vec<String>,
 }
 
@@ -272,18 +274,46 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
     }
 
     let open = unresolved(&snap, p);
-    if p.fm.status != S::Review {
-        Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
+    let needs_move = p.fm.status != S::Review;
+    let mut snap = snap;
+    if needs_move {
+        let done = Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
             Ok(Plan::of(vec![Op::SetFields {
                 entity: EntityRef::Proposal(id.clone()),
                 sets: vec![(Key::Proposal(ProposalKey::Status), Yv::s("review"))],
             }]))
         })?;
+        snap = done.snapshot;
     }
+
+    // `--export`: the page as one static file, so it can be read on a phone or pasted
+    // into a PR when the loopback server is out of reach (t-f3a4). Comment-less on
+    // purpose: threads still live on the served page, and a comment relayed by hand is
+    // recorded as whoever relays it — see `via` on the row.
+    let exported = match &a.export {
+        None => None,
+        Some(rel) => {
+            let path = if rel.is_absolute() {
+                rel.clone()
+            } else {
+                ctx.repo.here().join(rel)
+            };
+            let html = crate::board::render_page_html(&page_of(ctx, &snap, &id.to_string())?);
+            let target = path.clone();
+            Store::open(ctx).transact(None, &ctx.invocation(), move |_s, _m| {
+                Ok(Plan::of(vec![Op::WriteGenerated {
+                    path: target,
+                    contents: html,
+                }]))
+            })?;
+            Some(path.display().to_string())
+        }
+    };
 
     Ok(ReviewReport {
         url: format!("http://127.0.0.1:{}/p/{id}", ctx.cfg.port),
         unresolved: open,
+        exported,
         // The URL is only live while `up` is running, and saying so beats a dead link.
         next: vec![format!("{} up", ctx.invoked_as)],
         status: S::Review,
@@ -314,6 +344,11 @@ impl Render for ReviewReport {
             .dim(dim)
             .url(self.url.clone())
             .write(w, st)?;
+        if let Some(p) = &self.exported {
+            Line::new(glyph::OK, format!("exported {p}"))
+                .dim("static, comment-less — threads stay on the served page")
+                .write(w, st)?;
+        }
         next_lines(&self.next, w, st)
     }
 }
@@ -1086,7 +1121,12 @@ pub struct SpecContext {
 pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
     ctx.require_initialized()?;
     let s = ctx.snapshot()?;
-    let p = open_proposal(ctx, &s, raw)?;
+    page_of(ctx, &s, raw)
+}
+
+/// [`page`] over a snapshot the caller already holds (§2.16: one store load per command).
+pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
+    let p = open_proposal(ctx, s, raw)?;
 
     let ops = s.comments.get(&p.fm.id).map(Vec::as_slice).unwrap_or(&[]);
     let (live, orphaned) = crate::cmd::comment::fold_threads(p, ops);
@@ -1149,7 +1189,7 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
             })
             .collect();
 
-    let open = unresolved(&s, p);
+    let open = unresolved(s, p);
     let why = section(&p.body, "## Why");
     let (why_headline, why_detail) = split_headline(&why);
     Ok(ProposalPage {
