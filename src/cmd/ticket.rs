@@ -495,9 +495,7 @@ impl Render for LsReport {
                 format!("no tickets match {}", self.filtered.join(" + "))
             };
             // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
-            return Line::new('·', what)
-                .fix(crate::out::spoken("kanspec new \"...\""))
-                .write(w, st);
+            return Line::new('·', what).fix("kanspec new \"...\"").write(w, st);
         }
         let mut table = Table::new(&["", "id", "title", "spec", "claimed", "merge", "age"], st);
         for r in &self.rows {

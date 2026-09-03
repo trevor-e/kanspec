@@ -134,7 +134,11 @@ pub fn run(ctx: &Ctx, agent: Agent, remove: bool) -> Result<Vec<SetupChange>> {
     if let Some(path) = files.settings {
         let before = read(&path);
         let after = if remove {
-            before.as_deref().map(strip_settings).transpose()?.flatten()
+            before
+                .as_deref()
+                .map(|b| strip_settings(b, ctx.invoked_as))
+                .transpose()?
+                .flatten()
         } else {
             let entries = hook_entries(ctx.invoked_as, ctx.cfg.hooks.landcheck);
             Some(merge_settings(before.as_deref(), &entries)?)
@@ -294,9 +298,9 @@ fn is_our_event(event: &str) -> bool {
 /// names count, and so does whatever name this process was invoked under — otherwise a
 /// symlinked binary would stack a fresh entry on every `setup` and `--remove` would strip
 /// none of them.
-fn is_kanspec_command(cmd: &str) -> bool {
+fn is_kanspec_command(cmd: &str, invoked_as: &str) -> bool {
     ["prime", "quirks --touch", "landcheck"].iter().any(|verb| {
-        [crate::cli::invoked_as(), "kanspec", "ks"]
+        [invoked_as, "kanspec", "ks"]
             .iter()
             .any(|bin| word(cmd, bin, verb))
     })
@@ -353,7 +357,13 @@ pub fn merge_settings(
             .and_then(|g| g.entry("hooks").or_insert_with(|| json!([])).as_array_mut())
             .ok_or_else(|| bad(&format!("`hooks.{event}[].hooks` is not an array")))?;
 
-        match inner.iter().position(|h| is_kanspec_command(command_of(h))) {
+        // The entry being merged is spelled with the binary that ran `setup`, so its own
+        // command word is the third name a foreign entry might carry.
+        let invoked_as = command.split_whitespace().next().unwrap_or("kanspec");
+        match inner
+            .iter()
+            .position(|h| is_kanspec_command(command_of(h), invoked_as))
+        {
             Some(i) => inner[i] = json!({ "type": "command", "command": command }),
             None => inner.push(json!({ "type": "command", "command": command })),
         }
@@ -363,7 +373,7 @@ pub fn merge_settings(
 
 /// Take out exactly what [`merge_settings`] put in. `None` means the file held nothing but
 /// kanspec's hooks and should go away rather than linger as `{}`.
-pub fn strip_settings(existing: &str) -> Result<Option<String>> {
+pub fn strip_settings(existing: &str, invoked_as: &str) -> Result<Option<String>> {
     let mut root = parse(Some(existing))?;
     if let Some(hooks) = root.get_mut("hooks").and_then(Value::as_object_mut) {
         for (event, list) in hooks.iter_mut() {
@@ -378,7 +388,7 @@ pub fn strip_settings(existing: &str) -> Result<Option<String>> {
                     return true;
                 };
                 let had = inner.len();
-                inner.retain(|h| !is_kanspec_command(command_of(h)));
+                inner.retain(|h| !is_kanspec_command(command_of(h), invoked_as));
                 // A group we emptied is a group we created. One the user left empty is
                 // theirs, and stays.
                 !(inner.is_empty() && had > 0)
@@ -539,7 +549,7 @@ mod tests {
         assert_eq!(v["hooks"]["PostToolUse"][0]["matcher"], json!(EDIT_TOOLS));
 
         // …and removal puts it back exactly as it was.
-        let stripped = strip_settings(&merged).unwrap().unwrap();
+        let stripped = strip_settings(&merged, "kanspec").unwrap().unwrap();
         let back: Value = serde_json::from_str(&stripped).unwrap();
         let want: Value = serde_json::from_str(foreign).unwrap();
         assert_eq!(back, want);
@@ -549,7 +559,7 @@ mod tests {
     fn a_settings_file_that_held_only_our_hooks_goes_away_again() {
         let merged = merge_settings(None, &entries()).unwrap();
         assert!(merged.ends_with('\n'));
-        assert_eq!(strip_settings(&merged).unwrap(), None);
+        assert_eq!(strip_settings(&merged, "kanspec").unwrap(), None);
     }
 
     #[test]
@@ -598,19 +608,25 @@ mod tests {
                 .iter()
                 .find(|(ev, _, _)| ev == event)
                 .unwrap_or_else(|| panic!("{event} is documented ({why}) but never installed"));
-            assert!(is_kanspec_command(&e.2), "{event}: {}", e.2);
+            assert!(is_kanspec_command(&e.2, "kanspec"), "{event}: {}", e.2);
         }
         assert_eq!(on.len(), AGENT_HOOKS.len(), "an undocumented hook appeared");
     }
 
     #[test]
     fn only_our_commands_look_like_ours() {
-        assert!(is_kanspec_command("kanspec prime"));
-        assert!(is_kanspec_command("ks landcheck"));
-        assert!(is_kanspec_command("f=$(jq -r x); ks quirks --touch \"$f\""));
-        assert!(!is_kanspec_command("echo mine"));
-        assert!(!is_kanspec_command("works prime"), "word boundaries matter");
-        assert!(!is_kanspec_command("kanspec status"));
+        assert!(is_kanspec_command("kanspec prime", "kanspec"));
+        assert!(is_kanspec_command("ks landcheck", "kanspec"));
+        assert!(is_kanspec_command(
+            "f=$(jq -r x); ks quirks --touch \"$f\"",
+            "kanspec"
+        ));
+        assert!(!is_kanspec_command("echo mine", "kanspec"));
+        assert!(
+            !is_kanspec_command("works prime", "kanspec"),
+            "word boundaries matter"
+        );
+        assert!(!is_kanspec_command("kanspec status", "kanspec"));
     }
 
     /// The agent contract may not prescribe a command the binary refuses.

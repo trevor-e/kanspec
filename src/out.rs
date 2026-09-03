@@ -23,11 +23,16 @@ use crate::error::{KsError, Result};
 pub struct Style {
     pub color: bool,
     pub width: usize,
+    /// `"kanspec"` or `"ks"`: every fix a `Line` prints is spelled with it, at write time,
+    /// so a pure producer (derive, transitions) writes `kanspec …` and never knows the
+    /// binary's name (t-a535).
+    pub invoked_as: &'static str,
 }
 
 impl Style {
     pub fn plain() -> Style {
         Style {
+            invoked_as: "kanspec",
             color: false,
             width: 100,
         }
@@ -40,7 +45,7 @@ pub trait Render: serde::Serialize {
 }
 
 /// The single emit point. A broken pipe (`kanspec ls | head`) is success, not an error.
-pub fn emit<R: Render>(r: &R, mode: &OutMode) -> Result<()> {
+pub fn emit<R: Render>(r: &R, mode: &OutMode, invoked_as: &'static str) -> Result<()> {
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
     let res = match mode {
@@ -52,6 +57,7 @@ pub fn emit<R: Render>(r: &R, mode: &OutMode) -> Result<()> {
             let st = Style {
                 color: *color,
                 width: term_width(),
+                invoked_as,
             };
             r.human(&mut w, &st).and_then(|()| w.flush())
         }
@@ -167,7 +173,7 @@ impl Line {
         let tail = self
             .fix
             .as_deref()
-            .map(|f| format!("→ {f}"))
+            .map(|f| format!("→ {}", spoken_as(f, st.invoked_as)))
             .or_else(|| self.url.clone());
         match tail {
             None => writeln!(w, "{left}"),
@@ -279,19 +285,15 @@ pub fn visible_len(s: &str) -> usize {
 /// unset KANSPEC_NOW                                       # an env var
 /// ```
 ///
-/// So the rewrite fires only where `kanspec` stands in COMMAND POSITION: at the very start
+/// The rewrite fires only where `kanspec` stands in COMMAND POSITION: at the very start
 /// of the string, or immediately after a backtick (the fixes that quote a command inside
 /// prose), and only where the word ends there — end of string, a space, or the closing
 /// backtick. `.kanspec/` is preceded by `.`, `"kanspec: sync"` is preceded by `"` and
 /// followed by `:`, and `KANSPEC_NOW` is not even the same bytes; none of the three can
 /// match, whatever else is in the string.
-pub fn spoken(cmd: &str) -> String {
-    spoken_as(cmd, crate::cli::invoked_as())
-}
-
-/// [`spoken`] against an explicit binary name. Split out for the same reason
-/// `Verb::command_as` is (ARCHITECTURE D-43): it is the seam tests pin both spellings
-/// through without racing a set-once `OnceLock`.
+/// `spoken_as(cmd, "ks")` rewrites the command word to the binary the user typed. Applied
+/// at RENDER time — `Line::write`, `KsError::render`, `KsError::to_json_as` — against the
+/// name the `Ctx` carries, never against a process global (t-a535).
 pub fn spoken_as(cmd: &str, ks: &str) -> String {
     const NAME: &str = "kanspec";
     if ks == NAME {

@@ -187,8 +187,39 @@ pub struct Ctx {
     pub invocation: String,
 }
 
+/// How this `Ctx` was asked for: the binary name the user typed and the command line the
+/// `## Log` note records. Supplied by whoever builds the `Ctx` — `run()` from its argv, the
+/// server from the verb the browser asked for, a test from a literal — so `Ctx` reads no
+/// process global and no `std::env::args()`, and a second caller needs no override hook
+/// (t-a535: every web verb used to log itself as `kanspec up --port …`).
+#[derive(Clone, Debug)]
+pub struct Invocation {
+    /// `"kanspec"` or `"ks"` — what every fix line and `next` command is spelled with
+    pub invoked_as: &'static str,
+    /// `"kanspec ship t-9c41 --pr 142"` — the Log note, and `Store::transact`'s `cmdline`
+    pub cmdline: String,
+}
+
+impl Invocation {
+    /// `Invocation::of("ks", ["ship", "t-9c41"])` → cmdline `ks ship t-9c41`.
+    pub fn of<I, S>(invoked_as: &'static str, args: I) -> Invocation
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let cmdline = std::iter::once(invoked_as.to_string())
+            .chain(args.into_iter().map(|a| a.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Invocation {
+            invoked_as,
+            cmdline,
+        }
+    }
+}
+
 impl Ctx {
-    pub fn open(cli: &Cli, cwd: &Path) -> Result<Ctx> {
+    pub fn open(cli: &Cli, cwd: &Path, inv: Invocation) -> Result<Ctx> {
         let repo = Repo::discover(cwd, cli.repo.as_deref())?;
         let ks = KanspecDir::resolve(&repo);
         let cfg = Config::load(&ks)?;
@@ -204,11 +235,8 @@ impl Ctx {
             actor: Actor::detect(),
             now: detect_now()?,
             out: OutMode::from_cli(cli),
-            invoked_as: crate::cli::invoked_as(),
-            invocation: std::iter::once(crate::cli::invoked_as().to_string())
-                .chain(std::env::args().skip(1))
-                .collect::<Vec<_>>()
-                .join(" "),
+            invoked_as: inv.invoked_as,
+            invocation: inv.cmdline,
         })
     }
 
@@ -235,6 +263,7 @@ impl Ctx {
         Style {
             color: matches!(self.out, OutMode::Human { color: true }),
             width: crate::out::term_width(),
+            invoked_as: self.invoked_as,
         }
     }
 

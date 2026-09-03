@@ -66,10 +66,9 @@ pub fn render(topic: &str) -> Result<String> {
             "instructions topic",
             name.to_string(),
             fixes![
-                fix!("{} instructions", crate::cli::invoked_as()),
+                fix!("kanspec instructions"),
                 fix!(
-                    "{} instructions {}",
-                    crate::cli::invoked_as(),
+                    "kanspec instructions {}",
                     known.first().map(String::as_str).unwrap_or("start")
                 ),
             ],

@@ -11,7 +11,6 @@
 //! Owner: **F** (foundation). FROZEN.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -64,18 +63,6 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// `"kanspec"` or `"ks"` — set once by `run()`, because the log note and every fix line
-/// should name the binary the user actually typed.
-static INVOKED_AS: OnceLock<&'static str> = OnceLock::new();
-
-pub fn set_invoked_as(name: &'static str) {
-    let _ = INVOKED_AS.set(name);
-}
-
-pub fn invoked_as() -> &'static str {
-    INVOKED_AS.get().copied().unwrap_or("kanspec")
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]

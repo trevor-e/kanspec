@@ -42,7 +42,12 @@ impl Fix {
     /// — a rewrite applied per surface would let the human and JSON refusals name
     /// different commands, which is the one drift this crate's whole output design forbids.
     pub fn cmd(s: impl Into<String>) -> Fix {
-        Fix(crate::out::spoken(&s.into()))
+        Fix(s.into())
+    }
+
+    /// The fix as the user should type it — `kanspec` rewritten to the binary they ran.
+    pub fn spoken(&self, invoked_as: &str) -> String {
+        crate::out::spoken_as(&self.0, invoked_as)
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -397,27 +402,29 @@ impl KsError {
 
     /// human -> stderr; json -> a `{"ok":false,…}` envelope on stdout, so an agent that
     /// only reads stdout still gets the refusal and its fix list.
-    pub fn render(&self, mode: &OutMode) {
+    pub fn render(&self, mode: &OutMode, invoked_as: &str) {
         match mode {
             OutMode::Json => {
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(
                     out,
                     "{}",
-                    serde_json::to_string_pretty(&self.to_json())
+                    serde_json::to_string_pretty(&self.to_json_as(invoked_as))
                         .unwrap_or_else(|_| r#"{"ok":false}"#.to_string())
                 );
             }
             OutMode::Human { color } => {
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(self.render_human(*color).as_bytes());
+                let _ = err.write_all(self.render_human(*color, invoked_as).as_bytes());
             }
         }
     }
 
     /// The exact bytes `render` writes in human mode. Split out so it is unit-testable
-    /// without capturing a global stream.
-    pub fn render_human(&self, color: bool) -> String {
+    /// without capturing a global stream. `invoked_as` spells every fix — the same
+    /// rewrite `to_json_as` applies, so the human and JSON refusals cannot name different
+    /// commands.
+    pub fn render_human(&self, color: bool, invoked_as: &str) -> String {
         use crate::out::{paint, Color};
         let mut s = String::new();
         let _ = writeln!(s, "{} {}", paint("✗", Color::Red, color), self);
@@ -445,14 +452,20 @@ impl KsError {
             let _ = writeln!(s, "    {cmd}   exit {exit}");
         }
         for f in self.fixes().iter() {
-            let _ = writeln!(s, "  {} {}", paint("→", Color::Cyan, color), f.as_str());
+            let _ = writeln!(
+                s,
+                "  {} {}",
+                paint("→", Color::Cyan, color),
+                f.spoken(invoked_as)
+            );
         }
         s
     }
 
-    /// `{"ok":false,"error":{kind,code,message,detail,fix,exit}}`
-    pub fn to_json(&self) -> serde_json::Value {
-        let fixes: Vec<&str> = self.fixes().iter().map(Fix::as_str).collect();
+    /// `{"ok":false,"error":{kind,code,message,detail,fix,exit}}`, fixes spelled with the
+    /// binary the user ran.
+    pub fn to_json_as(&self, invoked_as: &str) -> serde_json::Value {
+        let fixes: Vec<String> = self.fixes().iter().map(|f| f.spoken(invoked_as)).collect();
         let mut error = serde_json::json!({
             "kind": self.kind(),
             "message": self.to_string(),
@@ -547,7 +560,7 @@ mod tests {
         for e in &cases {
             assert!(e.fixes().iter().next().is_some(), "{} has no fix", e.kind());
             assert!(matches!(e.exit_code(), 1 | 69 | 70));
-            assert_eq!(e.to_json()["ok"], serde_json::json!(false));
+            assert_eq!(e.to_json_as("kanspec")["ok"], serde_json::json!(false));
         }
     }
 
@@ -562,7 +575,7 @@ mod tests {
         };
         assert_eq!(e.to_string(), "t-9c41 is review, not doing — cannot ship");
         assert_eq!(
-            e.render_human(false),
+            e.render_human(false, "kanspec"),
             "✗ t-9c41 is review, not doing — cannot ship\n  → kanspec show t-9c41\n"
         );
     }

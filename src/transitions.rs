@@ -117,7 +117,8 @@ impl Verb {
     /// string produced here against the real clap tree, so a flag that later becomes
     /// mandatory is a failing test rather than advice that fails in the user's terminal.
     pub fn command(self, id: &TicketId) -> String {
-        self.command_as(crate::cli::invoked_as(), id)
+        // Canonical spelling; `Line::write` and `KsError::render` respell it for `ks`.
+        self.command_as("kanspec", id)
     }
 
     /// [`Verb::command`] against an explicit binary name — `kanspec` or `ks`, whichever the
@@ -291,7 +292,7 @@ pub fn require(id: &TicketId, from: State, verb: Verb) -> Result<State> {
 /// fails on a repeated command, so a future fix line that bounces is a failing test rather
 /// than an agent spinning in someone's terminal.
 fn onward(id: &TicketId, from: State) -> Fixes {
-    let ks = crate::cli::invoked_as();
+    let ks = "kanspec";
     if from.terminal() {
         // `New` mints an id rather than taking one, so `command_as` spells it with the
         // title it needs — the same single source of truth as every other suggestion.

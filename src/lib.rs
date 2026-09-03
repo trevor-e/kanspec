@@ -71,8 +71,6 @@ use crate::out::Render;
 /// reachable from exactly one module in this crate — `cmd::landcheck`, sealed by
 /// `BlockToken`'s private field — so the Stop-hook contract stays auditable by grep.
 pub fn run(invoked_as: &'static str) -> ExitCode {
-    cli::set_invoked_as(invoked_as);
-
     let cmd = Cli::command().name(invoked_as).bin_name(invoked_as);
     let cli = match cmd
         .try_get_matches()
@@ -94,10 +92,11 @@ pub fn run(invoked_as: &'static str) -> ExitCode {
 
     let mode = OutMode::from_cli(&cli);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let ctx = match Ctx::open(&cli, &cwd) {
+    let inv = ctx::Invocation::of(invoked_as, std::env::args().skip(1));
+    let ctx = match Ctx::open(&cli, &cwd, inv) {
         Ok(c) => c,
         Err(e) => {
-            e.render(&mode);
+            e.render(&mode, invoked_as);
             return ExitCode::from(e.exit_code());
         }
     };
@@ -105,7 +104,7 @@ pub fn run(invoked_as: &'static str) -> ExitCode {
     match dispatch(&ctx, &cli) {
         Ok(c) => ExitCode::from(c),
         Err(e) => {
-            e.render(&ctx.out);
+            e.render(&ctx.out, ctx.invoked_as);
             ExitCode::from(e.exit_code())
         }
     }
@@ -128,7 +127,7 @@ pub fn dispatch(ctx: &Ctx, cli: &Cli) -> Result<u8> {
             // A clean prove is exit 0; any Error-severity finding is exit 1, so `doctor`
             // is a CI gate without a wrapper script.
             let r = cmd::doctor::doctor(ctx, a)?;
-            out::emit(&r, &ctx.out)?;
+            out::emit(&r, &ctx.out, ctx.invoked_as)?;
             Ok(r.exit_code())
         }
         C::Instructions(a) => ok(&cmd::setup::instructions(ctx, a)?, ctx),
@@ -184,13 +183,13 @@ pub fn dispatch(ctx: &Ctx, cli: &Cli) -> Result<u8> {
         C::Landcheck(a) => {
             // The ONLY route to exit 2 in the whole crate, sealed by `BlockToken`.
             let r = cmd::landcheck::landcheck(ctx, a)?;
-            out::emit(&r, &ctx.out)?;
+            out::emit(&r, &ctx.out, ctx.invoked_as)?;
             Ok(r.exit_code())
         }
     }
 }
 
 fn ok<R: Render>(r: &R, ctx: &Ctx) -> Result<u8> {
-    out::emit(r, &ctx.out)?;
+    out::emit(r, &ctx.out, ctx.invoked_as)?;
     Ok(code::OK)
 }

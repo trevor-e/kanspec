@@ -112,7 +112,7 @@ impl Render for ReadyReport {
             // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
             let mut line = Line::state(State::Todo, &r.title)
                 .id(&r.id)
-                .fix(crate::out::spoken(&format!("kanspec start {}", r.id)));
+                .fix(format!("kanspec start {}", r.id));
             if !chips.is_empty() {
                 line = line.dim(format!("· {}", chips.join(" · ")));
             }
