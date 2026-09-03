@@ -962,6 +962,12 @@ function renderRail(p) {
   return rail;
 }
 
+// `trevor` / `trevor via agent`: the row's label, and the kind when an agent wrote it.
+function who(label, via) {
+  const name = label || 'someone';
+  return via ? name + ' via ' + via : name;
+}
+
 function renderThread(t, target, orphan) {
   const box = el('div', 'thread' + (t.resolved ? ' resolved' : '') + (orphan ? ' orphan' : ''));
   box.id = 'thread-' + t.id;
@@ -972,13 +978,13 @@ function renderThread(t, target, orphan) {
 
   if (t.quote) box.appendChild(el('blockquote', null, t.quote));
   const first = el('div', 'msg');
-  first.appendChild(el('span', 'who', t.author || 'someone'));
+  first.appendChild(el('span', 'who', who(t.author, t.via)));
   first.appendChild(el('span', null, t.body));
   box.appendChild(first);
 
   for (const r of t.replies) {
     const m = el('div', 'msg reply');
-    m.appendChild(el('span', 'who', r.by || 'someone'));
+    m.appendChild(el('span', 'who', who(r.by, r.via)));
     m.appendChild(el('span', null, r.body));
     box.appendChild(m);
   }

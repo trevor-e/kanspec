@@ -728,3 +728,67 @@ fn a_minted_ticket_takes_its_own_spec_or_the_spec_of_the_change_it_implements() 
         "the marker is not the title: {t2}"
     );
 }
+
+/// t-8e31: labels come from git identity, so an agent relaying a human's comment and the
+/// human typing it looked identical. The row carries the kind beside the label.
+#[test]
+fn a_row_an_agent_wrote_says_so_beside_its_label_and_a_humans_does_not() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n\n## Tickets\n",
+    );
+    // The human seeds the thread.
+    repo.ks(["comment", "add", &format!("{id}#c1"), "--body", "too broad"])
+        .ok();
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    // An agent with a session id replies; then one that Claude Code runs with no session
+    // id at all — the case that used to fall through to the git identity and look human.
+    repo.ks_env(
+        ["comment", "reply", &cid, "--body", "narrowed to /login"],
+        &[
+            ("KANSPEC_ACTOR", "claude/sess-a91"),
+            ("KANSPEC_ACTOR_KIND", "agent"),
+        ],
+    )
+    .ok();
+    // A later clock: rows dedupe on (id, op, at), so two replies in the same frozen
+    // minute would read back as one.
+    repo.ks_env(
+        ["comment", "reply", &cid, "--body", "and documented"],
+        &[
+            ("KANSPEC_ACTOR", ""),
+            ("KANSPEC_ACTOR_KIND", ""),
+            ("KANSPEC_NOW", "2026-08-31T12:01:00Z"),
+            ("CLAUDECODE", "1"),
+        ],
+    )
+    .ok();
+
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let t = &cm["threads"][0];
+    assert!(t["via"].is_null(), "the human's seed carries no kind: {t}");
+    assert_eq!(t["replies"][0]["via"], "agent", "{t}");
+    assert_eq!(t["replies"][0]["by"], "claude/sess-a91", "{t}");
+    assert_eq!(
+        t["replies"][1]["via"], "agent",
+        "an agent with no session id is still an agent: {t}"
+    );
+    assert_eq!(t["replies"][1]["by"], "claude/session", "{t}");
+
+    let human = repo.ks(["comments"]).ok().stdout;
+    assert!(
+        human.contains("claude/sess-a91 via agent: narrowed"),
+        "{human}"
+    );
+    assert!(!human.contains("trevor via"), "{human}");
+
+    // The kind is in the row itself, where a merge or a hand reader sees it.
+    let jsonl = repo.read(&format!(".kanspec/proposals/{p}/comments.jsonl"));
+    assert_eq!(jsonl.matches("\"via\":\"agent\"").count(), 2, "{jsonl}");
+}

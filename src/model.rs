@@ -317,6 +317,10 @@ pub struct CommentOp {
     pub author: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// `"agent"` when an agent process wrote the row — carried beside the label, because
+    /// the label is a git identity that an agent relaying a human's words borrows
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
     pub at: DateTime<Utc>,
 }
 

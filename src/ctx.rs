@@ -34,8 +34,14 @@ pub enum Actor {
 
 impl Actor {
     /// `KANSPEC_ACTOR` + `KANSPEC_ACTOR_KIND` (tests) >
-    /// `CLAUDE_SESSION_ID`/`CURSOR_SESSION_ID`/`CODEX_SESSION_ID` (agent) >
+    /// `CLAUDE_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`/`CURSOR_SESSION_ID`/`CODEX_SESSION_ID`
+    /// (agent, by session) > `CLAUDECODE`/`CURSOR_TRACE_ID` (agent, no session id) >
     /// `git config user.email` > `$USER` (human).
+    ///
+    /// The second agent rung exists because a Claude Code session does not always export
+    /// a session id, and an agent that falls through to the git identity records every
+    /// verb as the human whose email it borrowed — indistinguishable from the human
+    /// running the CLI (t-8e31).
     pub fn detect() -> Actor {
         if let Ok(name) = std::env::var("KANSPEC_ACTOR") {
             let kind = std::env::var("KANSPEC_ACTOR_KIND").unwrap_or_default();
@@ -51,6 +57,7 @@ impl Actor {
         }
         for (var, tool) in [
             ("CLAUDE_SESSION_ID", "claude"),
+            ("CLAUDE_CODE_SESSION_ID", "claude"),
             ("CURSOR_SESSION_ID", "cursor"),
             ("CODEX_SESSION_ID", "codex"),
         ] {
@@ -61,6 +68,17 @@ impl Actor {
                         tool: tool.to_string(),
                     };
                 }
+            }
+        }
+        // An agent process with no session id to name: still an agent. `CLAUDECODE=1` is
+        // set for every command Claude Code runs; the git identity underneath it belongs
+        // to the human whose machine it is.
+        for (var, tool) in [("CLAUDECODE", "claude"), ("CURSOR_TRACE_ID", "cursor")] {
+            if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+                return Actor::Agent {
+                    session: "session".to_string(),
+                    tool: tool.to_string(),
+                };
             }
         }
         let name = git_user_email()
@@ -82,6 +100,12 @@ impl Actor {
 
     pub fn is_agent(&self) -> bool {
         matches!(self, Actor::Agent { .. })
+    }
+
+    /// The `via` an agent-written row carries, so a reader of `comments.jsonl` or the
+    /// page can tell an agent relaying feedback from the human typing it (t-8e31).
+    pub fn via(&self) -> Option<String> {
+        self.is_agent().then(|| "agent".to_string())
     }
 }
 

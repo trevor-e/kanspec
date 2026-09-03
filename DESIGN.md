@@ -156,8 +156,8 @@ Every prescription is **typed**: `(temp until <ticket>)` dies when its guard tic
 
 ```json
 {"id":"cm-88f1","op":"comment","target":"p-7de2#c3","quote":"ops: alert when lockouts exceed 100/hour","body":"scope creep — split alerting into its own proposal","author":"trevor","at":"2026-08-30T16:02:00Z"}
-{"id":"cm-88f1","op":"reply","by":"agent:claude","body":"Agreed — moved to p-8a10; c3 removed.","at":"2026-08-30T16:21:40Z"}
-{"id":"cm-88f1","op":"resolve","by":"agent:claude","note":"c3 -> p-8a10","at":"2026-08-30T16:21:41Z"}
+{"id":"cm-88f1","op":"reply","by":"claude/sess-a91","via":"agent","body":"Agreed — moved to p-8a10; c3 removed.","at":"2026-08-30T16:21:40Z"}
+{"id":"cm-88f1","op":"resolve","by":"claude/sess-a91","via":"agent","note":"c3 -> p-8a10","at":"2026-08-30T16:21:41Z"}
 ```
 
 The `quote` field captures the item's text at comment time: threads are self-locating for agents (`{target, quote, body}` is the whole payload), "edited since — view diff" is detectable, and a deleted item moves its thread to a visible orphan tray instead of losing it.
