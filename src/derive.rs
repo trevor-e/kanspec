@@ -845,6 +845,24 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
                     )
                 },
             ));
+        } else if p.fm.status == ProposalStatus::Review {
+            // A proposal in review is owed a human decision from the moment `review` ran —
+            // `approve`, or a comment — not from the seven-day dwell. Open threads above ARE
+            // that comment; with none, the approve is what is owed (t-660d).
+            let url = review_url(s, id);
+            you.push((
+                YOU_IN_REVIEW,
+                Attention {
+                    url: Some(url.clone()),
+                    ..att(
+                        Owner::You,
+                        state_glyph(State::Review),
+                        id,
+                        format!("in review: {} — approve it, or comment", p.fm.title),
+                        format!("kanspec approve {id}"),
+                    )
+                },
+            ));
         }
     }
 
@@ -1036,10 +1054,11 @@ const READY_SHOWN: usize = 5;
 /// [`attention`]; they never reach the JSON, because what an agent branches on is `owner`
 /// and `fix`, not a number that would then have to stay stable forever.
 const YOU_THREADS: u8 = 0;
-const YOU_IN_MAIN: u8 = 1;
-const YOU_SETTLING: u8 = 2;
-const YOU_DOUBLE_CLAIM: u8 = 3;
-const YOU_PROPOSED_DECISION: u8 = 4;
+const YOU_IN_REVIEW: u8 = 1;
+const YOU_IN_MAIN: u8 = 2;
+const YOU_SETTLING: u8 = 3;
+const YOU_DOUBLE_CLAIM: u8 = 4;
+const YOU_PROPOSED_DECISION: u8 = 5;
 const AGENT_READY: u8 = 0;
 const AGENT_MORE: u8 = 1;
 const AGENT_THREADS: u8 = 2;

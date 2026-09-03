@@ -608,3 +608,65 @@ fn features_without_uncovered_still_renders_its_table() {
     assert!(out.contains("Login"), "{out}");
     assert!(!out.contains("claimed by a spec"), "{out}");
 }
+
+/// t-660d: a proposal in review is owed a human decision from the moment `review` runs,
+/// not from the seven-day dwell — `approve`, or a comment.
+#[test]
+fn a_proposal_in_review_is_listed_under_you_until_a_human_approves_or_comments() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n\n## Tickets\n",
+    );
+    let you = |repo: &TestRepo| -> Vec<serde_json::Value> {
+        let s: serde_json::Value = repo.json(&["status"]);
+        s["you"].as_array().unwrap().clone()
+    };
+    assert!(
+        !you(&repo).iter().any(|a| a["subject"] == id),
+        "a draft is nobody's to approve yet"
+    );
+
+    repo.ks(["review", id]).ok();
+    let line = you(&repo)
+        .into_iter()
+        .find(|a| a["subject"] == id)
+        .unwrap_or_else(|| panic!("the proposal in review is owed a decision"));
+    assert_eq!(line["fix"], format!("kanspec approve {id}"), "{line}");
+    assert!(
+        line["line"].as_str().unwrap().contains("in review"),
+        "{line}"
+    );
+    let human = repo.ks(["status"]).ok().stdout;
+    assert!(human.starts_with(" YOU (1)"), "{human}");
+
+    // A thread is the other way to discharge it: the threads line takes over.
+    repo.ks(["comment", "add", &format!("{id}#c1"), "--body", "too broad"])
+        .ok();
+    let lines = you(&repo);
+    let mine: Vec<&serde_json::Value> = lines.iter().filter(|a| a["subject"] == id).collect();
+    assert_eq!(mine.len(), 1, "one line per proposal: {lines:?}");
+    assert!(
+        mine[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("unresolved review threads"),
+        "{lines:?}"
+    );
+
+    // Approved: nothing owed on it any more.
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    repo.ks(["comment", "resolve", &cid, "--note", "narrowed"])
+        .ok();
+    repo.ks(["approve", id]).ok();
+    assert!(
+        !you(&repo).iter().any(|a| a["subject"] == id),
+        "{:?}",
+        you(&repo)
+    );
+}
