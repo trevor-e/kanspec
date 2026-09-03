@@ -435,13 +435,30 @@ pub fn ladder(
     };
 
     // ── guard 0b: a branch that never carried a commit is not "merged" ───────
+    //
+    // "Zero commits main does not have" is ALSO what a branch looks like once every one
+    // of its commits has landed (merged before `ship`, or `done` run straight from
+    // `doing`). The two are told apart by the trailer: a fresh branch cannot have a
+    // commit carrying `Kanspec: <id>` on main, a landed one does. So a measured zero
+    // consults the trailer first and only an unclaimed zero is the guard (t-174c).
     if origin == HeadOrigin::BranchTip {
         let cmd = format!("git rev-list --count {main}..{}", head.short());
         match git.commits_ahead(main, &head) {
-            Tri::Yes(0) => {
-                tr.push(trace(Method::None, &cmd, 0, "0", "unknown"));
-                done!(Verdict::Unknown(Unknown::ZeroCommitBranch))
-            }
+            Tri::Yes(0) => match git.grep_trailer(main, &t.fm.id) {
+                Tri::Yes(shas) if !shas.is_empty() => {
+                    tr.push(trace(
+                        Method::None,
+                        &cmd,
+                        0,
+                        &format!("0, but {} trailer hit(s) on {main}", shas.len()),
+                        "landed already",
+                    ));
+                }
+                _ => {
+                    tr.push(trace(Method::None, &cmd, 0, "0", "unknown"));
+                    done!(Verdict::Unknown(Unknown::ZeroCommitBranch))
+                }
+            },
             Tri::Unknown(u) => {
                 let saw = u.badge();
                 tr.push(trace(Method::None, &cmd, 128, &saw, "unknown"));
