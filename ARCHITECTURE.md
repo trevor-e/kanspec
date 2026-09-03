@@ -1487,6 +1487,15 @@ pub fn plan_drop  (s:&Snapshot, f:&Facts,      a:&DropArgs,  m:&Minter) -> Resul
 pub fn plan_repair(s:&Snapshot, f:&Facts,      a:&RepairArgs,m:&Minter) -> Result<Plan>;
 ```
 
+**One store load per command.** A handler parses the store once before its transaction —
+`ctx.snapshot()`, the read-only peek — and never again after it: `Store::transact` returns the
+post-write `Snapshot` in `Committed`, loaded once under the lock, and that is what the report,
+the projections (t-0769) and any follow-on planning read. A second `ctx.snapshot()` after a
+`transact` is a bug, not a refresh; a verb that needs facts from git for its plan gathers them
+into its `Facts` before the lock, once (t-e3a7). Likewise the rules document is built once per
+command (`rulesdoc::build`), and the claimed ticket is resolved once (`claimed_ticket`), because
+each costs a subprocess.
+
 Worked example — **`ship`, both call sites, byte-identical:**
 
 ```rust
