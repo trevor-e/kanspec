@@ -76,7 +76,7 @@ fn the_recon_merge_matrix_reproduces_against_real_git() {
         assert_eq!(ahead as usize, shape.commits_ahead_of_main(), "{id}");
 
         let ancestor = git.is_ancestor(&sha, &main);
-        let cherry = yes(git.cherry(&main, &sha), &format!("{id} cherry"));
+        let cherry = yes(git.cherry(&main, &sha).into(), &format!("{id} cherry"));
         let trailer = yes(
             git.grep_trailer(&main, &kanspec::ids::TicketId::parse(&id).unwrap()),
             &format!("{id} trailer"),
@@ -137,7 +137,7 @@ fn the_recon_merge_matrix_reproduces_against_real_git() {
             || !trailer.is_empty();
         match expected {
             ExpectedStatus::Merged => assert!(evidence_says_merged, "{id} must be provable"),
-            ExpectedStatus::NotMerged | ExpectedStatus::Unknown => {
+            ExpectedStatus::Unknown => {
                 assert!(!evidence_says_merged, "{id} must NOT look merged")
             }
         }
@@ -167,7 +167,7 @@ fn a_squash_merged_branch_survives_deletion_of_the_branch_itself() {
     let sha = git.head_sha(&head).expect("the object outlives the ref");
     assert!(git.object_exists(sha.sha()));
     is_no(&git.is_ancestor(sha.sha(), &main), "still a squash");
-    let cherry = yes(git.cherry(&main, sha.sha()), "cherry on a bare SHA");
+    let cherry = yes(git.cherry(&main, sha.sha()).into(), "cherry on a bare SHA");
     assert_eq!(
         cherry.len(),
         2,
@@ -224,7 +224,10 @@ fn a_head_that_is_no_longer_in_the_object_store_is_unknown_not_not_merged() {
         ),
         "grep_trailer",
     );
-    unknown(git.cherry("origin/nonexistent", head.sha()), "cherry");
+    unknown(
+        git.cherry("origin/nonexistent", head.sha()).into(),
+        "cherry",
+    );
     unknown(
         git.changed_paths("origin/nonexistent", "HEAD"),
         "changed_paths",

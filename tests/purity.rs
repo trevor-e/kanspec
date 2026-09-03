@@ -148,10 +148,10 @@ fn a_freshness_stamp_is_the_only_thing_that_moves_with_the_wall_clock() {
     let badge = derive::badge(&a, &t);
     assert_eq!(
         badge.text(a.now),
-        "in main (gh-pr · checked 1h ago)",
+        "in main (gh-pr #142 · checked 1h ago)",
         "the badge names its own age, so it can never lie about freshness"
     );
-    assert_eq!(badge.text(at(-1)), "in main (gh-pr · checked 2h ago)");
+    assert_eq!(badge.text(at(-1)), "in main (gh-pr #142 · checked 2h ago)");
 }
 
 #[test]

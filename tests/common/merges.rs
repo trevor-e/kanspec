@@ -84,7 +84,7 @@ impl Shape {
     /// output is a `+` cherry line, and a `+` cannot distinguish a branch that never merged
     /// from a multi-commit squash that did (D-3). Saying `not merged` there would be a
     /// confident wrong answer for the squash, which is the one thing this ladder may never
-    /// produce. `Verdict::NotLanded` is consequently unreachable in v0.1 — see §11 D-25.
+    /// produce. There is consequently no `NotLanded` verdict at all (t-c060; §11 D-25).
     pub const fn expected(self) -> ExpectedStatus {
         match self {
             Shape::TrueMerge | Shape::SquashGitNative | Shape::Rebase | Shape::SquashOneCommit => {
@@ -108,7 +108,6 @@ impl Shape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpectedStatus {
     Merged,
-    NotMerged,
     Unknown,
 }
 

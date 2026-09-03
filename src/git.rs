@@ -106,6 +106,15 @@ pub enum Tri<T> {
     Unknown(Unknown),
 }
 
+impl<T> From<std::result::Result<T, Unknown>> for Tri<T> {
+    fn from(r: std::result::Result<T, Unknown>) -> Tri<T> {
+        match r {
+            Ok(v) => Tri::Yes(v),
+            Err(u) => Tri::Unknown(u),
+        }
+    }
+}
+
 /// One variant per decline reason, exhaustively matched, each carrying the fields its
 /// badge text needs.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -494,24 +503,27 @@ impl Git {
     /// `-` means an equivalent patch is already upstream; `+` means it is not — and a `+`
     /// cannot tell an unmerged branch apart from a multi-commit squash, which is why the
     /// ladder maps it to `Unknown` rather than `NotMerged` (D-3).
-    pub fn cherry(&self, base: &str, head: &Sha) -> Tri<Vec<CherryLine>> {
+    ///
+    /// A two-state answer, not a `Tri`: `cherry` reports lines or fails to run, and never
+    /// says `No` — so the type does not promise a `No` the ladder would have to map to a
+    /// verdict nothing else produces (t-c060).
+    pub fn cherry(&self, base: &str, head: &Sha) -> std::result::Result<Vec<CherryLine>, Unknown> {
         let cmd = format!("git cherry {base} {}", head.as_str());
         match self.evidence(&cmd, &["cherry", base, head.as_str()], &[]) {
-            Ok(o) => Tri::Yes(
-                o.out
-                    .lines()
-                    .filter_map(|l| {
-                        let mut it = l.split_whitespace();
-                        let sign = it.next()?;
-                        let sha = it.next()?.to_string();
-                        Some(CherryLine {
-                            upstream: sign == "-",
-                            sha,
-                        })
+            Ok(o) => Ok(o
+                .out
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let sign = it.next()?;
+                    let sha = it.next()?.to_string();
+                    Some(CherryLine {
+                        upstream: sign == "-",
+                        sha,
                     })
-                    .collect(),
-            ),
-            Err(u) => Tri::Unknown(u),
+                })
+                .collect()),
+            Err(u) => Err(u),
         }
     }
 

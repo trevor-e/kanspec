@@ -107,7 +107,7 @@ fn fixture(repo: &TestRepo) {
 /// S3's, and because a hand-written cache is the harsher test: nothing in the projection
 /// may depend on having produced it.
 const CACHE: &str = r#"{
-  "version": 1,
+  "version": 2,
   "scanned_at": "2026-08-31T11:56:00Z",
   "main": "origin/main",
   "fetch_age_secs": 10,

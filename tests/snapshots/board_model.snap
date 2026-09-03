@@ -244,6 +244,7 @@ expression: board
             "badge": "in_main",
             "checked_at": "[ts]",
             "method": "trailer",
+            "pr": null,
             "sha": "[sha]"
           },
           "badge_text": "in main (trailer · checked [age] ago)",
@@ -268,6 +269,7 @@ expression: board
             "badge": "in_main",
             "checked_at": "[ts]",
             "method": "ancestry",
+            "pr": null,
             "sha": "[sha]"
           },
           "badge_text": "in main (ancestry · checked [age] ago)",
@@ -292,6 +294,7 @@ expression: board
             "badge": "in_main",
             "checked_at": "[ts]",
             "method": "trailer",
+            "pr": null,
             "sha": "[sha]"
           },
           "badge_text": "in main (trailer · checked [age] ago)",
@@ -316,6 +319,7 @@ expression: board
             "badge": "in_main",
             "checked_at": "[ts]",
             "method": "patch_id",
+            "pr": null,
             "sha": "[sha]"
           },
           "badge_text": "in main (patch-id · checked [age] ago)",

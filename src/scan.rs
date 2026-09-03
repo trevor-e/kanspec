@@ -39,7 +39,7 @@ use serde::Serialize;
 
 use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor};
 use crate::ctx::{Actor, Ctx};
-use crate::derive::note_sha;
+use crate::derive::{note_sha, Badge};
 use crate::error::{GateCode, GateDetail, KsError, Result};
 use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
@@ -138,20 +138,17 @@ impl MergedProof {
     pub fn checked_at(&self) -> DateTime<Utc> {
         self.checked_at
     }
-    /// `"IN MAIN (gh-pr #142 · checked 11s ago)"`
-    ///
-    /// `now` is the CALLER'S clock — `ctx.now` — never `Utc::now()`. Determinism in this
-    /// crate comes from exactly three env overrides (§9), and a badge that reads the wall
-    /// clock renders "checked 3h ago" under `KANSPEC_NOW`, making every snapshot test of a
-    /// transcript that shows it unstable. `derive::Badge::text` takes the same argument for
-    /// the same reason.
-    pub fn badge(&self, now: DateTime<Utc>) -> String {
-        let pr = self.pr.map(|n| format!(" #{n}")).unwrap_or_default();
-        format!(
-            "IN MAIN ({}{pr} · checked {})",
-            self.method,
-            crate::out::rel_time(self.checked_at, now)
-        )
+    /// The proof as the one badge vocabulary — `Badge::text(now)` renders it, with the
+    /// CALLER'S clock (`ctx.now`, never `Utc::now()`: a badge that read the wall clock
+    /// would render "checked 3h ago" under `KANSPEC_NOW` and make every transcript that
+    /// shows it unstable). One formatter for the card, the scan row and the proof (t-c060).
+    pub fn badge(&self) -> Badge {
+        Badge::InMain {
+            method: self.method,
+            pr: self.pr,
+            sha: self.sha.as_str().to_string(),
+            checked_at: self.checked_at,
+        }
     }
 }
 
@@ -245,7 +242,8 @@ pub enum Verdict {
         method: Method,
         pr: Option<u64>,
     },
-    NotLanded,
+    /// The ladder declined, and says why. There is no `NotLanded`: no rung can prove
+    /// absence (R-4, D-3), so the type does not promise it (t-c060).
     Unknown(Unknown),
 }
 
@@ -289,9 +287,6 @@ impl Detection {
                 *pr,
                 None,
             ),
-            // No method concluded, so none is claimed. The rung table lives in
-            // `Detection`, which is where `--explain` reads it from.
-            Verdict::NotLanded => (MergeStatus::NotMerged, None, Method::None, None, None),
             // The badge explains itself without re-running anything.
             Verdict::Unknown(u) => (
                 MergeStatus::Unknown,
@@ -609,7 +604,7 @@ pub fn ladder(
     // i.e. NOT merged — the exact case the rung was supposed to cover.
     let cmd = format!("git cherry {main} {}", head.short());
     match git.cherry(main, &head) {
-        Tri::Yes(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
+        Ok(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
             tr.push(trace(
                 Method::PatchId,
                 &cmd,
@@ -625,13 +620,13 @@ pub fn ladder(
         }
         // We only reach rung 4 with commits main does not have, so an empty `cherry` means
         // the two questions disagree. Conflicting signals are unknown, by policy.
-        Tri::Yes(lines) if lines.is_empty() => {
+        Ok(lines) if lines.is_empty() => {
             tr.push(trace(Method::PatchId, &cmd, 0, "no output", "unknown"));
             done!(Verdict::Unknown(Unknown::ConflictingSignals {
                 rungs: tr.clone()
             }))
         }
-        Tri::Yes(lines) => {
+        Ok(lines) => {
             let plus = lines.iter().filter(|l| !l.upstream).count();
             tr.push(trace(
                 Method::PatchId,
@@ -647,15 +642,11 @@ pub fn ladder(
                 plus_lines: plus
             }))
         }
-        Tri::Unknown(u) => {
+        Err(u) => {
             let saw = u.badge();
             tr.push(trace(Method::PatchId, &cmd, 128, &saw, "unknown"));
             done!(Verdict::Unknown(u))
         }
-        // `cherry` never answers `No` — a `+` line is Unknown by policy (above) — so this
-        // arm is the type's exhaustiveness, not a rung: the ladder alone never reaches
-        // `NotLanded`, which is R-4 stated as control flow.
-        Tri::No => done!(Verdict::NotLanded),
     }
 }
 
@@ -677,7 +668,8 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
     let id = &t.fm.id;
     let why = match d.verdict() {
         Verdict::Unknown(u) => u.badge(),
-        _ => format!("nothing on {main} carries this ticket's work"),
+        // `from_detection` returned `Some` for a landed verdict above.
+        Verdict::Landed { .. } => format!("nothing on {main} carries this ticket's work"),
     };
     Err(KsError::gate_detail(
         GateCode::NotLanded,
@@ -1117,21 +1109,12 @@ mod tests {
         assert_eq!(f.checked_at, at());
     }
 
-    #[test]
-    fn a_not_landed_verdict_never_carries_a_method_or_a_sha() {
-        let f = detection(Verdict::NotLanded).to_fact(vec![]);
-        assert_eq!(f.status, MergeStatus::NotMerged);
-        assert_eq!(f.method, Method::None);
-        assert!(f.sha.is_none() && f.why.is_none());
-    }
-
     /// The proof is minted from a `Detection` and nothing else — the whole of invariant 1's
     /// compile-time half rests on there being no other route.
     #[test]
     fn only_a_landed_detection_mints_a_proof() {
         let id = tid("t-9c41");
         for v in [
-            Verdict::NotLanded,
             Verdict::Unknown(Unknown::ZeroCommitBranch),
             Verdict::Unknown(Unknown::GhUnavailable {
                 why: "no gh".into(),

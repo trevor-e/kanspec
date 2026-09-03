@@ -28,13 +28,16 @@ use crate::paths::Layout;
 
 /// Bumped whenever a DTO below changes shape. A file stamped with anything else is
 /// discarded rather than migrated — it is a cache.
-pub const GITSTATE_VERSION: u32 = 1;
+pub const GITSTATE_VERSION: u32 = 2;
 
+/// What the ladder concluded. Two outcomes, because the ladder has two: it proves a merge
+/// or it declines with a reason. No rung can prove ABSENCE — a `+` cherry line cannot tell
+/// an unmerged branch from a multi-commit squash (D-3) — so there is no `NotMerged`: a
+/// variant nothing emits would only give readers a case to mishandle (t-c060).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeStatus {
     Merged,
-    NotMerged,
     Unknown,
 }
 
@@ -226,7 +229,7 @@ mod tests {
     #[test]
     fn a_row_that_breaks_an_invariant_is_dropped_with_a_reason_and_the_rest_kept() {
         let s: GitState = serde_json::from_str(
-            r#"{"version":1,"scanned_at":"2026-08-31T12:00:00Z","main":"origin/main",
+            r#"{"version":2,"scanned_at":"2026-08-31T12:00:00Z","main":"origin/main",
                 "quirk_dead_globs":{"q-11ba":[],"q-22cd":["src/gone/**"]},
                 "decision_dead_globs":{"D-8c1a":[]}}"#,
         )
@@ -299,7 +302,7 @@ mod tests {
             "{",
             "not json at all",
             r#"{"version":999,"scanned_at":"2026-08-31T00:00:00Z"}"#,
-            r#"{"version":1,"tickets":{"not-a-ticket-id":{}}}"#,
+            r#"{"version":2,"tickets":{"not-a-ticket-id":{}}}"#,
         ] {
             std::fs::write(layout.gitstate(), body).unwrap();
             let s = load(&layout);

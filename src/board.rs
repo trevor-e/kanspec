@@ -6,7 +6,7 @@
 //! "stalled".
 //!
 //! **The merge badge is never a guess.** It is `derive::badge` verbatim — one of
-//! `unpushed / pushed / PR #N open / in main (method · checked_at) / unknown (why) /
+//! `unpushed / pushed / in main (method [#pr] · checked_at) / unknown (why) /
 //! never scanned` — and `badge_text` is baked here rather than at print time, because
 //! `Render` has no clock and `snap.now` does.
 //!
@@ -785,13 +785,13 @@ mod tests {
         for (b, want) in [
             (Badge::Unpushed, "unpushed"),
             (Badge::Pushed, "pushed"),
-            (Badge::PrOpen { n: 142 }, "PR #142 open"),
             (Badge::NeverScanned, "never scanned"),
         ] {
             assert_eq!(b.text(now), want);
         }
         let in_main = Badge::InMain {
             method: crate::git::Method::GhPr,
+            pr: None,
             sha: "a1b9c3d".into(),
             checked_at: now,
         };
