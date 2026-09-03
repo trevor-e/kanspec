@@ -765,11 +765,21 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
     // a verified false positive for work that never happened. The ladder's guard 0b covers
     // the branch-tip case; this covers the recorded-`head:` case, which guard 0b cannot see
     // by construction (§2.15). "Cannot answer" is not a refusal: only a measured zero is.
+    // A measured zero is also what a branch looks like once every commit of its own has
+    // landed — merged before `ship` ran. The trailer tells the two apart, exactly as the
+    // ladder's guard 0b does (t-174c): a branch whose ticket is on main has plenty to
+    // record, and refusing it would leave the ticket unshippable forever.
     if let Ok(base) = ctx.git.resolve_main(&ctx.cfg.main) {
-        if matches!(
-            ctx.git.commits_ahead(&base, head.sha()),
-            crate::git::Tri::Yes(0)
-        ) {
+        let landed = matches!(
+            ctx.git.grep_trailer(&base, &id),
+            crate::git::Tri::Yes(ref shas) if !shas.is_empty()
+        );
+        if !landed
+            && matches!(
+                ctx.git.commits_ahead(&base, head.sha()),
+                crate::git::Tri::Yes(0)
+            )
+        {
             return Err(KsError::gate(
                 GateCode::NothingToShip,
                 format!("{id}: `{rev}` carries no commits that {base} does not already have"),

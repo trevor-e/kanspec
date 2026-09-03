@@ -1265,3 +1265,79 @@ fn new_ticket(repo: &TestRepo, title: &str) -> String {
 fn worktree_of(repo: &TestRepo, id: &str) -> std::path::PathBuf {
     repo.root.join("..").join("kanspec-wt").join(id)
 }
+
+/// t-174c: a branch whose every commit is already on main — merged before `ship` ran, or
+/// `done` run straight from `doing` — measured as "0 commits main does not have", which
+/// guard 0b read as a branch that never carried a commit. The trailer tells the two apart.
+#[test]
+fn a_branch_merged_before_ship_is_still_shippable_and_closes_by_ancestry() {
+    let repo = TestRepo::new();
+    let root = repo.root.clone();
+    seed_knowledge(&repo);
+    let id = str_at(
+        &json_in(&repo, &root, &["new", "Merged early", "--spec", "auth"]),
+        "id",
+    )
+    .to_string();
+    repo.ks(["start", &id, "--worktree"]).ok();
+    let wt = repo.root.join("..").join("kanspec-wt").join(&id);
+    let branch = json_in(&repo, &wt, &["where"])["branch"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    write_at(&wt, "src/auth/early.ts", "export const early = 1;\n");
+    commit_in(&wt, &id, "the work");
+    git_at(&wt, &["push", "--quiet", "origin", &branch]);
+
+    // Landed on main WITHOUT a `ship` first — a true merge, so the tip is an ancestor.
+    repo.git(&["merge", "--quiet", "--no-ff", "-m", "merge early", &branch]);
+    repo.push("main");
+
+    // The ladder: guard 0b sees zero commits ahead, the trailer says they all landed,
+    // ancestry proves it.
+    repo.ks(["scan"]).ok();
+    let shown = json_in(&repo, &root, &["show", &id]);
+    assert!(
+        shown["badge_text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("in main (ancestry"),
+        "{shown}"
+    );
+    let explain = repo.ks(["scan", "--explain", &id]).ok().stdout;
+    assert!(
+        explain.contains("trailer hit(s)") && explain.contains("ancestor"),
+        "{explain}"
+    );
+
+    // `ship` records the tip rather than refusing, and `done` closes on the proof.
+    let shipped = json_in(&repo, &wt, &["ship", &id, "--pr", "7"]);
+    assert_eq!(shipped["state"], "review", "{shipped}");
+    let done = json_in(
+        &repo,
+        &wt,
+        &[
+            "done",
+            &id,
+            "--no-followups",
+            "--no-quirks",
+            "--no-decisions",
+            "--spec-unchanged",
+            "auth:no behaviour change",
+        ],
+    );
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(
+        done["landed"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ancestry"),
+        "{done}"
+    );
+
+    // The guard still holds for a branch that really never carried a commit.
+    let fresh = str_at(&json_in(&repo, &root, &["new", "Nothing yet"]), "id").to_string();
+    repo.ks_in(&root, ["start", &fresh, "--worktree"]).ok();
+    let e = refusal(&repo, &root, &["ship", &fresh, "--pr", "8"]);
+    assert_eq!(e["code"], "nothing_to_ship", "{e}");
+}
