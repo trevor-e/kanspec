@@ -8,7 +8,10 @@
 //!
 //! [`load`] is **total**: any error — missing, truncated, written by a newer kanspec —
 //! yields [`GitState::default`], because a disposable cache must never be able to fail a
-//! command.
+//! command. And it is **validated**: the file is tool-owned but anything can write it, so
+//! every row a reader trusts the shape of is checked once, in [`GitState::validated`],
+//! and a row that breaks an invariant is dropped with a reason `doctor` surfaces — never
+//! handed to a consumer that then has to guard against it (t-c0f5).
 //!
 //! Owner: **S3**.
 
@@ -96,6 +99,11 @@ pub struct GitState {
     pub decision_dead_globs: BTreeMap<DecisionId, Vec<String>>,
     /// The same for an ACTIVE quirk's `paths:`.
     pub quirk_dead_globs: BTreeMap<QuirkId, Vec<String>>,
+    /// Rows [`load`] dropped because they broke an invariant, each with why. Never
+    /// serialised: the next `scan` rewrites the file whole, and `doctor` reports these
+    /// until it does.
+    #[serde(skip)]
+    pub dropped: Vec<String>,
 }
 
 impl Default for GitState {
@@ -110,11 +118,44 @@ impl Default for GitState {
             specs: BTreeMap::new(),
             decision_dead_globs: BTreeMap::new(),
             quirk_dead_globs: BTreeMap::new(),
+            dropped: Vec::new(),
         }
     }
 }
 
 impl GitState {
+    /// THE list of invariants the cache's readers rely on, enforced once at load. A row
+    /// that breaks one is dropped and named in [`GitState::dropped`]; the rest of the file
+    /// is kept, because a disposable cache must never fail a command and one bad row must
+    /// not cost the badges every other row still answers.
+    ///
+    /// - A dead-glob row names at least one glob: `scan` records only rotted entries, so
+    ///   an absent id already means "no rot" and an empty list is a row nothing should
+    ///   index into (`doctor` once panicked on exactly that).
+    pub fn validated(mut self) -> GitState {
+        let mut dropped = Vec::new();
+        self.decision_dead_globs.retain(|id, dead| {
+            let ok = !dead.is_empty();
+            if !ok {
+                dropped.push(format!(
+                    "decision_dead_globs[{id}]: empty list — an absent id already means no rot"
+                ));
+            }
+            ok
+        });
+        self.quirk_dead_globs.retain(|id, dead| {
+            let ok = !dead.is_empty();
+            if !ok {
+                dropped.push(format!(
+                    "quirk_dead_globs[{id}]: empty list — an absent id already means no rot"
+                ));
+            }
+            ok
+        });
+        self.dropped = dropped;
+        self
+    }
+
     /// True when nothing has ever been scanned — the `NeverScanned` badge.
     pub fn is_empty(&self) -> bool {
         self.scanned_at.is_none()
@@ -157,7 +198,7 @@ pub fn load(layout: &Layout) -> GitState {
         // A file stamped with another version is DISCARDED rather than migrated. It is a
         // cache: re-deriving it costs one `scan`, and migrating it costs a forever-branch
         // in the only code that answers "did this land?".
-        Ok(s) if s.version == GITSTATE_VERSION => s,
+        Ok(s) if s.version == GITSTATE_VERSION => s.validated(),
         _ => GitState::default(),
     }
 }
@@ -180,6 +221,25 @@ mod tests {
         let back: GitState = serde_json::from_str(&j).unwrap();
         assert_eq!(back, s);
         assert!(back.is_empty());
+    }
+
+    #[test]
+    fn a_row_that_breaks_an_invariant_is_dropped_with_a_reason_and_the_rest_kept() {
+        let s: GitState = serde_json::from_str(
+            r#"{"version":1,"scanned_at":"2026-08-31T12:00:00Z","main":"origin/main",
+                "quirk_dead_globs":{"q-11ba":[],"q-22cd":["src/gone/**"]},
+                "decision_dead_globs":{"D-8c1a":[]}}"#,
+        )
+        .unwrap();
+        let v = s.validated();
+        assert_eq!(v.quirk_dead_globs.len(), 1, "the live row stays");
+        assert!(v.decision_dead_globs.is_empty());
+        assert_eq!(v.dropped.len(), 2, "{:?}", v.dropped);
+        assert!(v.dropped[0].contains("D-8c1a") && v.dropped[1].contains("q-11ba"));
+        assert!(!v.is_empty(), "dropping rows does not un-scan the cache");
+        // `dropped` never travels through the file.
+        let j = serde_json::to_string(&v).unwrap();
+        assert!(!j.contains("dropped"), "{j}");
     }
 
     #[test]

@@ -150,6 +150,12 @@ pub static CHECKS: &[Check] = &[
         fix: None,
     },
     Check {
+        id: "cache_rows_dropped",
+        about: "every row in cache/gitstate.json satisfies the invariants its readers rely on",
+        run: check_cache_rows_dropped,
+        fix: None,
+    },
+    Check {
         id: "untyped_prescriptions",
         about: "every [pN] is (temp until t-x) or (promote: …) — a close blocker",
         run: check_untyped_prescriptions,
@@ -564,6 +570,25 @@ fn check_dep_cycles(s: &Snapshot) -> Vec<Finding> {
         .collect()
 }
 
+/// Rows `cache::load` refused to hand to a reader. A Warning, not an Error: the cache is
+/// disposable and the next `scan` rewrites it — but a file something wrote by hand is
+/// worth a line, or the badge that went quiet has no explanation.
+fn check_cache_rows_dropped(s: &Snapshot) -> Vec<Finding> {
+    s.git
+        .dropped
+        .iter()
+        .map(|why| {
+            Finding::new(
+                "cache_rows_dropped",
+                Severity::Warning,
+                "cache/gitstate.json",
+                format!("dropped on load: {why}"),
+                "kanspec scan".to_string(),
+            )
+        })
+        .collect()
+}
+
 /// Glob rot. `scan` records which of a record's globs matched zero files; nothing here
 /// re-walks the filesystem, because a check that shelled out would be a second, worse copy
 /// of `scan`.
@@ -652,8 +677,9 @@ fn rot(
     some_dead_msg: String,
     fix: String,
 ) {
-    // `scan` records only rotted entries, but the cache is a plain file anyone can write:
-    // an empty list is nothing to report, never something to index into.
+    // `cache::load` drops an empty row before it gets here (t-c0f5); this is the same
+    // rule stated where the value is read, so a caller with an unloaded `GitState` is
+    // still safe.
     if dead.is_empty() {
         return;
     }
@@ -1741,7 +1767,7 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate check id");
-        assert_eq!(n, 14);
+        assert_eq!(n, 15);
         // every check runs against an empty snapshot without panicking
         let s = snap();
         for c in CHECKS {
