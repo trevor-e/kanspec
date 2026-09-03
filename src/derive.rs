@@ -318,16 +318,39 @@ pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
     None
 }
 
-/// Whether git has anything to be asked ABOUT this ticket: a branch, a head commit, or a
-/// PR number. Mirrors `scan::ticket_rev`'s "head-or-tip, non-empty" and widens it by `pr:`,
-/// because rung 2 answers from a PR number alone.
-fn names_a_rev(t: &Ticket) -> bool {
+/// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
+/// [`ladder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadOrigin {
+    /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
+    /// is proof the branch carried commits of its own.
+    Recorded,
+    /// The branch tip, resolved live. Says nothing about whether the branch ever carried a
+    /// commit.
+    BranchTip,
+}
+
+/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip" — as a rev string for
+/// the git calls that take one, tagged with where it came from (load-bearing for guard 0b).
+/// The ONE definition, here because it is pure: `scan.rs` and `cmd/scan.rs` import it, and
+/// [`names_a_rev`] widens it by `pr:` (t-d223 retired the private mirror that lived here).
+pub fn ticket_rev(t: &Ticket) -> Option<(String, HeadOrigin)> {
     let named = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && s != "null")
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(str::to_string)
     };
-    named(&t.fm.head) || named(&t.fm.branch) || t.fm.pr.is_some()
+    named(&t.fm.head)
+        .map(|h| (h, HeadOrigin::Recorded))
+        .or_else(|| named(&t.fm.branch).map(|b| (b, HeadOrigin::BranchTip)))
+}
+
+/// Whether git has anything to be asked ABOUT this ticket: a branch, a head commit, or a
+/// PR number — [`ticket_rev`] widened by `pr:`, because rung 2 answers from a PR number
+/// alone.
+fn names_a_rev(t: &Ticket) -> bool {
+    ticket_rev(t).is_some() || t.fm.pr.is_some()
 }
 
 /// The badge every card carries — **never a guess**. Precedence is evidence-first: a

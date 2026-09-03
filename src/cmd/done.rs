@@ -18,7 +18,6 @@ use chrono::SecondsFormat;
 use serde::Serialize;
 
 use crate::cli::DoneArgs;
-use crate::cmd::ticket::{facts, join, minted};
 use crate::ctx::{Ctx, OutMode};
 use crate::error::{GateCode, KsError, Result};
 use crate::fm::Yv;
@@ -27,6 +26,7 @@ use crate::ids::{DecisionId, Minter, ProposalId, QuirkId, TicketId};
 use crate::keys::TicketKey;
 use crate::logentry::LogEntry;
 use crate::model::Snapshot;
+use crate::out::join;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{DoneFacts, EntityRef, Op, Plan};
 use crate::scan::{self, Landed, NoCodeWaiver};
@@ -153,7 +153,7 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     };
 
     let f = DoneFacts {
-        base: facts(ctx),
+        base: ctx.facts(),
         landed,
         touched,
     };
@@ -170,23 +170,24 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     let snap = &committed.snapshot;
     let t = snap.ticket(&id)?;
     // `Plan::minted` preserves the order `plan_done` pushed them in, which is step order.
-    let spawned: Vec<Spawned> = minted(&committed, |e| match e {
-        EntityRef::Ticket(id) => Some(id.clone()),
-        _ => None,
-    })
-    .into_iter()
-    .zip(triage.spawns())
-    .map(|(id, (from_step, title))| Spawned {
-        id,
-        title: title.to_string(),
-        from_step,
-    })
-    .collect();
-    let quirks: Vec<QuirkId> = minted(&committed, |e| match e {
+    let spawned: Vec<Spawned> = committed
+        .minted_of(|e| match e {
+            EntityRef::Ticket(id) => Some(id.clone()),
+            _ => None,
+        })
+        .into_iter()
+        .zip(triage.spawns())
+        .map(|(id, (from_step, title))| Spawned {
+            id,
+            title: title.to_string(),
+            from_step,
+        })
+        .collect();
+    let quirks: Vec<QuirkId> = committed.minted_of(|e| match e {
         EntityRef::Quirk(q) => Some(q.clone()),
         _ => None,
     });
-    let decisions: Vec<DecisionId> = minted(&committed, |e| match e {
+    let decisions: Vec<DecisionId> = committed.minted_of(|e| match e {
         EntityRef::Decision(d) => Some(d.clone()),
         _ => None,
     });

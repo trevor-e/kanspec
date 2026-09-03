@@ -167,7 +167,7 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
 
     // Every git call happens BEFORE the lock (§2.16). The SHA the human is attesting to is
     // resolved through git so the log line names a commit that provably exists.
-    let sha = scan::ticket_rev(t).and_then(|(rev, _)| ctx.git.head_sha(&rev).ok());
+    let sha = crate::derive::ticket_rev(t).and_then(|(rev, _)| ctx.git.head_sha(&rev).ok());
     let f = ConfirmFacts {
         sha: sha.map(|h| h.sha().clone()),
         actor: ctx.actor.clone(),

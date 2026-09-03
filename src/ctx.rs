@@ -244,6 +244,25 @@ impl Ctx {
         crate::store::load_snapshot(self)
     }
 
+    /// The `Facts` every planner is handed — who, when, and the invocation — read from
+    /// `Ctx` ONCE, before the lock, and never inside a planner (§2.16).
+    pub fn facts(&self) -> crate::plan::Facts {
+        crate::plan::Facts {
+            actor: self.actor.clone(),
+            at: self.now,
+            invocation: self.invocation(),
+        }
+    }
+
+    /// A path under the repo root, printed relative to it — an absolute temp path in a
+    /// transcript is noise, and the relative form is what a human types next.
+    pub fn rel(&self, p: &Path) -> String {
+        p.strip_prefix(self.repo.primary_root())
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    }
+
     /// `.kanspec/config.toml` relative to the primary root, forward slashes — the one path
     /// whose presence in a commit proves that commit carries the store
     /// (`git cat-file -e <rev>:<this>`). Used by `start`, `init` and `status` to tell a

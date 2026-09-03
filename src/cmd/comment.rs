@@ -14,7 +14,6 @@ use serde::Serialize;
 
 use crate::cli::{CommentArgs, CommentCommand, CommentsArgs, ExpireArgs, PromoteArgs};
 use crate::cmd::proposal::{live, next_lines, proposal_or_refuse};
-use crate::cmd::ticket::facts;
 use crate::ctx::Ctx;
 use crate::error::{GateCode, KsError, Result};
 use crate::ids::{CommentId, ItemRef, ProposalId};
@@ -611,7 +610,7 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                 from: Some(anchor.clone()),
                 scope: a.scope.clone(),
             };
-            let f = facts(ctx);
+            let f = ctx.facts();
             let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
                 let mut plan = crate::cmd::decision::plan_decide(sn, &f, &args, m)?;
                 let id = minted_record(&plan.minted)?;

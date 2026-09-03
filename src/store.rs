@@ -404,6 +404,23 @@ pub struct Committed {
     pub rev: u64,
 }
 
+impl Committed {
+    /// The ids this plan minted, of the kind `pick` selects, in the order the planner
+    /// pushed them.
+    pub fn minted_of<T>(&self, pick: impl Fn(&EntityRef) -> Option<T>) -> Vec<T> {
+        self.minted.iter().filter_map(pick).collect()
+    }
+
+    /// The ONE id a plan was expected to mint; a plan that minted none is an internal
+    /// error.
+    pub fn first_minted<T>(&self, what: &str, pick: impl Fn(&EntityRef) -> Option<T>) -> Result<T> {
+        self.minted_of(pick)
+            .into_iter()
+            .next()
+            .ok_or_else(|| KsError::internal(anyhow::anyhow!("the plan minted no {what}")))
+    }
+}
+
 pub struct Store<'c> {
     ctx: &'c Ctx,
 }

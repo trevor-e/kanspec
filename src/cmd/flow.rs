@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cli::{DropArgs, ParkArgs, ReadyArgs, ShipArgs, StartArgs};
-use crate::cmd::ticket::{facts, join};
 use crate::ctx::Ctx;
 use crate::derive::{self, Badge};
 use crate::error::{GateCode, KsError, Result};
@@ -21,6 +20,7 @@ use crate::ids::Minter;
 use crate::ids::{ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::TicketKey;
 use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Ticket};
+use crate::out::join;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{Facts, Op, Plan, ShipFacts, StartFacts};
 use crate::rulesdoc::Scope;
@@ -222,7 +222,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {
-        base: facts(ctx),
+        base: ctx.facts(),
         branch: branch.clone(),
         worktree: wt_display.clone(),
         head,
@@ -783,7 +783,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
     }
 
     let f = ShipFacts {
-        base: facts(ctx),
+        base: ctx.facts(),
         head,
     };
     let committed = Store::open(ctx).transact(Some(Verb::Ship), &ctx.invocation(), |s, m| {
@@ -878,7 +878,7 @@ pub struct ParkReport {
 pub fn park(ctx: &Ctx, a: &ParkArgs) -> Result<ParkReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let committed = Store::open(ctx).transact(Some(Verb::Park), &ctx.invocation(), |s, m| {
         plan_park(s, &f, a, m)
     })?;
@@ -943,7 +943,7 @@ pub struct DropReport {
 pub fn drop_ticket(ctx: &Ctx, a: &DropArgs) -> Result<DropReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let committed = Store::open(ctx).transact(Some(Verb::Drop), &ctx.invocation(), |s, m| {
         plan_drop(s, &f, a, m)
     })?;

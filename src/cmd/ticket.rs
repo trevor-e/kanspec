@@ -20,9 +20,9 @@ use crate::fm::Yv;
 use crate::ids::{ProposalId, SpecName, TicketId};
 use crate::logentry::{LogEntry, LOG_HEADING, STEPS_HEADING};
 use crate::model::{Snapshot, Step, Ticket};
-use crate::out::{glyph, Color, Line, Render, Style, Table};
+use crate::out::{glyph, join, Color, Line, Render, Style, Table};
 use crate::plan::{EntityRef, Facts, Op, Plan};
-use crate::store::{Committed, Store};
+use crate::store::Store;
 use crate::transitions::{self, State, Verb};
 use crate::{fix, fixes};
 
@@ -52,12 +52,12 @@ pub fn new(ctx: &Ctx, a: &NewArgs) -> Result<NewReport> {
     // anything.
     let discovered_in = resolve_discovered_in(ctx, &snap, a)?;
 
-    let f = facts(ctx);
+    let f = ctx.facts();
     let committed = Store::open(ctx).transact(Some(Verb::New), &ctx.invocation(), |s, m| {
         plan_new(s, &f, a, m, discovered_in.as_ref())
     })?;
 
-    let id = first_minted(&committed, "ticket", |e| match e {
+    let id = committed.first_minted("ticket", |e| match e {
         EntityRef::Ticket(id) => Some(id.clone()),
         _ => None,
     })?;
@@ -71,7 +71,7 @@ pub fn new(ctx: &Ctx, a: &NewArgs) -> Result<NewReport> {
         deps: t.fm.deps.clone(),
         followup_of: t.fm.followup_of.clone(),
         discovered_in: t.fm.discovered_in.clone(),
-        path: rel_to(ctx, &t.path),
+        path: ctx.rel(&t.path),
         next: if derive::is_ready(&committed.snapshot, t) {
             vec![format!("{} start {id}", ctx.invoked_as)]
         } else {
@@ -796,80 +796,6 @@ pub fn owed(ctx: &Ctx, snap: &Snapshot, t: &Ticket) -> Vec<String> {
         State::Review => vec![format!("{ks} scan --explain {id}")],
         State::Done | State::Dropped => Vec::new(),
     }
-}
-
-/// A path under the repo root, printed relative to it — an absolute temp path in a
-/// transcript is noise, and the relative form is what a human types next.
-pub fn rel_to(ctx: &Ctx, p: &Path) -> String {
-    p.strip_prefix(ctx.repo.primary_root())
-        .unwrap_or(p)
-        .display()
-        .to_string()
-}
-
-// ── the helpers every handler in `cmd/` shares ───────────────────────────────
-//
-// They live here rather than in `out.rs`/`plan.rs`/`ctx.rs` because those files are frozen
-// foundation and this one already exports the shared session lookups above. NOTE: this
-// file must never name the decision, quirk or spec `EntityRef` variants, even in a comment —
-// the structural test in `tests/invariants_rules.rs` greps every `cmd/*.rs` for those
-// tokens, treats a match as a handler that writes a projected entity, and demands a
-// `project::regenerate` call from it. The minted-id helpers are generic over a
-// caller-supplied `pick` for exactly that reason.
-
-/// The `Facts` every planner is handed — who, when, and the invocation — read from `Ctx`
-/// ONCE, before the lock, and never inside a planner (§2.16).
-pub(crate) fn facts(ctx: &Ctx) -> Facts {
-    Facts {
-        actor: ctx.actor.clone(),
-        at: ctx.now,
-        invocation: ctx.invocation(),
-    }
-}
-
-/// `a, b, c` — the ONE spelling of a joined list in human output.
-pub(crate) fn join<T: std::fmt::Display>(v: impl IntoIterator<Item = T>, sep: &str) -> String {
-    v.into_iter()
-        .map(|x| x.to_string())
-        .collect::<Vec<_>>()
-        .join(sep)
-}
-
-/// The `  → next` lines under a knowledge verb's report: two-space indent, painted cyan.
-/// (The ticket verbs use a three-space, unpainted variant on purpose — DESIGN.md's
-/// transcripts — so this is not for them.)
-pub(crate) fn write_next(
-    w: &mut dyn std::io::Write,
-    st: &Style,
-    next: &[String],
-) -> std::io::Result<()> {
-    for n in next {
-        writeln!(
-            w,
-            "  {} {}",
-            glyph::FIX,
-            crate::out::paint(n, Color::Cyan, st.color)
-        )?;
-    }
-    Ok(())
-}
-
-/// The ids a committed plan minted, of the kind `pick` selects, in the order the planner
-/// pushed them.
-pub(crate) fn minted<T>(c: &Committed, pick: impl Fn(&EntityRef) -> Option<T>) -> Vec<T> {
-    c.minted.iter().filter_map(pick).collect()
-}
-
-/// The ONE id a plan was expected to mint; a plan that minted none is an internal error.
-pub(crate) fn first_minted<T>(
-    c: &Committed,
-    what: &str,
-    pick: impl Fn(&EntityRef) -> Option<T>,
-) -> Result<T> {
-    minted(c, pick)
-        .into_iter()
-        .next()
-        .ok_or_else(|| KsError::internal(anyhow::anyhow!("the plan minted no {what}")))
 }
 
 impl Render for NewReport {

@@ -39,7 +39,7 @@ use serde::Serialize;
 
 use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor};
 use crate::ctx::{Actor, Ctx};
-use crate::derive::{note_sha, Badge};
+use crate::derive::{note_sha, ticket_rev, Badge, HeadOrigin};
 use crate::error::{GateCode, GateDetail, KsError, Result};
 use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
@@ -311,18 +311,6 @@ impl Detection {
 // ─────────────────────────────────────────────────────────────────────────────
 // The ladder
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
-/// [`ladder`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeadOrigin {
-    /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
-    /// is proof the branch carried commits of its own.
-    Recorded,
-    /// The branch tip, resolved live. Says nothing about whether the branch ever carried a
-    /// commit.
-    BranchTip,
-}
 
 /// `<head:>` if recorded, else the branch tip — DESIGN.md's "head-or-tip". Both are
 /// resolved *through git*, because [`Sha`] has no public constructor: a SHA in this crate
@@ -862,21 +850,6 @@ fn added_or_modified(paths: Tri<Vec<crate::git::ChangedPath>>) -> Vec<String> {
         // path list, and every consumer treats an absent path as untouched.
         _ => Vec::new(),
     }
-}
-
-/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip" — as a rev string for
-/// the git calls that take one, tagged with where it came from (load-bearing for guard 0b).
-/// The ONE definition: `cmd/scan.rs` resolves the SHA a confirmation attests to through it.
-pub(crate) fn ticket_rev(t: &Ticket) -> Option<(String, HeadOrigin)> {
-    let named = |v: &Option<String>| {
-        v.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "null")
-            .map(str::to_string)
-    };
-    named(&t.fm.head)
-        .map(|h| (h, HeadOrigin::Recorded))
-        .or_else(|| named(&t.fm.branch).map(|b| (b, HeadOrigin::BranchTip)))
 }
 
 /// The Worktrees tab's row and the STALLED tripwire's input.

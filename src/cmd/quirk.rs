@@ -9,13 +9,13 @@
 use serde::Serialize;
 
 use crate::cli::{QuirkArgs, QuirkCommand, QuirksArgs, SeverityArg};
-use crate::cmd::ticket::{first_minted, write_next};
 use crate::ctx::Ctx;
 use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{QuirkId, TicketId};
 use crate::keys::{Key, QuirkKey};
 use crate::model::{QuirkStatus, Severity};
+use crate::out::write_next;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::rulesdoc::{severity_word, Scope};
@@ -90,7 +90,7 @@ fn add(
         Ok(plan)
     })?;
 
-    let id = first_minted(&done, "quirk", |e| match e {
+    let id = done.first_minted("quirk", |e| match e {
         EntityRef::Quirk(id) => Some(id.clone()),
         _ => None,
     })?;

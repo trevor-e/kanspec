@@ -8,13 +8,13 @@
 use serde::Serialize;
 
 use crate::cli::{SpecArgs, SpecCommand};
-use crate::cmd::ticket::{rel_to, write_next};
 use crate::ctx::Ctx;
 use crate::derive::{self, Staleness};
 use crate::error::Result;
 use crate::fm::{self, Yv};
 use crate::ids::SpecName;
 use crate::model::Rule;
+use crate::out::write_next;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::project;
@@ -81,7 +81,7 @@ fn new(ctx: &Ctx, raw: &str, feature: Option<&str>, code: &[String]) -> Result<S
     // produced. See `project::regenerate` for why it is a second transaction.
 
     Ok(SpecReport::Created {
-        path: rel_to(ctx, &ctx.layout.spec(&name)),
+        path: ctx.rel(&ctx.layout.spec(&name)),
         next: vec![
             format!("{} spec show {name}", ctx.invoked_as),
             format!("{} rules --path <file>", ctx.invoked_as),

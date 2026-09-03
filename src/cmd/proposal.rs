@@ -10,7 +10,6 @@
 use serde::Serialize;
 
 use crate::cli::{AbandonArgs, ApproveArgs, CloseArgs, ProposeArgs, ReviewArgs};
-use crate::cmd::ticket::{facts, rel_to};
 use crate::ctx::Ctx;
 use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
@@ -112,7 +111,7 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
         .snapshot
         .proposals
         .get(&id)
-        .map(|p| rel_to(ctx, &ctx.layout.proposal_md(&p.dir)))
+        .map(|p| ctx.rel(&ctx.layout.proposal_md(&p.dir)))
         .unwrap_or_default();
 
     Ok(ProposeReport {
@@ -404,7 +403,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         }]);
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
-            let f = facts(ctx);
+            let f = ctx.facts();
             for (anchor, title, deps, spec) in &wanted {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
@@ -852,7 +851,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
         let mut ledger = ledger.clone();
         let mut plan = Plan::empty();
-        let f = facts(ctx);
+        let f = ctx.facts();
         for (item, text) in &followups {
             let args = crate::cli::NewArgs {
                 title: text.clone(),
@@ -903,7 +902,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     Ok(CloseReport {
         status: S::Closed,
         ledger: dispositions,
-        moved_to: rel_to(ctx, &dest),
+        moved_to: ctx.rel(&dest),
         next: vec![format!("{} rules", ctx.invoked_as)],
         id,
     })

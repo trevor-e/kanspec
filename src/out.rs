@@ -44,6 +44,24 @@ pub trait Render: serde::Serialize {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()>;
 }
 
+/// `a, b, c` — the ONE spelling of a joined list in human output.
+pub fn join<T: std::fmt::Display>(v: impl IntoIterator<Item = T>, sep: &str) -> String {
+    v.into_iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// The `  → next` lines under a knowledge verb's report: two-space indent, painted cyan.
+/// (The ticket verbs use a three-space, unpainted variant on purpose — DESIGN.md's
+/// transcripts — so this is not for them.)
+pub fn write_next(w: &mut dyn Write, st: &Style, next: &[String]) -> std::io::Result<()> {
+    for n in next {
+        writeln!(w, "  {} {}", glyph::FIX, paint(n, Color::Cyan, st.color))?;
+    }
+    Ok(())
+}
+
 /// The single emit point. A broken pipe (`kanspec ls | head`) is success, not an error.
 pub fn emit<R: Render>(r: &R, mode: &OutMode, invoked_as: &'static str) -> Result<()> {
     let stdout = std::io::stdout();

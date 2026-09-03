@@ -57,7 +57,7 @@ pub fn repair(ctx: &Ctx, a: &RepairArgs) -> Result<RepairReport> {
     // it necessarily replays clean.
     let was = transitions::replay(&t.log).ok().map(|s| s.to_string());
 
-    let f = crate::cmd::ticket::facts(ctx);
+    let f = ctx.facts();
     let done = Store::open(ctx).transact(Some(Verb::Repair), &ctx.invocation(), |s, m| {
         plan_repair(s, &f, a, m)
     })?;

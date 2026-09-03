@@ -1,6 +1,6 @@
 # kanspec
 
-The binding docs are `DESIGN.md` (the product) and `ARCHITECTURE.md` (the code contract; its §10 file-ownership map and the five no-collision rules still hold). `docs/*.md` are the embedded `kanspec instructions` topics. Tests: `cargo test` (27 suites), `cargo clippy --all-targets`, `cargo fmt`. A rebuild reaches the hooks only after `cargo install --path .`.
+The binding docs are `DESIGN.md` (the product) and `ARCHITECTURE.md` (the code contract; §10 says where code lives now that the parallel build is over). `docs/*.md` are the embedded `kanspec instructions` topics. Tests: `cargo test` (27 suites), `cargo clippy --all-targets`, `cargo fmt`. A rebuild reaches the hooks only after `cargo install --path .`.
 
 <!-- kanspec:begin -->
 ## kanspec

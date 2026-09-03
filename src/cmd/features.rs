@@ -26,13 +26,13 @@
 use serde::Serialize;
 
 use crate::cli::FeaturesArgs;
-use crate::cmd::ticket::{rel_to, write_next};
 use crate::ctx::Ctx;
 use crate::derive::Staleness;
 use crate::error::{KsError, Result};
 use crate::fm::Yv;
 use crate::ids::SpecName;
 use crate::keys::{Key, SpecKey};
+use crate::out::write_next;
 use crate::out::{glyph, Color, Line, Render, Style, Table};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::project::{self, FeatureRow};
@@ -196,7 +196,7 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
         .regenerated
         .iter()
         .any(|p| p == ctx.layout.features_md())
-        .then(|| rel_to(ctx, ctx.layout.features_md()));
+        .then(|| ctx.rel(ctx.layout.features_md()));
 
     let snap = &done.snapshot;
     Ok(FeaturesReport {
