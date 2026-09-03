@@ -12,15 +12,15 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 use crate::cli::{DropArgs, ParkArgs, ReadyArgs, ShipArgs, StartArgs};
-use crate::cmd::ticket::{facts, join};
 use crate::ctx::Ctx;
 use crate::derive::{self, Badge};
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::Minter;
 use crate::ids::{ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::TicketKey;
 use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Ticket};
+use crate::out::join;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{Facts, Op, Plan, ShipFacts, StartFacts};
 use crate::rulesdoc::Scope;
@@ -112,7 +112,7 @@ impl Render for ReadyReport {
             // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
             let mut line = Line::state(State::Todo, &r.title)
                 .id(&r.id)
-                .fix(crate::out::spoken(&format!("kanspec start {}", r.id)));
+                .fix(format!("kanspec start {}", r.id));
             if !chips.is_empty() {
                 line = line.dim(format!("· {}", chips.join(" · ")));
             }
@@ -164,6 +164,9 @@ pub struct StartReport {
     /// The one-line hazard notice a `--worktree`-less claim earns under `sync = "batch"`.
     /// See [`tracker_note`].
     pub tracker_note: Option<String>,
+    /// HEAD carries commits the configured main does not, so the ticket branch — cut from
+    /// main — starts without them. See [`integration_check`].
+    pub base_note: Option<String>,
 }
 
 pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
@@ -181,6 +184,14 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     let base = ctx.git.resolve_main(&ctx.cfg.main)?;
     let branch = branch_name(ctx, &id, &t.fm.title);
     let existed = branch_exists(ctx, &branch);
+    // Refuse to cut a branch that could not see the store, and say when the cut leaves
+    // HEAD's own commits behind. A branch that already exists is not being cut from
+    // anything, so neither question applies to it.
+    let base_note = if existed {
+        None
+    } else {
+        integration_check(ctx, &base)?
+    };
     let want_wt = wants_worktree(ctx, a);
     let (wt_display, wt_abs) = if want_wt {
         let rel = worktree_rel(ctx, &id);
@@ -211,7 +222,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {
-        base: facts(ctx),
+        base: ctx.facts(),
         branch: branch.clone(),
         worktree: wt_display.clone(),
         head,
@@ -254,6 +265,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
         title: t.fm.title.clone(),
         state: t.fm.state,
         tracker_note: tracker_note(ctx, a, &branch, &base),
+        base_note,
         branch,
         worktree: wt_display.map(|p| p.display().to_string()),
         claimed_by: t.fm.claimed_by.clone().unwrap_or_else(|| ctx.actor.label()),
@@ -349,6 +361,14 @@ impl Render for StartReport {
                 w,
                 "  {} {}",
                 crate::out::paint("⚠ tracker", Color::Yellow, st.color),
+                note
+            )?;
+        }
+        if let Some(note) = &self.base_note {
+            writeln!(
+                w,
+                "  {} {}",
+                crate::out::paint("⚠ base", Color::Yellow, st.color),
                 note
             )?;
         }
@@ -612,6 +632,74 @@ fn wants_worktree(ctx: &Ctx, a: &StartArgs) -> bool {
     ctx.cfg.worktree
 }
 
+/// Can a ticket branch be cut from `base` at all, and does the cut leave anything behind?
+///
+/// Found on a trial that integrated through a branch `origin/main` had never seen: `start`
+/// cut the ticket branch from main, the branch had no `.kanspec/`, and nothing said so
+/// until the next verb failed to find a store. The fix was `main = "<branch>"` in
+/// config.toml, which nothing suggested. Two shapes, told apart by whether the store is
+/// committed on HEAD but absent from `base`:
+///
+/// - **main is blind** — the store lives on a branch main does not contain. Refused, with
+///   the config line as the fix: a claim whose branch cannot see the board is not a claim.
+/// - **main is behind** — HEAD *is* main, just unpushed. Refused, with `git push` as the
+///   fix: the `switch` that follows a claim would delete the tracked store from the working
+///   tree, because the ticket branch does not have it.
+///
+/// When the store is fine but HEAD still carries commits `base` lacks, the claim goes
+/// through with one line saying the ticket branch starts without them. A ticket branch of
+/// another claim is expected to be ahead, so it earns no line.
+fn integration_check(ctx: &Ctx, base: &str) -> Result<Option<String>> {
+    // Detached HEAD is nowhere in particular; there is nothing to compare.
+    let Some(on) = ctx.git.current_branch() else {
+        return Ok(None);
+    };
+    let store = ctx.store_marker();
+    let main = ctx.git.short_name(base);
+    let ahead = ctx
+        .git
+        .ahead_behind(base, "HEAD")
+        .map(|(ahead, _)| ahead)
+        .unwrap_or(0);
+    if ctx.git.carries("HEAD", &store) && !ctx.git.carries(base, &store) {
+        if on == main {
+            return Err(KsError::gate(
+                GateCode::MainBehind,
+                format!(
+                    "{base} does not carry {store} yet — {on} is {ahead} commit{} ahead of \
+                     it, and a ticket branch cut from {base} would have no store",
+                    plural(ahead as usize)
+                ),
+                fixes![fix!("git push origin {on}")],
+            ));
+        }
+        let suggest = if ctx.git.ref_exists(&format!("refs/remotes/origin/{on}")) {
+            format!("origin/{on}")
+        } else {
+            on.clone()
+        };
+        return Err(KsError::gate(
+            GateCode::MainBlind,
+            format!(
+                "{base} has never carried {store} — the store lives on {on}, and a ticket \
+                 branch cut from {base} would have none"
+            ),
+            fixes![
+                fix!("set `main = \"{suggest}\"` in .kanspec/config.toml"),
+                fix!("kanspec instructions config"),
+            ],
+        ));
+    }
+    if ahead > 0 && !on.starts_with(&ctx.cfg.branch_prefix) {
+        return Ok(Some(format!(
+            "{on} is {ahead} commit{} ahead of {base} — the ticket branch is cut from {base} \
+             and starts without them",
+            plural(ahead as usize)
+        )));
+    }
+    Ok(None)
+}
+
 fn tracker_note(ctx: &Ctx, a: &StartArgs, branch: &str, base: &str) -> Option<String> {
     if wants_worktree(ctx, a) || ctx.cfg.sync != crate::config::SyncMode::Batch {
         return None;
@@ -662,7 +750,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
         // A ticket claimed without a branch, or a branch someone deleted: say which,
         // because "cannot resolve HEAD" is not actionable.
         KsError::gate(
-            "no_head_to_record",
+            GateCode::NoHeadToRecord,
             format!("{id}: cannot read a head SHA from `{rev}` — {e}"),
             fixes![
                 fix!("git switch -c {rev}"),
@@ -683,7 +771,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
             crate::git::Tri::Yes(0)
         ) {
             return Err(KsError::gate(
-                "nothing_to_ship",
+                GateCode::NothingToShip,
                 format!("{id}: `{rev}` carries no commits that {base} does not already have"),
                 fixes![
                     fix!("git commit -m \"...\" && git push origin {rev}"),
@@ -695,7 +783,7 @@ pub fn ship(ctx: &Ctx, a: &ShipArgs) -> Result<ShipReport> {
     }
 
     let f = ShipFacts {
-        base: facts(ctx),
+        base: ctx.facts(),
         head,
     };
     let committed = Store::open(ctx).transact(Some(Verb::Ship), &ctx.invocation(), |s, m| {
@@ -790,7 +878,7 @@ pub struct ParkReport {
 pub fn park(ctx: &Ctx, a: &ParkArgs) -> Result<ParkReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let committed = Store::open(ctx).transact(Some(Verb::Park), &ctx.invocation(), |s, m| {
         plan_park(s, &f, a, m)
     })?;
@@ -855,7 +943,7 @@ pub struct DropReport {
 pub fn drop_ticket(ctx: &Ctx, a: &DropArgs) -> Result<DropReport> {
     ctx.require_initialized()?;
     let id = TicketId::parse(&a.id)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let committed = Store::open(ctx).transact(Some(Verb::Drop), &ctx.invocation(), |s, m| {
         plan_drop(s, &f, a, m)
     })?;
@@ -925,7 +1013,7 @@ fn require_why(id: &TicketId, why: &str, verb: &'static str) -> Result<String> {
     let why = why.trim();
     if why.is_empty() {
         return Err(KsError::gate(
-            "why_is_required",
+            GateCode::WhyIsRequired,
             format!("`{verb} {id}` records a reason, so nothing rots silently"),
             fixes![
                 fix!("kanspec {verb} {id} --why \"what actually happened\""),
@@ -1190,6 +1278,7 @@ mod tests {
             next: Vec::new(),
             checked_out: false,
             tracker_note: None,
+            base_note: None,
         };
         // DESIGN.md's transcript, verbatim.
         assert_eq!(

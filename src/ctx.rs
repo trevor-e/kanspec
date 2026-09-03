@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::cli::Cli;
 use crate::config::Config;
-use crate::error::{EnvCode, KsError, Result};
+use crate::error::{EnvCode, GateCode, KsError, Result};
 use crate::gh::Gh;
 use crate::git::Git;
 use crate::model::Snapshot;
@@ -34,8 +34,14 @@ pub enum Actor {
 
 impl Actor {
     /// `KANSPEC_ACTOR` + `KANSPEC_ACTOR_KIND` (tests) >
-    /// `CLAUDE_SESSION_ID`/`CURSOR_SESSION_ID`/`CODEX_SESSION_ID` (agent) >
+    /// `CLAUDE_SESSION_ID`/`CLAUDE_CODE_SESSION_ID`/`CURSOR_SESSION_ID`/`CODEX_SESSION_ID`
+    /// (agent, by session) > `CLAUDECODE`/`CURSOR_TRACE_ID` (agent, no session id) >
     /// `git config user.email` > `$USER` (human).
+    ///
+    /// The second agent rung exists because a Claude Code session does not always export
+    /// a session id, and an agent that falls through to the git identity records every
+    /// verb as the human whose email it borrowed — indistinguishable from the human
+    /// running the CLI (t-8e31).
     pub fn detect() -> Actor {
         if let Ok(name) = std::env::var("KANSPEC_ACTOR") {
             let kind = std::env::var("KANSPEC_ACTOR_KIND").unwrap_or_default();
@@ -51,6 +57,7 @@ impl Actor {
         }
         for (var, tool) in [
             ("CLAUDE_SESSION_ID", "claude"),
+            ("CLAUDE_CODE_SESSION_ID", "claude"),
             ("CURSOR_SESSION_ID", "cursor"),
             ("CODEX_SESSION_ID", "codex"),
         ] {
@@ -61,6 +68,17 @@ impl Actor {
                         tool: tool.to_string(),
                     };
                 }
+            }
+        }
+        // An agent process with no session id to name: still an agent. `CLAUDECODE=1` is
+        // set for every command Claude Code runs; the git identity underneath it belongs
+        // to the human whose machine it is.
+        for (var, tool) in [("CLAUDECODE", "claude"), ("CURSOR_TRACE_ID", "cursor")] {
+            if std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+                return Actor::Agent {
+                    session: "session".to_string(),
+                    tool: tool.to_string(),
+                };
             }
         }
         let name = git_user_email()
@@ -82,6 +100,12 @@ impl Actor {
 
     pub fn is_agent(&self) -> bool {
         matches!(self, Actor::Agent { .. })
+    }
+
+    /// The `via` an agent-written row carries, so a reader of `comments.jsonl` or the
+    /// page can tell an agent relaying feedback from the human typing it (t-8e31).
+    pub fn via(&self) -> Option<String> {
+        self.is_agent().then(|| "agent".to_string())
     }
 }
 
@@ -113,7 +137,7 @@ impl HumanActor {
     pub fn require(a: &Actor, verb: &'static str) -> Result<HumanActor> {
         if a.is_agent() {
             return Err(KsError::gate(
-                "agent_cannot_self_accept",
+                GateCode::AgentCannotSelfAccept,
                 format!("`{verb}` is a human act — agents never self-accept standing rules"),
                 fixes![
                     fix!("ask your human to run `kanspec {verb} <id>`"),
@@ -163,8 +187,39 @@ pub struct Ctx {
     pub invocation: String,
 }
 
+/// How this `Ctx` was asked for: the binary name the user typed and the command line the
+/// `## Log` note records. Supplied by whoever builds the `Ctx` — `run()` from its argv, the
+/// server from the verb the browser asked for, a test from a literal — so `Ctx` reads no
+/// process global and no `std::env::args()`, and a second caller needs no override hook
+/// (t-a535: every web verb used to log itself as `kanspec up --port …`).
+#[derive(Clone, Debug)]
+pub struct Invocation {
+    /// `"kanspec"` or `"ks"` — what every fix line and `next` command is spelled with
+    pub invoked_as: &'static str,
+    /// `"kanspec ship t-9c41 --pr 142"` — the Log note, and `Store::transact`'s `cmdline`
+    pub cmdline: String,
+}
+
+impl Invocation {
+    /// `Invocation::of("ks", ["ship", "t-9c41"])` → cmdline `ks ship t-9c41`.
+    pub fn of<I, S>(invoked_as: &'static str, args: I) -> Invocation
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let cmdline = std::iter::once(invoked_as.to_string())
+            .chain(args.into_iter().map(|a| a.as_ref().to_string()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Invocation {
+            invoked_as,
+            cmdline,
+        }
+    }
+}
+
 impl Ctx {
-    pub fn open(cli: &Cli, cwd: &Path) -> Result<Ctx> {
+    pub fn open(cli: &Cli, cwd: &Path, inv: Invocation) -> Result<Ctx> {
         let repo = Repo::discover(cwd, cli.repo.as_deref())?;
         let ks = KanspecDir::resolve(&repo);
         let cfg = Config::load(&ks)?;
@@ -180,16 +235,42 @@ impl Ctx {
             actor: Actor::detect(),
             now: detect_now()?,
             out: OutMode::from_cli(cli),
-            invoked_as: crate::cli::invoked_as(),
-            invocation: std::iter::once(crate::cli::invoked_as().to_string())
-                .chain(std::env::args().skip(1))
-                .collect::<Vec<_>>()
-                .join(" "),
+            invoked_as: inv.invoked_as,
+            invocation: inv.cmdline,
         })
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
         crate::store::load_snapshot(self)
+    }
+
+    /// The `Facts` every planner is handed — who, when, and the invocation — read from
+    /// `Ctx` ONCE, before the lock, and never inside a planner (§2.16).
+    pub fn facts(&self) -> crate::plan::Facts {
+        crate::plan::Facts {
+            actor: self.actor.clone(),
+            at: self.now,
+            invocation: self.invocation(),
+        }
+    }
+
+    /// A path under the repo root, printed relative to it — an absolute temp path in a
+    /// transcript is noise, and the relative form is what a human types next.
+    pub fn rel(&self, p: &Path) -> String {
+        p.strip_prefix(self.repo.primary_root())
+            .unwrap_or(p)
+            .display()
+            .to_string()
+    }
+
+    /// `.kanspec/config.toml` relative to the primary root, forward slashes — the one path
+    /// whose presence in a commit proves that commit carries the store
+    /// (`git cat-file -e <rev>:<this>`). Used by `start`, `init` and `status` to tell a
+    /// `main` that has never seen `.kanspec/` from one that is merely behind.
+    pub fn store_marker(&self) -> String {
+        crate::hooks::relative_to(self.repo.primary_root(), &self.layout.config_toml())
+            .to_string_lossy()
+            .replace('\\', "/")
     }
 
     /// `"kanspec ship --pr 142"` — the Log note, and `Store::transact`'s `cmdline`.
@@ -201,6 +282,7 @@ impl Ctx {
         Style {
             color: matches!(self.out, OutMode::Human { color: true }),
             width: crate::out::term_width(),
+            invoked_as: self.invoked_as,
         }
     }
 

@@ -1,16 +1,16 @@
 ---
 id: t-e3a7
 title: 'One store load per command: use Committed.snapshot, build RulesDoc once'
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-e3a7-one-store-load-per-command-use-committed
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ Store::transact returns the post-write Snapshot in Committed, yet several verbs 
 
 ## Log
 - 2026-09-03T02:15Z  todo     noreply               new
+- 2026-09-03T03:36Z  doing    noreply               start (branch created)

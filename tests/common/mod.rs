@@ -233,7 +233,10 @@ impl TestRepo {
             .env("KANSPEC_ID_SEED", ID_SEED)
             .env("NO_COLOR", "1")
             .env_remove("CLAUDE_SESSION_ID")
+            .env_remove("CLAUDE_CODE_SESSION_ID")
+            .env_remove("CLAUDECODE")
             .env_remove("CURSOR_SESSION_ID")
+            .env_remove("CURSOR_TRACE_ID")
             .env_remove("CODEX_SESSION_ID")
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -345,7 +348,8 @@ impl TestRepo {
 pub fn ctx_at(cwd: &Path) -> kanspec::ctx::Ctx {
     use clap::Parser as _;
     let cli = kanspec::cli::Cli::try_parse_from(["kanspec", "status"]).expect("a valid argv");
-    kanspec::ctx::Ctx::open(&cli, cwd).unwrap_or_else(|e| {
+    let inv = kanspec::ctx::Invocation::of("kanspec", ["status"]);
+    kanspec::ctx::Ctx::open(&cli, cwd, inv).unwrap_or_else(|e| {
         panic!("Ctx::open({}) failed: {e}", cwd.display());
     })
 }

@@ -27,7 +27,7 @@ snapshot / `closed_ids` / doctor registry; *Sealed Keel*'s closed key enums, `Sh
 
 ## 1. Module tree
 
-Flat `src/*.rs` (house style: `~/dev/homerunner`). Every file has **exactly one owner** (§10).
+Flat `src/*.rs` (house style: `~/dev/homerunner`). Every file has **exactly one concern** (§10).
 Scope tag: **v0.1** = the weekend cut · **v0.2** = declared in wave 0 as `unimplemented!("v0.2")`
 with a `#[command(hide = true)]` clap arm, so v0.2 fills bodies and never edits a frozen file.
 
@@ -115,7 +115,7 @@ tests/
 ├── worktree.rs                every mutating verb from a linked wt hits primary         S2
 ├── scan_ladder.rs             all 6 merge shapes -> exact MergeStatus, incl. 2 unknowns S3
 ├── proof_is_sealed.rs         GREP: no Deserialize/Default/From impl for MergedProof    S3
-├── purity.rs                  GREP: derive.rs imports no std::fs / std::process         S4
+├── purity.rs                  derive/doctor are functions of the Snapshot (behavioural)  S4
 ├── transition_table.rs        exhaustive (State x Verb); replay matrix; repair reset    S4
 ├── doctor_replay.rs           hand-edit fails; legal trail passes; repair recovers      S4
 ├── cache_wipe.rs              rm -rf cache/ changes nothing but freshness stamps        S4
@@ -132,8 +132,9 @@ tests/
 
 ## 2. The shared contract — verbatim Rust
 
-> Everything in §2 is **frozen after wave 0**. A missing type or flag is a *request to F*, batched
-> between waves — never a direct edit. Compiled and tested as written.
+> §2 is the shared vocabulary every module is written against. It was frozen for the parallel
+> build; it now changes the way any contract does — deliberately, with the callers and the tests
+> that pin it updated in the same change (§10). Compiled and tested as written.
 
 ### 2.1 `src/error.rs` — 8 closed shapes, non-empty fix by TYPE
 
@@ -183,7 +184,7 @@ pub enum KsError {
     #[error("{kind} {id} not found")]
     NotFound   { kind: &'static str, id: String, fix: Fixes },
     #[error("{message}")]
-    Gate       { code: &'static str, message: String, detail: GateDetail, fix: Fixes },
+    Gate       { code: GateCode, message: String, detail: GateDetail, fix: Fixes },
     #[error("{message}")]
     Environment{ code: EnvCode, message: String, fix: Fixes },
     #[error("{message}")]
@@ -197,7 +198,7 @@ pub enum KsError {
 }
 
 impl KsError {
-    pub fn gate(code: &'static str, message: impl Into<String>, fix: Fixes) -> KsError {
+    pub fn gate(code: GateCode, message: impl Into<String>, fix: Fixes) -> KsError {
         KsError::Gate { code, message: message.into(), detail: GateDetail::Plain, fix }
     }
     /// ✅ There is NO `#[from] std::io::Error`. A bare `?` on a file op cannot
@@ -1487,6 +1488,15 @@ pub fn plan_drop  (s:&Snapshot, f:&Facts,      a:&DropArgs,  m:&Minter) -> Resul
 pub fn plan_repair(s:&Snapshot, f:&Facts,      a:&RepairArgs,m:&Minter) -> Result<Plan>;
 ```
 
+**One store load per command.** A handler parses the store once before its transaction —
+`ctx.snapshot()`, the read-only peek — and never again after it: `Store::transact` returns the
+post-write `Snapshot` in `Committed`, loaded once under the lock, and that is what the report,
+the projections (t-0769) and any follow-on planning read. A second `ctx.snapshot()` after a
+`transact` is a bug, not a refresh; a verb that needs facts from git for its plan gathers them
+into its `Facts` before the lock, once (t-e3a7). Likewise the rules document is built once per
+command (`rulesdoc::build`), and the claimed ticket is resolved once (`claimed_ticket`), because
+each costs a subprocess.
+
 Worked example — **`ship`, both call sites, byte-identical:**
 
 ```rust
@@ -1552,7 +1562,7 @@ impl Triage {
 ## 3. Error strategy
 
 **Shape, not situation.** Eight closed shapes (§2.1). A new refusal is
-`KsError::gate("undispositioned", msg, fixes![..])` **in the raising agent's own file** —
+`KsError::gate(GateCode::Undispositioned, msg, fixes![..])` **in the raising agent's own file** —
 `error.rs` never grows, which removes the single worst merge magnet from a 9-agent build. `code:
 &'static str` remains a stable JSON discriminator, so agent-facing error kinds stay as precise as
 a per-situation enum. The two errors whose output quality *is* the product keep structured
@@ -1720,7 +1730,8 @@ for scope in [vec![], vec!["src/auth/x.ts"], vec!["src/billing/**"], vec!["nonex
 ## 6. Derived-state projection — `src/derive.rs`, pure
 
 No `use std::fs`, no `use std::process`, no `Utc::now()` — `now` is a `Snapshot` field.
-`tests/purity.rs` greps for all three and fails the build on a hit. This is what makes the part of
+`tests/purity.rs` proves it behaviourally (shift the snapshot's clock: every tripwire moves; nothing
+else moves with the wall clock) and the signatures make it structural. This is what makes the part of
 the product most likely to be wrong, and hardest to reproduce, testable as table-driven unit tests
 over struct literals in microseconds. Every derived fact in the product is one of these:
 
@@ -2116,15 +2127,15 @@ hook at `target/debug/kanspec`; nothing in the product reads it. Owner: S7, docu
 
 **How each slice tests in isolation.** Every slice's public surface exists as a signature after
 wave 0, so a slice compiles and unit-tests against `unimplemented!()` neighbours from hour one.
-Only *runtime* integration waits on a dependency, and the gate for each slice (§10) names exactly
-which test proves it.
+Only *runtime* integration waits on a dependency, and the integration gates of the original build
+(now in git history) named exactly which test proved each slice.
 
 **Invariant tests own their own file so they cannot be quietly weakened:**
 
 | File | Proves |
 |---|---|
 | `single_write_path.rs` | source grep: no `fs::write\|fs::rename\|File::create\|OpenOptions\|fs::remove\|fs::create_dir` outside `store.rs` + the 3-file allowlist |
-| `purity.rs` | source grep: `derive.rs` imports no `std::fs`, no `std::process`, calls no `Utc::now()` |
+| `purity.rs` | `derive.rs` and the doctor checks are functions of the `Snapshot`: shifting its clock moves every tripwire, nothing else moves with the wall clock (structural by signature; the source grep was retired in t-0769) |
 | `proof_is_sealed.rs` | source grep: no `impl (Deserialize\|Default\|From<.*>) for MergedProof` — it *will* be tempting the first time someone wants a fast `status` |
 | `cache_wipe.rs` | `rm -rf .kanspec/cache` changes no rendered state except freshness stamps. The correct **behavioural** proof of invariant 1 — it holds regardless of how a derived fact got there, which no type and no grep can do |
 | `invariants_rules.rs` | `prime` stdout `starts_with` `rules` stdout, on the real binary, across N scopes |
@@ -2140,82 +2151,51 @@ which test proves it.
 
 ---
 
-## 10. File ownership map
+## 10. Where code lives — steady-state guidance
 
-**Wave 0 (Foundation, ONE agent, serialized, ~3h) delivers a COMPILING SKELETON**, not a document:
-every file in §1, every `pub` signature, every doc comment, every `impl Render for X` stub, bodies
-`unimplemented!("S4")`. Plus `Cargo.toml`, `build.rs`, the complete clap tree from DESIGN.md's CLI
-reference, the complete `dispatch` match wiring every verb (v0.1 **and** v0.2) to a real `cmd::*`
-signature, and `tests/common/`.
+This section used to be the file-ownership map and the five no-collision rules for the
+nine-agent build (waves, rounds, exclusive-write slices). Those were merge-avoidance rules; the
+build is over, and kept as law they had started to dictate where code lives — shared helpers
+sat in `cmd/ticket.rs` because `out.rs`, `plan.rs` and `ctx.rs` were "frozen", and `derive.rs`
+mirrored `scan.rs`'s `ticket_rev` rather than importing it (t-d223). The tables live in git
+history. What follows is what still buys something.
 
-**Exit gate:** `cargo check --all-targets` clean · `cargo clippy --all-targets` clean ·
-`cli_well_formed.rs` passes · `kanspec --help` and `ks --help` print the real CLI reference ·
-every verb exits 1 with `not implemented (owner: S4)` · `TestRepo` actually builds a temp repo with
-a bare origin and the six merge shapes.
+### Placement
 
-| # | Slice | Owns (exclusive write) | Depends on (reads only) | Must NOT touch |
-|---|---|---|---|---|
-| **F** | **Foundation** | `Cargo.toml`, `build.rs`, `rust-toolchain.toml`, `src/lib.rs`, `src/bin/*`, `cli.rs`, `ctx.rs`, `error.rs`, `out.rs`, `paths.rs`, `config.rs`, `ids.rs`, `keys.rs`, `logentry.rs`, `model.rs`, `transitions.rs`, `plan.rs`, `cmd/mod.rs`, `tests/common/**`, `tests/fixtures/**` *except* `tests/fixtures/gh/**` (S2's, see below), `tests/cli_well_formed.rs`, `tests/cli_smoke.rs` | — | any slice file after wave 0 |
-| **S1** | **Write path** | `fm.rs`, `lock.rs`, `store.rs`, `tests/{fm_bytes,lock,single_write_path}.rs` | F | everything else |
-| **S2** | **Git** | `git.rs`, `gh.rs`, `tests/worktree.rs`, `tests/fixtures/gh/**` | F | everything else |
-| **S3** | **Scan** | `scan.rs`, `cache.rs`, `cmd/scan.rs`, `cmd/repair.rs`, `tests/{scan_ladder,proof_is_sealed}.rs` | F, S1(store), S2(git,gh) | everything else |
-| **S4** | **Derive + doctor** | `derive.rs`, `doctor.rs`, `cmd/doctor.rs`, `cmd/status.rs`, `tests/{purity,transition_table,doctor_replay,cache_wipe}.rs` | F, S1, S3(cache types) | everything else |
-| **S5** | **Ticket verbs** | `triage.rs`, `cmd/ticket.rs`, `cmd/flow.rs`, `cmd/done.rs`, `tests/lifecycle.rs` | F, S1, S2, S3(`Landed`,`proof_for_done`), S4(derive) | everything else |
-| **S6** | **Knowledge + rules** | `rulesdoc.rs`, `project.rs`, `cmd/{spec,quirk,decision,rules,prime,features}.rs`, `tests/invariants_rules.rs` | F, S1, S4 | everything else |
-| **S7** | **Setup / hooks / docs** | `hooks.rs`, `setup.rs`, `instructions.rs`, `ci.rs`, `cmd/{init,setup}.rs`, `docs/**`, `tests/setup_hooks.rs` | F, S1, S2 | everything else |
-| **S8** | **Board + server** | `board.rs`, `server.rs`, `cmd/{board,up}.rs`, `assets/**`, `tests/{board,json_matrix}.rs` | F, S1, S4, and every `cmd::*` fn | everything else |
-| **V2** | **Proposals + review** (v0.2) | `cmd/{proposal,comment,landcheck}.rs` | F, S1, S3, S6 | everything else |
+- **One file, one concern.** §1's module tree is the map; a new module is fine when it has
+  one concern and a doc comment saying so. `lib.rs` and `cmd/mod.rs` declare it.
+- **Shared rendering helpers live in `out.rs`** (`Line`, `Table`, `join`, `write_next`,
+  `spoken_as`). A handler's own payload struct and its `impl Render` live in that handler's
+  file; a helper two handlers share moves to `out.rs`.
+- **Helpers derived from a `Ctx` live on `Ctx`** (`facts()`, `rel()`, `style()`,
+  `store_marker()`); helpers about a committed plan live on `Committed`
+  (`minted_of`, `first_minted`).
+- **`derive.rs` is the one pure home of ticket-reading helpers** (`ticket_rev`, `note_sha`,
+  `HeadOrigin`); `scan.rs` imports them. Nothing mirrors a function because its home is
+  in another file.
+- **CLI arguments are declared in `cli.rs` next to their verb**, and DESIGN.md's CLI reference
+  is updated in the same change — the reference is the product's contract, the clap tree is
+  its implementation. `tests/cli_well_formed.rs` and `transition_table.rs` parse what the
+  fix lines suggest, so a flag that changes shape is a failing test.
+- **`Cargo.toml` pins exact versions** (§8). Adding a crate is fine; add its pin.
 
-**No file appears twice.** Every file in §1 has exactly one owner. There is **no split ownership
-within a file** — the wave-0 commit *hands each file over* whole, signatures included; whoever
-fills the body owns the signature too. ✅ (Sealed Keel's `// ── keel ──` marker comment put two
-owners in one file, the exact hazard its plan claimed to eliminate.)
+### What is still closed
 
-**The five rules that make this actually disjoint** — each removes a *named* merge magnet:
+- **`KsError` has 8 shapes and `GateCode` is the closed set of refusal codes** (§2.1). A new
+  refusal adds a `GateCode` variant and is raised from the file that detects it; agents and
+  hooks branch on the snake_case code, so it never changes once shipped.
+- **Every frontmatter key is a `keys.rs` variant**, never a `&str` — invariant 1.
+- **`Op` is the whole edit vocabulary** (§2.10) and `Store::transact` the one write path;
+  `Store::transact` republishes the projections itself (t-0769), so no handler needs to.
 
-1. **No agent adds a `mod` line.** `lib.rs` and `cmd/mod.rs` declare every module in wave 0,
-   including every v0.2 module.
-2. **No agent adds an error variant.** The 8 shapes are closed; new refusals are
-   `KsError::gate(code, msg, fixes![..])` in the agent's own file.
-3. **No agent adds an output variant.** Each command's payload struct **and** its `impl Render`
-   live in that command's own file; `out.rs` never grows.
-4. **No agent adds a CLI arg.** The full clap tree ships in wave 0 straight off DESIGN.md's CLI
-   reference table (already declarative and complete; the recon proved every shape parses,
-   including the `--spawn`/`--no-followups` group and `allow_hyphen_values` on every free-text
-   reason). v0.2 subcommands ship `#[command(hide = true)]`.
-5. **No agent edits `Cargo.toml`.** Every crate the v0.1 *and* v0.2 cut needs is pinned in §8.
-
-A missing type or flag is a **request to F**, batched between waves. Budget one contract-change
-round per wave; fewer than five should be needed across the build.
-
-### Integration order — 6 rounds
-
-| Round | Lands | Gate ("done" looks like) |
-|---|---|---|
-| **0** | **F alone.** Nobody else has started. | `cargo check --all-targets` + clippy green; `cli_well_formed` passes; `TestRepo` builds the six merge shapes |
-| **1** | **S1 + S2 in parallel** (no shared file, no shared type they both define) | `fm_bytes.rs` (byte-identity + 100-edit idempotence on the adversarial fixture) · `single_write_path.rs` · `lock.rs` (20-process contention, `kill -9`) · `worktree.rs` (every verb from a linked worktree hits primary) |
-| **2** | **S3 (ancestry rung + `cache.rs` first, then rungs 2–4)** and **S4 in parallel** | `scan_ladder.rs` all six shapes with exact `Method`, **two landing on `unknown`** · `proof_is_sealed.rs` · `transition_table.rs` (all 40 pairs) · `doctor_replay.rs` · `purity.rs` |
-| | *Ancestry moves this early on purpose: the `done` gate's primary path must be real from birth, or three milestones of dogfooding tune the UX against `scan --confirm` and wear the human override smooth.* | |
-| **3** | **S5** — the walking skeleton | `lifecycle.rs`: `new → ready → start --worktree → ship --pr → (REAL squash merge) → scan → done`, run **from inside a linked worktree**, asserting every write landed in the primary `.kanspec/` and the `## Log` replays clean. **Dogfooding starts here.** |
-| **4** | **S6 + S7 in parallel** | `invariants_rules.rs` byte-identity across N scopes on the real binary · `cache_wipe.rs` · `setup_hooks.rs` (`setup claude --remove` restores a pre-existing husky-style hook exactly; `core.hooksPath` honoured) · **D-20 MUST BE WIRED HERE**: `cmd/scan.rs` carries a marked comment at the exact call site where `project::plan_regenerate` (S6's, `todo!()` through round B, so calling it would panic every `scan`) pushes its two `Op`s into the same transaction. Close it or the committed `KANSPEC-*.md` projections silently rot — the exact failure the projections exist to prevent — and add the test the corrections doc asks for: *a scan after a spec edit rewrites the root files*. |
-| **5** | **S8** — last, because it consumes every view and every `cmd::*` fn and adds no new semantics | `json_matrix.rs` · `board.rs` insta snapshots · manual: `up` with two SSE tabs open, **Ctrl-C exits in under a second**; a CLI `start` in another terminal refreshes the board; a POST and the equivalent CLI verb produce byte-identical files |
-| **6** | Release cut | `cargo-dist`; `init --refresh-hooks` against the dogfood repo; **one manual run against a real GitHub squash-merged PR** before the ladder is trusted |
-
-**Rebase discipline:** each slice rebases on the integration branch at the start of every round.
-Because ownership is disjoint and `Cargo.toml` is complete up front, rebases are conflict-free by
-construction.
-
-**If fewer agents are available**, the honest collapse — chosen so adjacent slices merge without
-changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 4), giving F + 5.
-
-### Non-negotiables every slice must honour
+### Non-negotiables every handler honours
 
 - Handlers are `fn(ctx: &Ctx, a: &XArgs) -> Result<XReport>`; `XReport: Render`; handlers **never**
   print and never call `process::exit`.
 - Mutations go through `Store::transact` and a pure planner. **Every subprocess, network call and
-  clock read happens before `transact`**, packaged into a `Facts` value.
+  clock read happens before `transact`**, packaged into a `Facts` value; the store is loaded once
+  before the transaction and `Committed.snapshot` is used after (§2.16).
 - Every `KsError` you construct names its fix. `Fixes` makes this impossible to skip.
-- Every new frontmatter key is a **request to F** for a `keys.rs` variant, never a `&str`.
 - axum 0.8 routes use `{id}`, not `:id` — `:id` **panics** at `Router::route()`.
 
 ---
@@ -2282,7 +2262,7 @@ changing any file's owner — is S1+S2 (round 1), S3+S4 (round 2), S6+S7 (round 
 | D-31 | `Store::transact(verb: Verb)` — S3, S5 and S6 each filed the same request for `Option<Verb>`, because a plan that transitions nothing had to pass `Verb::Confirm` as filler. | **Granted.** Not cosmetic, as round B assumed: **10 of 20** call sites were filler, so under `sync = "commit"` a `spec new auth` committed as `kanspec: confirm auth`. `Confirm` is the human merge override (D-11); borrowing it made git history assert something false. `Some(v)` iff the transaction IS ticket verb `v` (`Op::Transition`, plus `new`'s genesis); `None` otherwise, committing as `kanspec: update <id>`. §2.13 updated. |
 | D-32 | `Yv` cannot express `spec.stale_ack`, whose type `model::StaleAck { sha, at, by, why }` was already frozen in §2. S6 added `Yv::Map`. | **Granted, verified empirically.** No other spelling works: a flow SEQUENCE is rejected by serde, and `Yv::Str("{…}")` is single-quoted by `emit` (`{` is in `plain_ok`'s deny list) and reads back as a String — which makes the entire spec unloadable and takes `rules`, `prime` and the feature map with it. **Flow style, never a block map**, so `fm::index` reports `multiline: false` and a second `features --confirm` is a `Replaced` rather than R-9's refusal. §2.14 updated. |
 | D-33 | `Op::writes_tracked_file` returned true for `WriteGenerated`, which D-20's wiring surfaced. | **Granted, and load-bearing** — verified by reverting it, which fails `scan_ladder.rs::a_scan_commits_nothing_under_sync_commit_…` on the nose. `commit_kanspec` is scoped to `:(glob,top).kanspec/**`, so counting a repo-root projection never commits it; it only makes `scan` sweep a human's pending tracker edit into a commit labelled after the scan. §2.10 updated. |
-| D-34 | D-20 says regeneration rides "inside the same lock" as the write that changed a spec or decision. `project::regenerate` runs as its own short transaction immediately after. | **Deviation ACCEPTED; D-20 amended.** A planner sees the snapshot as it was BEFORE its own plan, so regenerating inside the closure would publish a feature map permanently one write behind — a brand-new spec missing until some later verb ran, and a post-`scan` `Fresh?` column computed from the pre-scan `GitState`. That is the exact rot the projections exist to prevent. Cost is R-1's window, one lock cycle wide, self-healing on the next verb. |
+| D-34 | D-20 says regeneration rides "inside the same lock" as the write that changed a spec or decision. `project::regenerate` runs as its own short transaction immediately after. | **Superseded (t-0769): `Store::transact` reloads after its writes and renders the projections from that snapshot, inside the same lock, whenever a plan's ops `touches_projection` — no handler calls anything.** The original reasoning, kept for the record: **Deviation ACCEPTED; D-20 amended.** A planner sees the snapshot as it was BEFORE its own plan, so regenerating inside the closure would publish a feature map permanently one write behind — a brand-new spec missing until some later verb ran, and a post-`scan` `Fresh?` column computed from the pre-scan `GitState`. That is the exact rot the projections exist to prevent. Cost is R-1's window, one lock cycle wide, self-healing on the next verb. |
 | D-35 | S5 invented a non-DESIGN `ship` gate: refuse when the branch is 0 commits ahead of main. | **Kept.** Without it `start` → `ship` records main's own SHA as `head:`, and rung 1 then answers MERGED — a *verified false positive for work that never happened*, the single worst answer this tool can give. Guard 0b covers only the branch-tip case and cannot see this one by construction. It fires **only on a measured `Tri::Yes(0)`**; `Unknown` never refuses. It lives in the handler because the planner is pure and `ShipFacts` carries no commit count — safe today because `cmd::flow::ship` is the only caller, including from the server (§2.16). |
 | D-36 | S5 made `start` check the primary worktree out onto the ticket branch — not in DESIGN, which says only "creates branch (+ worktree)". | **Kept, and REPAIRED at integration.** Keeping it: without a checkout an agent following the CLAUDE.md snippet commits to main and the ticket-branch model breaks silently, which the dogfood run reproduced. Repairing it: as shipped the guard ran `git status --porcelain -uno` *after* `transact`, so in any repo that COMMITS `.kanspec/` (as DESIGN does) the ticket file the verb had just rewritten was the only dirty entry and the switch **never fired on any repo**. `.kanspec/**` is now excluded from the check and the check is hoisted above the write. Pinned both directions by `lifecycle.rs::start_moves_the_primary_onto_the_branch_only_when_the_source_tree_is_clean`, which commits AND pushes the tracker first — with an untracked `.kanspec/` the bug is invisible, which is how it shipped green. |
 | D-37 | `rules --adopt` needs an op that rewrites one line inside an entity BODY (`Op::ReplaceLine`). | **Rejected for v0.1; stays a typed refusal.** DESIGN's build plan puts `rules --audit/--adopt` in v0.2, and nothing else in v0.1 needs the op. S6 ships `--adopt` as an exit-1 gate naming three real fixes rather than a no-op exit 0 — an exit 0 that changed nothing is how a human comes to believe the audit is clean. `rulesdoc::ADOPTED_TOKEN` and the audit's `adoptable` flag are in place, so v0.2 needs only the op. |

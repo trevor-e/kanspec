@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::cli::RepairArgs;
 use crate::ctx::Ctx;
 use crate::derive;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::ids::{Minter, TicketId};
 use crate::logentry::LogEntry;
 use crate::model::Snapshot;
@@ -57,7 +57,7 @@ pub fn repair(ctx: &Ctx, a: &RepairArgs) -> Result<RepairReport> {
     // it necessarily replays clean.
     let was = transitions::replay(&t.log).ok().map(|s| s.to_string());
 
-    let f = crate::cmd::ticket::facts(ctx);
+    let f = ctx.facts();
     let done = Store::open(ctx).transact(Some(Verb::Repair), &ctx.invocation(), |s, m| {
         plan_repair(s, &f, a, m)
     })?;
@@ -82,7 +82,7 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
     let why = a.why.trim();
     if why.is_empty() {
         return Err(KsError::gate(
-            "repair_without_why",
+            GateCode::RepairWithoutWhy,
             format!("`{id}` cannot be repaired without a recorded reason"),
             fixes![
                 fix!("kanspec repair {id} --why \"imported from the old tracker\""),
@@ -96,7 +96,7 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
     // authoritative from then on — weakening the very chain `prove` walks — for no gain.
     if transitions::prove(t).is_ok() {
         return Err(KsError::gate(
-            "nothing_to_repair",
+            GateCode::NothingToRepair,
             format!(
                 "{id}'s ## Log already replays to {} — nothing to attest",
                 t.fm.state
@@ -120,7 +120,7 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
     // trail is what D-12 exists for, and none of those states claims work shipped.
     if t.fm.state == State::Done && !derive::logged_close(t) {
         return Err(KsError::gate(
-            "repair_cannot_close",
+            GateCode::RepairCannotClose,
             format!(
                 "{id}: nothing in the ## Log says this work landed — repair cannot attest a \
                  `done` the gate never granted"
@@ -162,7 +162,7 @@ pub fn plan_repair(s: &Snapshot, f: &Facts, a: &RepairArgs, _m: &Minter) -> Resu
     replayed.push(entry);
     if let Err(v) = transitions::replay(&replayed) {
         return Err(KsError::gate(
-            "repair_cannot_reset",
+            GateCode::RepairCannotReset,
             format!("{id}: repair cannot reset this ## Log — {v}"),
             fixes![
                 fix!("kanspec log {id}"),

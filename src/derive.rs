@@ -292,15 +292,12 @@ pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
     });
     if let Some(sha) = sha {
         // A note is plain text in the log the forger is already editing, so it corroborates
-        // only until git contradicts it. A DEFINITIVE not-merged verdict does exactly that:
-        // the ladder was asked and answered no, while the note claims the work is in main.
-        // `Unknown` deliberately does NOT disqualify — a genuinely old close whose branch
-        // was deleted and gc'd reads unknown forever, and flagging it would punish the
-        // legitimate case to catch nothing the next rung does not already catch.
-        let contradicted = merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::NotMerged);
-        if !contradicted {
-            return Some(CloseEvidence::Proof(sha.to_string()));
-        }
+        // only until git contradicts it — and git never does: no rung can prove absence
+        // (D-3), so there is no verdict that could. `Unknown` deliberately does NOT
+        // disqualify — a genuinely old close whose branch was deleted and gc'd reads
+        // unknown forever, and flagging it would punish the legitimate case to catch
+        // nothing the next rung does not already catch.
+        return Some(CloseEvidence::Proof(sha.to_string()));
     }
     if t.body
         .lines()
@@ -321,16 +318,39 @@ pub fn close_evidence(s: &Snapshot, t: &Ticket) -> Option<CloseEvidence> {
     None
 }
 
-/// Whether git has anything to be asked ABOUT this ticket: a branch, a head commit, or a
-/// PR number. Mirrors `scan::ticket_rev`'s "head-or-tip, non-empty" and widens it by `pr:`,
-/// because rung 2 answers from a PR number alone.
-fn names_a_rev(t: &Ticket) -> bool {
+/// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
+/// [`ladder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeadOrigin {
+    /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
+    /// is proof the branch carried commits of its own.
+    Recorded,
+    /// The branch tip, resolved live. Says nothing about whether the branch ever carried a
+    /// commit.
+    BranchTip,
+}
+
+/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip" — as a rev string for
+/// the git calls that take one, tagged with where it came from (load-bearing for guard 0b).
+/// The ONE definition, here because it is pure: `scan.rs` and `cmd/scan.rs` import it, and
+/// [`names_a_rev`] widens it by `pr:` (t-d223 retired the private mirror that lived here).
+pub fn ticket_rev(t: &Ticket) -> Option<(String, HeadOrigin)> {
     let named = |v: &Option<String>| {
         v.as_deref()
             .map(str::trim)
-            .is_some_and(|s| !s.is_empty() && s != "null")
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(str::to_string)
     };
-    named(&t.fm.head) || named(&t.fm.branch) || t.fm.pr.is_some()
+    named(&t.fm.head)
+        .map(|h| (h, HeadOrigin::Recorded))
+        .or_else(|| named(&t.fm.branch).map(|b| (b, HeadOrigin::BranchTip)))
+}
+
+/// Whether git has anything to be asked ABOUT this ticket: a branch, a head commit, or a
+/// PR number — [`ticket_rev`] widened by `pr:`, because rung 2 answers from a PR number
+/// alone.
+fn names_a_rev(t: &Ticket) -> bool {
+    ticket_rev(t).is_some() || t.fm.pr.is_some()
 }
 
 /// The badge every card carries — **never a guess**. Precedence is evidence-first: a
@@ -358,32 +378,11 @@ pub fn badge(s: &Snapshot, t: &Ticket) -> Badge {
     }
     let pushed = s.git.branches.get(&t.fm.id).map(|b| b.pushed);
     match merge_fact(s, t) {
-        Some(f) => match f.status {
-            MergeStatus::Merged => Badge::InMain {
-                method: f.method,
-                sha: f
-                    .sha
-                    .clone()
-                    .or_else(|| t.fm.head.clone())
-                    .unwrap_or_default(),
-                checked_at: f.checked_at,
-            },
-            MergeStatus::Unknown => Badge::Unknown {
-                why: f
-                    .why
-                    .as_deref()
-                    .map(bare_reason)
-                    .unwrap_or_else(|| "no reason recorded".to_string()),
-                checked_at: Some(f.checked_at),
-            },
-            MergeStatus::NotMerged => match f.pr.or(t.fm.pr) {
-                Some(n) => Badge::PrOpen { n },
-                None if pushed == Some(true) => Badge::Pushed,
-                None => Badge::Unpushed,
-            },
-        },
+        Some(f) => Badge::from_fact(f, t.fm.head.as_deref()),
         // No ladder verdict. The branch facts still say whether the work left the machine,
-        // which is the difference between "nothing to detect yet" and "never looked".
+        // which is the difference between "nothing to detect yet" and "never looked". The
+        // ticket's own `pr:` is NOT a badge: git has not been asked, and "PR #N open" would
+        // be a claim about state nobody verified (`tests/cache_wipe.rs`).
         None => match pushed {
             Some(true) => Badge::Pushed,
             Some(false) => Badge::Unpushed,
@@ -397,11 +396,9 @@ pub fn badge(s: &Snapshot, t: &Ticket) -> Badge {
 pub enum Badge {
     Unpushed,
     Pushed,
-    PrOpen {
-        n: u64,
-    },
     InMain {
         method: Method,
+        pr: Option<u64>,
         sha: String,
         checked_at: DateTime<Utc>,
     },
@@ -413,16 +410,46 @@ pub enum Badge {
 }
 
 impl Badge {
-    /// `"in main (gh-pr #142 · checked 4m ago)"` — what the card actually shows.
+    /// A cached ladder result as a badge — the `scan` row's spelling and the card's are
+    /// this one function (t-c060). `sha_fallback` is the ticket's own `head:` for a fact
+    /// recorded without one.
+    pub fn from_fact(f: &MergeFact, sha_fallback: Option<&str>) -> Badge {
+        match f.status {
+            MergeStatus::Merged => Badge::InMain {
+                method: f.method,
+                pr: f.pr,
+                sha: f
+                    .sha
+                    .clone()
+                    .or_else(|| sha_fallback.map(str::to_string))
+                    .unwrap_or_default(),
+                checked_at: f.checked_at,
+            },
+            MergeStatus::Unknown => Badge::Unknown {
+                why: f
+                    .why
+                    .as_deref()
+                    .map(bare_reason)
+                    .unwrap_or_else(|| "no reason recorded".to_string()),
+                checked_at: Some(f.checked_at),
+            },
+        }
+    }
+
+    /// `"in main (gh-pr #142 · checked 4m ago)"` — what the card, the scan row and the
+    /// close-out transcript all show. The ONE spelling of merge state.
     pub fn text(&self, now: DateTime<Utc>) -> String {
         match self {
             Badge::Unpushed => "unpushed".to_string(),
             Badge::Pushed => "pushed".to_string(),
-            Badge::PrOpen { n } => format!("PR #{n} open"),
             Badge::InMain {
-                method, checked_at, ..
+                method,
+                pr,
+                checked_at,
+                ..
             } => format!(
-                "in main ({method} · checked {})",
+                "in main ({method}{} · checked {})",
+                pr.map(|n| format!(" #{n}")).unwrap_or_default(),
                 rel_time(*checked_at, now)
             ),
             Badge::Unknown { why, checked_at } => match checked_at {
@@ -845,6 +872,24 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
                     )
                 },
             ));
+        } else if p.fm.status == ProposalStatus::Review {
+            // A proposal in review is owed a human decision from the moment `review` ran —
+            // `approve`, or a comment — not from the seven-day dwell. Open threads above ARE
+            // that comment; with none, the approve is what is owed (t-660d).
+            let url = review_url(s, id);
+            you.push((
+                YOU_IN_REVIEW,
+                Attention {
+                    url: Some(url.clone()),
+                    ..att(
+                        Owner::You,
+                        state_glyph(State::Review),
+                        id,
+                        format!("in review: {} — approve it, or comment", p.fm.title),
+                        format!("kanspec approve {id}"),
+                    )
+                },
+            ));
         }
     }
 
@@ -1036,10 +1081,11 @@ const READY_SHOWN: usize = 5;
 /// [`attention`]; they never reach the JSON, because what an agent branches on is `owner`
 /// and `fix`, not a number that would then have to stay stable forever.
 const YOU_THREADS: u8 = 0;
-const YOU_IN_MAIN: u8 = 1;
-const YOU_SETTLING: u8 = 2;
-const YOU_DOUBLE_CLAIM: u8 = 3;
-const YOU_PROPOSED_DECISION: u8 = 4;
+const YOU_IN_REVIEW: u8 = 1;
+const YOU_IN_MAIN: u8 = 2;
+const YOU_SETTLING: u8 = 3;
+const YOU_DOUBLE_CLAIM: u8 = 4;
+const YOU_PROPOSED_DECISION: u8 = 5;
 const AGENT_READY: u8 = 0;
 const AGENT_MORE: u8 = 1;
 const AGENT_THREADS: u8 = 2;
@@ -1286,19 +1332,6 @@ mod tests {
         }
     }
 
-    /// The ladder was asked and answered no — the one verdict that outranks a note.
-    fn not_merged() -> MergeFact {
-        MergeFact {
-            status: MergeStatus::NotMerged,
-            sha: None,
-            method: Method::Ancestry,
-            pr: None,
-            why: None,
-            checked_at: ago(1),
-            changed: Vec::new(),
-        }
-    }
-
     /// The ladder looked and could not tell — must never disqualify a note.
     fn unknown_fact() -> MergeFact {
         MergeFact {
@@ -1442,21 +1475,6 @@ mod tests {
         s.git.branches.get_mut(&tid("t-0001")).unwrap().pushed = true;
         assert!(matches!(badge(&s, t), Badge::Pushed));
 
-        // a NotMerged verdict with a PR outranks the push state
-        s.git.tickets.insert(
-            tid("t-0001"),
-            MergeFact {
-                status: MergeStatus::NotMerged,
-                sha: None,
-                method: Method::Ancestry,
-                pr: Some(7),
-                why: None,
-                checked_at: ago(1),
-                changed: vec![],
-            },
-        );
-        assert!(matches!(badge(&s, t), Badge::PrOpen { n: 7 }));
-
         // unknown is a VALUE, never folded into "not merged"
         s.git.tickets.insert(
             tid("t-0001"),
@@ -1503,7 +1521,7 @@ mod tests {
         let b = badge(&s, t);
         assert!(matches!(b, Badge::InMain { .. }));
         assert!(
-            b.text(s.now).starts_with("in main (gh-pr · checked"),
+            b.text(s.now).starts_with("in main (gh-pr #142 · checked"),
             "{b:?}"
         );
     }
@@ -1651,14 +1669,6 @@ mod tests {
         t.body = "## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n".to_string();
         put(&mut s, t);
         assert_eq!(close_evidence(&s, &s.tickets[&tid("t-0009")]), None);
-
-        // EVASION 2 — the gate's note grammar copied from a real closed ticket, while the
-        // ladder has already been asked about THIS ticket and answered no. Git outranks a
-        // line of text in the file being forged.
-        let mut s = snap();
-        put(&mut s, closed("t-0010"));
-        s.git.tickets.insert(tid("t-0010"), not_merged());
-        assert_eq!(close_evidence(&s, &s.tickets[&tid("t-0010")]), None);
 
         // …but an `unknown` verdict must NOT disqualify: an old close whose branch was
         // deleted and gc'd reads unknown forever, and flagging it punishes the honest case.

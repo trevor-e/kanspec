@@ -1,16 +1,16 @@
 ---
 id: t-c0f5
 title: Validate GitState on load or stop calling the cache hand-editable
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-c0f5-validate-gitstate-on-load-or-stop-callin
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ cache.rs says a text editor can write .kanspec/cache, and cache::load promises a
 
 ## Log
 - 2026-09-03T02:15Z  todo     noreply               new
+- 2026-09-03T03:27Z  doing    noreply               start (branch created)

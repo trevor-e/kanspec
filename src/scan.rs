@@ -39,8 +39,8 @@ use serde::Serialize;
 
 use crate::cache::{BranchFact, GitState, MergeFact, MergeStatus, SpecAnchor};
 use crate::ctx::{Actor, Ctx};
-use crate::derive::note_sha;
-use crate::error::{GateDetail, KsError, Result};
+use crate::derive::{note_sha, ticket_rev, Badge, HeadOrigin};
+use crate::error::{GateCode, GateDetail, KsError, Result};
 use crate::gh::{merged_pr, Gh, GhUnavailable};
 use crate::git::{Git, Method, Pathspec, RungTrace, Sha, Tri, Unknown};
 use crate::ids::TicketId;
@@ -138,20 +138,17 @@ impl MergedProof {
     pub fn checked_at(&self) -> DateTime<Utc> {
         self.checked_at
     }
-    /// `"IN MAIN (gh-pr #142 · checked 11s ago)"`
-    ///
-    /// `now` is the CALLER'S clock — `ctx.now` — never `Utc::now()`. Determinism in this
-    /// crate comes from exactly three env overrides (§9), and a badge that reads the wall
-    /// clock renders "checked 3h ago" under `KANSPEC_NOW`, making every snapshot test of a
-    /// transcript that shows it unstable. `derive::Badge::text` takes the same argument for
-    /// the same reason.
-    pub fn badge(&self, now: DateTime<Utc>) -> String {
-        let pr = self.pr.map(|n| format!(" #{n}")).unwrap_or_default();
-        format!(
-            "IN MAIN ({}{pr} · checked {})",
-            self.method,
-            crate::out::rel_time(self.checked_at, now)
-        )
+    /// The proof as the one badge vocabulary — `Badge::text(now)` renders it, with the
+    /// CALLER'S clock (`ctx.now`, never `Utc::now()`: a badge that read the wall clock
+    /// would render "checked 3h ago" under `KANSPEC_NOW` and make every transcript that
+    /// shows it unstable). One formatter for the card, the scan row and the proof (t-c060).
+    pub fn badge(&self) -> Badge {
+        Badge::InMain {
+            method: self.method,
+            pr: self.pr,
+            sha: self.sha.as_str().to_string(),
+            checked_at: self.checked_at,
+        }
     }
 }
 
@@ -186,7 +183,7 @@ impl NoCodeWaiver {
         let why = why.trim();
         if why.is_empty() {
             return Err(KsError::gate(
-                "no_code_without_why",
+                GateCode::NoCodeWithoutWhy,
                 format!("`{id}` cannot close as no-code without a recorded reason"),
                 fixes![
                     fix!("kanspec done {id} --no-code --why \"docs only\""),
@@ -245,7 +242,8 @@ pub enum Verdict {
         method: Method,
         pr: Option<u64>,
     },
-    NotLanded,
+    /// The ladder declined, and says why. There is no `NotLanded`: no rung can prove
+    /// absence (R-4, D-3), so the type does not promise it (t-c060).
     Unknown(Unknown),
 }
 
@@ -289,9 +287,6 @@ impl Detection {
                 *pr,
                 None,
             ),
-            // No method concluded, so none is claimed. The rung table lives in
-            // `Detection`, which is where `--explain` reads it from.
-            Verdict::NotLanded => (MergeStatus::NotMerged, None, Method::None, None, None),
             // The badge explains itself without re-running anything.
             Verdict::Unknown(u) => (
                 MergeStatus::Unknown,
@@ -316,18 +311,6 @@ impl Detection {
 // ─────────────────────────────────────────────────────────────────────────────
 // The ladder
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Where the SHA the ladder reasons about came from. Load-bearing for guard 0b — see
-/// [`ladder`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum HeadOrigin {
-    /// The `head:` frontmatter field, written by `ship` from real git output. Its presence
-    /// is proof the branch carried commits of its own.
-    Recorded,
-    /// The branch tip, resolved live. Says nothing about whether the branch ever carried a
-    /// commit.
-    BranchTip,
-}
 
 /// `<head:>` if recorded, else the branch tip — DESIGN.md's "head-or-tip". Both are
 /// resolved *through git*, because [`Sha`] has no public constructor: a SHA in this crate
@@ -609,7 +592,7 @@ pub fn ladder(
     // i.e. NOT merged — the exact case the rung was supposed to cover.
     let cmd = format!("git cherry {main} {}", head.short());
     match git.cherry(main, &head) {
-        Tri::Yes(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
+        Ok(lines) if !lines.is_empty() && lines.iter().all(|l| l.upstream) => {
             tr.push(trace(
                 Method::PatchId,
                 &cmd,
@@ -625,13 +608,13 @@ pub fn ladder(
         }
         // We only reach rung 4 with commits main does not have, so an empty `cherry` means
         // the two questions disagree. Conflicting signals are unknown, by policy.
-        Tri::Yes(lines) if lines.is_empty() => {
+        Ok(lines) if lines.is_empty() => {
             tr.push(trace(Method::PatchId, &cmd, 0, "no output", "unknown"));
             done!(Verdict::Unknown(Unknown::ConflictingSignals {
                 rungs: tr.clone()
             }))
         }
-        Tri::Yes(lines) => {
+        Ok(lines) => {
             let plus = lines.iter().filter(|l| !l.upstream).count();
             tr.push(trace(
                 Method::PatchId,
@@ -647,15 +630,11 @@ pub fn ladder(
                 plus_lines: plus
             }))
         }
-        Tri::Unknown(u) => {
+        Err(u) => {
             let saw = u.badge();
             tr.push(trace(Method::PatchId, &cmd, 128, &saw, "unknown"));
             done!(Verdict::Unknown(u))
         }
-        // `cherry` never answers `No` — a `+` line is Unknown by policy (above) — so this
-        // arm is the type's exhaustiveness, not a rung: the ladder alone never reaches
-        // `NotLanded`, which is R-4 stated as control flow.
-        Tri::No => done!(Verdict::NotLanded),
     }
 }
 
@@ -677,10 +656,11 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
     let id = &t.fm.id;
     let why = match d.verdict() {
         Verdict::Unknown(u) => u.badge(),
-        _ => format!("nothing on {main} carries this ticket's work"),
+        // `from_detection` returned `Some` for a landed verdict above.
+        Verdict::Landed { .. } => format!("nothing on {main} carries this ticket's work"),
     };
     Err(KsError::gate_detail(
-        "not_landed",
+        GateCode::NotLanded,
         format!("{id} is not on {main} — {why}"),
         // The trace IS the refusal: pre-formatting it into the message would throw away
         // the `--explain`-grade output that makes the gate arguable rather than arbitrary.
@@ -872,21 +852,6 @@ fn added_or_modified(paths: Tri<Vec<crate::git::ChangedPath>>) -> Vec<String> {
     }
 }
 
-/// `head:` if recorded, else the branch — DESIGN.md's "head-or-tip" — as a rev string for
-/// the git calls that take one, tagged with where it came from (load-bearing for guard 0b).
-/// The ONE definition: `cmd/scan.rs` resolves the SHA a confirmation attests to through it.
-pub(crate) fn ticket_rev(t: &Ticket) -> Option<(String, HeadOrigin)> {
-    let named = |v: &Option<String>| {
-        v.as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "null")
-            .map(str::to_string)
-    };
-    named(&t.fm.head)
-        .map(|h| (h, HeadOrigin::Recorded))
-        .or_else(|| named(&t.fm.branch).map(|b| (b, HeadOrigin::BranchTip)))
-}
-
 /// The Worktrees tab's row and the STALLED tripwire's input.
 fn branch_fact(git: &Git, t: &Ticket, main: &str) -> Option<BranchFact> {
     let branch = t.fm.branch.clone();
@@ -989,7 +954,7 @@ pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<
     let why = f.why.trim();
     if why.is_empty() {
         return Err(KsError::gate(
-            "confirm_without_why",
+            GateCode::ConfirmWithoutWhy,
             format!("`{id}` cannot be confirmed in main without a recorded reason"),
             fixes![
                 fix!("kanspec scan --confirm {id} --why \"squash merged by hand, verified\""),
@@ -1006,7 +971,7 @@ pub fn plan_confirm(snap: &Snapshot, f: &ConfirmFacts, id: &TicketId) -> Result<
         .or_else(|| t.fm.head.clone())
         .ok_or_else(|| {
             KsError::gate(
-                "confirm_without_head",
+                GateCode::ConfirmWithoutHead,
                 format!("`{id}` records neither a `head:` SHA nor a resolvable branch to confirm"),
                 fixes![fix!("kanspec ship {id}"), fix!("kanspec show {id}"),],
             )
@@ -1117,21 +1082,12 @@ mod tests {
         assert_eq!(f.checked_at, at());
     }
 
-    #[test]
-    fn a_not_landed_verdict_never_carries_a_method_or_a_sha() {
-        let f = detection(Verdict::NotLanded).to_fact(vec![]);
-        assert_eq!(f.status, MergeStatus::NotMerged);
-        assert_eq!(f.method, Method::None);
-        assert!(f.sha.is_none() && f.why.is_none());
-    }
-
     /// The proof is minted from a `Detection` and nothing else — the whole of invariant 1's
     /// compile-time half rests on there being no other route.
     #[test]
     fn only_a_landed_detection_mints_a_proof() {
         let id = tid("t-9c41");
         for v in [
-            Verdict::NotLanded,
             Verdict::Unknown(Unknown::ZeroCommitBranch),
             Verdict::Unknown(Unknown::GhUnavailable {
                 why: "no gh".into(),

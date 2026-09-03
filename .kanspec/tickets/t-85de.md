@@ -1,16 +1,16 @@
 ---
 id: t-85de
 title: 'approve: a [tN] names its spec, or inherits it from the change it implements'
-state: todo
+state: doing
 spec: null
 proposal: null
 item: null
 deps: []
 followup_of: null
 discovered_in: null
-branch: null
+branch: ks/t-85de-approve-a-tn-names-its-spec-or-inherits
 worktree: null
-claimed_by: null
+claimed_by: noreply
 pr: null
 head: null
 spec_unchanged: null
@@ -24,3 +24,4 @@ All three tickets minted from p-1c51 got `spec: onboarding-interview` (the propo
 
 ## Log
 - 2026-09-02T03:50Z  todo     trevor                new
+- 2026-09-03T03:19Z  doing    noreply               start (branch created)

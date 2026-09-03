@@ -6,7 +6,7 @@
 //! "stalled".
 //!
 //! **The merge badge is never a guess.** It is `derive::badge` verbatim — one of
-//! `unpushed / pushed / PR #N open / in main (method · checked_at) / unknown (why) /
+//! `unpushed / pushed / in main (method [#pr] · checked_at) / unknown (why) /
 //! never scanned` — and `badge_text` is baked here rather than at print time, because
 //! `Render` has no clock and `snap.now` does.
 //!
@@ -49,7 +49,24 @@ pub struct BoardModel {
     /// the pinned strip at the bottom of every tab
     pub features: Vec<FeatureChip>,
     pub worktrees: Vec<WorktreeRowModel>,
+    /// The Review-queue tab: every proposal a human owes a decision on (t-ec60). Tickets
+    /// in review are the `review` column, read off `columns` by the same tab.
+    pub review_queue: Vec<ReviewRow>,
     pub cache_age_secs: Option<u64>,
+}
+
+/// One proposal awaiting `approve` or comments — the tab's row and `status`'s YOU line
+/// agree because both read `derive::unresolved`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewRow {
+    pub id: ProposalId,
+    pub title: String,
+    pub specs: Vec<SpecName>,
+    pub unresolved: usize,
+    pub created: chrono::NaiveDate,
+    /// the one command that moves it: `approve` with nothing open, the page otherwise
+    pub fix: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -184,8 +201,37 @@ pub fn build(ctx: &Ctx, snap: &Snapshot) -> Result<BoardModel> {
         attention: d.attention,
         features,
         worktrees: worktrees(ctx, snap),
+        review_queue: review_queue(snap),
         cache_age_secs: snap.git.age(snap.now).map(|d| d.as_secs()),
     })
+}
+
+/// Proposals in review, oldest first — the order a human should take them in.
+fn review_queue(snap: &Snapshot) -> Vec<ReviewRow> {
+    let mut rows: Vec<ReviewRow> = snap
+        .proposals
+        .values()
+        .filter(|p| p.fm.status == crate::model::ProposalStatus::Review)
+        .map(|p| {
+            let unresolved = derive::unresolved(snap, &p.fm.id);
+            let url = format!("http://127.0.0.1:{}/p/{}", snap.cfg.port, p.fm.id);
+            ReviewRow {
+                id: p.fm.id.clone(),
+                title: p.fm.title.clone(),
+                specs: p.fm.specs.clone(),
+                unresolved,
+                created: p.fm.created,
+                fix: if unresolved == 0 {
+                    format!("kanspec approve {}", p.fm.id)
+                } else {
+                    url.clone()
+                },
+                url,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
+    rows
 }
 
 fn created_of(snap: &Snapshot, id: &TicketId) -> DateTime<Utc> {
@@ -423,6 +469,23 @@ pub fn render_markdown(m: &BoardModel) -> String {
         }
     }
 
+    if !m.review_queue.is_empty() {
+        s.push_str(&format!("\n## Review queue ({})\n\n", m.review_queue.len()));
+        for r in &m.review_queue {
+            let open = match r.unresolved {
+                0 => "nothing open".to_string(),
+                n => format!("{n} open"),
+            };
+            s.push_str(&format!(
+                "- `{}` {} — {} — `{}`\n",
+                r.id,
+                md_escape(&r.title),
+                open,
+                r.fix
+            ));
+        }
+    }
+
     if !m.worktrees.is_empty() {
         s.push_str("\n## Worktrees\n\n");
         s.push_str("| path | branch | ticket | agent | last commit | ahead/behind | merge |\n");
@@ -454,6 +517,308 @@ pub fn render_markdown(m: &BoardModel) -> String {
         }
     }
     s
+}
+
+/// The review page as ONE self-contained HTML file: the proposal typeset with the same
+/// classes and the same stylesheet the served page uses, every thread read-only in the
+/// rail, no script and no form (t-f3a4). What `review --export` writes, so a proposal can
+/// be read on a phone, or attached to a PR, when `kanspec up`'s loopback bind is out of
+/// reach. It is a copy: the page it mirrors keeps taking comments.
+pub fn render_page_html(p: &crate::cmd::proposal::ProposalPage) -> String {
+    use std::fmt::Write as _;
+    let mut h = String::new();
+    let _ = write!(
+        h,
+        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+         <title>{} · {}</title>\n<style>\n{}\n</style>\n</head>\n<body class=\"static\">\n\
+         <main id=\"main\"><div class=\"review\">\n<article class=\"review-doc\">\n",
+        esc(p.id.as_str()),
+        esc(&p.title),
+        include_str!("../assets/style.css")
+    );
+    // ── head ──
+    let _ = write!(
+        h,
+        "<header class=\"review-head\"><h1>{}</h1><div class=\"review-meta\">\
+         <span class=\"pill mono\">{}</span><span class=\"pill status-{s}\">{s}</span>",
+        esc(&p.title),
+        esc(p.id.as_str()),
+        s = esc(&format!("{:?}", p.status).to_lowercase())
+    );
+    for sp in &p.specs {
+        let _ = write!(
+            h,
+            "<span class=\"pill ghost\">spec {}</span>",
+            esc(sp.as_str())
+        );
+    }
+    if let Some(a) = &p.approved {
+        let _ = write!(h, "<span class=\"pill ok\">approved {}</span>", esc(a));
+    }
+    let _ = writeln!(
+        h,
+        "<span class=\"pill ghost\">exported copy · {}</span></div></header>",
+        if p.unresolved == 0 {
+            "nothing open".to_string()
+        } else {
+            format!("{} open", p.unresolved)
+        }
+    );
+    if !p.why.is_empty() {
+        let _ = writeln!(
+            h,
+            "<section class=\"review-sec\"><h2>Why</h2>{}</section>",
+            fold(&p.why_headline, &p.why_detail, "prose")
+        );
+    }
+    // ── the three groups, in the page's order, with the author's sections after Changes ──
+    let groups: [(char, &str, Option<&str>); 3] = [
+        ('c', "Changes", None),
+        (
+            'p',
+            "Rules this leaves behind",
+            Some(
+                "kanspec calls these prescriptions. A closed proposal binds nothing, so a rule \
+             that should keep steering agents afterwards is named here and typed.",
+            ),
+        ),
+        ('t', "Tickets", None),
+    ];
+    for (kind, label, note) in groups {
+        let items: Vec<&crate::cmd::proposal::PageItem> =
+            p.items.iter().filter(|i| i.kind == kind).collect();
+        if items.is_empty() {
+            continue;
+        }
+        let _ = write!(h, "<section class=\"review-sec\"><h2>{}</h2>", esc(label));
+        if let Some(n) = note {
+            let _ = write!(h, "<p class=\"sec-note\">{}</p>", esc(n));
+        }
+        for i in items {
+            let _ = write!(
+                h,
+                "<div class=\"item{}\" id=\"item-{}{}\"><span class=\"item-tag\">[{}{}]</span>\
+                 <div class=\"item-body\">{}",
+                if i.dispositioned { " done" } else { "" },
+                i.kind,
+                i.id.n,
+                i.kind,
+                i.id.n,
+                fold(
+                    if i.headline.is_empty() {
+                        &i.text
+                    } else {
+                        &i.headline
+                    },
+                    &i.detail,
+                    "item-text"
+                )
+            );
+            if let Some(b) = &i.badge {
+                let cls = if b.starts_with("TEMP") {
+                    "temp"
+                } else if b.starts_with("UNTYPED") {
+                    "untyped"
+                } else {
+                    "promote"
+                };
+                let _ = write!(h, "<span class=\"badge {cls}\">{}</span>", esc(b));
+            }
+            if let Some(t) = &i.ticket {
+                let _ = write!(h, "<span class=\"badge ticket\">{}</span>", esc(t.as_str()));
+            }
+            let open = i.threads.iter().filter(|t| t.resolved.is_none()).count();
+            if !i.threads.is_empty() {
+                let _ = write!(
+                    h,
+                    "<span class=\"badge threads{}\">{}</span>",
+                    if open > 0 { " open" } else { "" },
+                    if open > 0 {
+                        format!("{} · {open} open", i.threads.len())
+                    } else {
+                        format!("{} resolved", i.threads.len())
+                    }
+                );
+            }
+            h.push_str("</div></div>\n");
+        }
+        if kind == 'c' && !p.context.is_empty() {
+            h.push_str(
+                "<details class=\"context\"><summary>the specs as they stand today</summary>",
+            );
+            for c in &p.context {
+                let _ = write!(
+                    h,
+                    "<div class=\"context-spec\"><h3>{} — {}</h3>",
+                    esc(c.spec.as_str()),
+                    esc(&c.feature)
+                );
+                if c.rules.is_empty() {
+                    h.push_str("<p class=\"dim\">no rules yet</p>");
+                }
+                for r in &c.rules {
+                    let _ = write!(
+                        h,
+                        "<div class=\"context-rule\"><span class=\"mono dim\">[{}]</span> {}</div>",
+                        esc(&r.anchor),
+                        esc(&r.text)
+                    );
+                }
+                h.push_str("</div>");
+            }
+            h.push_str("</details>");
+        }
+        h.push_str("</section>\n");
+        if kind == 'c' {
+            for sec in &p.sections {
+                let _ = write!(
+                    h,
+                    "<section class=\"review-sec\"><h2>{}</h2>",
+                    esc(&sec.heading)
+                );
+                if !sec.prose.is_empty() {
+                    let _ = write!(h, "<p class=\"prose\">{}</p>", esc(&sec.prose));
+                }
+                for b in &sec.bullets {
+                    let _ = write!(
+                        h,
+                        "<div class=\"item plain\"><span class=\"item-dot\">·</span>\
+                         <div class=\"item-body\">{}</div></div>",
+                        fold(&b.headline, &b.detail, "")
+                    );
+                }
+                h.push_str("</section>\n");
+            }
+        }
+    }
+    h.push_str("</article>\n");
+    // ── the rail, read-only ──
+    let _ = writeln!(
+        h,
+        "<aside class=\"rail\"><div class=\"rail-head\"><h2>Review</h2>\
+         <span class=\"pill{}\">{}</span></div>\
+         <p class=\"dim\">A static copy: comments are taken on the served page, or with \
+         <code>kanspec comment add</code>.</p>",
+        if p.unresolved > 0 { " warn" } else { " ok" },
+        if p.unresolved > 0 {
+            format!("{} open", p.unresolved)
+        } else {
+            "nothing open".to_string()
+        }
+    );
+    let mut any = false;
+    for i in &p.items {
+        for t in &i.threads {
+            any = true;
+            thread_html(
+                &mut h,
+                t,
+                &format!("{}#{}{}", i.id.proposal, i.kind, i.id.n),
+            );
+        }
+    }
+    if !p.orphaned.is_empty() {
+        any = true;
+        let _ = write!(
+            h,
+            "<h3 class=\"orphan-head\">Orphaned ({})</h3>",
+            p.orphaned.len()
+        );
+        for t in &p.orphaned {
+            thread_html(&mut h, t, &t.target);
+        }
+    }
+    if !any {
+        h.push_str("<p class=\"dim\">no threads yet</p>");
+    }
+    h.push_str("</aside>\n</div></main>\n</body>\n</html>\n");
+    h
+}
+
+/// A headline with its detail shown beneath it — nothing folds without a script, so
+/// nothing is hidden.
+fn fold(headline: &str, detail: &str, cls: &str) -> String {
+    let mut s = format!(
+        "<div class=\"fold open{}{}\"><span class=\"fold-head\">{}</span>",
+        if cls.is_empty() { "" } else { " " },
+        cls,
+        esc(headline)
+    );
+    if !detail.is_empty() {
+        s.push_str(&format!("<div class=\"fold-detail\">{}</div>", esc(detail)));
+    }
+    s.push_str("</div>");
+    s
+}
+
+fn thread_html(h: &mut String, t: &crate::cmd::comment::Thread, target: &str) {
+    use std::fmt::Write as _;
+    let who = |label: &str, via: Option<&str>| match via {
+        Some(v) => format!("{label} via {v}"),
+        None => label.to_string(),
+    };
+    let _ = write!(
+        h,
+        "<div class=\"thread{}\" id=\"thread-{}\"><div class=\"thread-head\">\
+         <span class=\"mono\">{}</span>{}</div>",
+        if t.resolved.is_some() {
+            " resolved"
+        } else {
+            ""
+        },
+        esc(t.id.as_str()),
+        esc(target),
+        if t.edited_since {
+            "<span class=\"badge edited\">edited since</span>"
+        } else {
+            ""
+        }
+    );
+    if let Some(q) = &t.quote {
+        let _ = write!(h, "<blockquote>{}</blockquote>", esc(q));
+    }
+    let _ = write!(
+        h,
+        "<div class=\"msg\"><span class=\"who\">{}</span><span>{}</span></div>",
+        esc(&who(
+            t.author.as_deref().unwrap_or("someone"),
+            t.via.as_deref()
+        )),
+        esc(&t.body)
+    );
+    for r in &t.replies {
+        let _ = write!(
+            h,
+            "<div class=\"msg reply\"><span class=\"who\">{}</span><span>{}</span></div>",
+            esc(&who(&r.by, r.via.as_deref())),
+            esc(&r.body)
+        );
+    }
+    if let Some(note) = &t.resolved {
+        let _ = write!(
+            h,
+            "<div class=\"resolution\">✓ {}</div>",
+            esc(if note.is_empty() { "resolved" } else { note })
+        );
+    }
+    h.push_str("</div>\n");
+}
+
+/// HTML text escaping — the four characters that can change meaning in text or an
+/// attribute value.
+fn esc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => o.push_str("&amp;"),
+            '<' => o.push_str("&lt;"),
+            '>' => o.push_str("&gt;"),
+            '"' => o.push_str("&quot;"),
+            _ => o.push(c),
+        }
+    }
+    o
 }
 
 /// The terminal board — the cold fallback that must work with the server down.
@@ -511,6 +876,26 @@ pub fn render_terminal(
                     crate::out::paint(&detail, Color::Dim, st.color)
                 )?;
             }
+        }
+        writeln!(w)?;
+    }
+
+    if !m.review_queue.is_empty() {
+        writeln!(
+            w,
+            " {}",
+            crate::out::paint("REVIEW QUEUE", Color::Bold, st.color)
+        )?;
+        for r in &m.review_queue {
+            let open = match r.unresolved {
+                0 => "nothing open".to_string(),
+                n => format!("{n} open"),
+            };
+            Line::new(crate::out::state_glyph(State::Review), r.title.as_str())
+                .id(&r.id)
+                .dim(open)
+                .fix(&r.fix)
+                .write(w, st)?;
         }
         writeln!(w)?;
     }
@@ -742,6 +1127,7 @@ mod tests {
                 badge_text: "unpushed".into(),
                 primary: false,
             }],
+            review_queue: vec![],
             cache_age_secs: Some(240),
         }
     }
@@ -785,13 +1171,13 @@ mod tests {
         for (b, want) in [
             (Badge::Unpushed, "unpushed"),
             (Badge::Pushed, "pushed"),
-            (Badge::PrOpen { n: 142 }, "PR #142 open"),
             (Badge::NeverScanned, "never scanned"),
         ] {
             assert_eq!(b.text(now), want);
         }
         let in_main = Badge::InMain {
             method: crate::git::Method::GhPr,
+            pr: None,
             sha: "a1b9c3d".into(),
             checked_at: now,
         };

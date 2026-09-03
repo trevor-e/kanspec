@@ -100,12 +100,7 @@ impl Render for InstructionsReport {
         for t in &self.topics {
             Line::new('·', format!("{:<10} {}", t.name, t.title)).write(w, st)?;
         }
-        writeln!(
-            w,
-            " {} {} instructions <topic>",
-            glyph::FIX,
-            crate::cli::invoked_as()
-        )
+        writeln!(w, " {} {} instructions <topic>", glyph::FIX, st.invoked_as)
     }
 }
 

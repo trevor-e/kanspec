@@ -419,59 +419,81 @@ fn regeneration_is_idempotent_so_a_checkout_does_not_dirty_the_tree() {
     }
 }
 
-/// D-20, mechanically: a handler that writes a spec, a decision or a quirk must also
-/// republish the pages those entities are projected onto.
-///
-/// A grep, because this half of the rule is not observable from outside *today*: `done`
-/// mints its quirks `gotcha` and its decisions `proposed`, and neither grade reaches
-/// `KANSPEC-ARCHITECTURE.md` — so a behavioural test would have passed while the wiring was
-/// missing, and would have kept passing right up until the day `render_architecture`
-/// widened by one line and a landmine captured at close-out went unpublished. The rule is
-/// structural, so the check is. Read off the directory rather than a hand-kept list,
-/// because a hand-kept list is the thing that drifts.
+/// The rule, stated where it is enforced: `Store::transact` republishes the projections
+/// whenever a plan touches a spec, a decision, a quirk, a rule stamp or the git facts —
+/// so a handler cannot forget to (t-0769). This drives the store directly with a plan no
+/// verb builds, which is what proves it is the store and not a disciplined handler.
 #[test]
-fn every_handler_that_writes_a_projected_entity_republishes_the_projections() {
-    // `CARGO_MANIFEST_DIR` is baked in at compile time, so this cannot pass by looking in
-    // the wrong tree.
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cmd");
-    let mut checked: Vec<String> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
-    for entry in std::fs::read_dir(&dir)
-        .expect("src/cmd is readable")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "rs") {
-            continue;
-        }
-        let src = std::fs::read_to_string(&path).expect("a readable handler");
-        // `EntityRef::` catches the ops that name an entity; `Op::StampRule` rewrites a
-        // spec BODY without one, so the scan must name it too — an op that edits a
-        // projected entity by a second route is exactly how this guard goes blind.
-        let touches_a_projected_entity = ["Spec(", "Decision(", "Quirk("]
-            .iter()
-            .any(|t| src.contains(&format!("EntityRef::{t}")))
-            || src.contains("Op::StampRule");
-        if !touches_a_projected_entity {
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        checked.push(name.clone());
-        if !src.contains("project::regenerate(") {
-            missing.push(name);
-        }
-    }
-    assert!(
-        checked.len() >= 4,
-        "the scan stopped finding handlers — it found {checked:?}"
+fn any_transaction_that_touches_a_projected_entity_republishes_the_projections() {
+    use kanspec::fm::Yv;
+    use kanspec::ids::{SpecName, TicketId};
+    use kanspec::keys::{Key, SpecKey, TicketKey};
+    use kanspec::plan::{EntityRef, Op, Plan};
+    use kanspec::store::Store;
+
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.ks(["scan"]).ok();
+    let ctx = common::ctx_at(&repo.root);
+    let features = repo.read("KANSPEC-FEATURES.md");
+    assert!(features.contains("Login"), "{features}");
+
+    // A spec edit through a bare plan: the feature map moves in the same transaction.
+    let done = Store::open(&ctx)
+        .transact(None, "test", |_s, _m| {
+            Ok(Plan::of(vec![Op::SetFields {
+                entity: EntityRef::Spec(SpecName::parse("auth").unwrap()),
+                sets: vec![(Key::Spec(SpecKey::Feature), Yv::s("Sign-in (renamed)"))],
+            }]))
+        })
+        .expect("a spec edit commits");
+    assert_eq!(
+        done.regenerated,
+        [ctx.layout.features_md().to_path_buf()],
+        "the feature map changed; the architecture page did not"
     );
     assert!(
-        missing.is_empty(),
-        "{} change a spec, a decision or a quirk without republishing \
-         KANSPEC-FEATURES.md / KANSPEC-ARCHITECTURE.md, so the committed page rots until \
-         somebody happens to run `scan`",
-        missing.join(", ")
+        done.touched
+            .contains(&ctx.layout.features_md().to_path_buf()),
+        "the projection rides in the same transaction's touched set"
     );
+    let features = repo.read("KANSPEC-FEATURES.md");
+    assert!(features.contains("Sign-in (renamed)"), "{features}");
+    assert!(
+        !done.snapshot.specs.is_empty()
+            && done
+                .snapshot
+                .specs
+                .values()
+                .any(|sp| sp.fm.feature == "Sign-in (renamed)"),
+        "the snapshot handed back is the post-write one the projection was rendered from"
+    );
+
+    // The same edit again changes no byte: nothing is regenerated, nothing is touched.
+    let again = Store::open(&ctx)
+        .transact(None, "test", |_s, _m| {
+            Ok(Plan::of(vec![Op::SetFields {
+                entity: EntityRef::Spec(SpecName::parse("auth").unwrap()),
+                sets: vec![(Key::Spec(SpecKey::Feature), Yv::s("Sign-in (renamed)"))],
+            }]))
+        })
+        .unwrap();
+    assert!(again.regenerated.is_empty(), "{:?}", again.regenerated);
+
+    // A ticket edit projects nothing, so the projections are not even rendered.
+    let id = repo.json::<serde_json::Value>(&["new", "Something"])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let t = Store::open(&ctx)
+        .transact(None, "test", |_s, _m| {
+            Ok(Plan::of(vec![Op::SetFields {
+                entity: EntityRef::Ticket(TicketId::parse(&id).unwrap()),
+                sets: vec![(Key::Ticket(TicketKey::Pr), Yv::Null)],
+            }]))
+        })
+        .unwrap();
+    assert!(t.regenerated.is_empty());
 }
 
 /// The behavioural half of the same rule. DESIGN.md's sanctioned workflow edits specs on

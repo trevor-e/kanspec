@@ -189,7 +189,12 @@ fn the_only_public_mutator_is_store_transact() {
     );
     for l in &public_fns {
         assert!(
-            l.contains("transact") || l.contains("load_snapshot") || l.contains("open"),
+            l.contains("transact")
+                || l.contains("load_snapshot")
+                || l.contains("open")
+                // `Committed::minted_of` / `first_minted`: readers of a finished
+                // transaction's minted ids, `&self` only (t-d223).
+                || (l.contains("minted") && l.contains("&self")),
             "store.rs grew a public function that is neither the write path nor the read \
              path: {l}"
         );

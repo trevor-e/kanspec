@@ -21,16 +21,15 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::cli::{AcceptArgs, DecideArgs, RevokeArgs, SupersedeArgs, WhyArgs};
-use crate::cmd::ticket::{facts, first_minted, join, rel_to, write_next};
 use crate::ctx::{Ctx, HumanActor};
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{DecisionId, ItemRef, Minter, ProposalId, QuirkId, RuleRef, TicketId};
 use crate::keys::{DecisionKey, Key};
 use crate::model::{DecisionStatus, Snapshot};
 use crate::out::{glyph, Color, Line, Render, Style};
+use crate::out::{join, write_next};
 use crate::plan::{EntityRef, Facts, Op, Plan};
-use crate::project;
 use crate::store::{Committed, Store};
 use crate::{fix, fixes};
 
@@ -54,18 +53,17 @@ pub fn decide(ctx: &Ctx, a: &DecideArgs) -> Result<DecideReport> {
     // Every glob is compiled before the lock: a decision whose `scope:` cannot compile
     // steers nobody, and `prime` would silently never inject it.
     crate::rulesdoc::Scope::of(&a.scope)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let done =
         Store::open(ctx).transact(None, &ctx.invocation(), |s, m| plan_decide(s, &f, a, m))?;
     let id = minted_decision(&done)?;
-    project::regenerate(ctx)?;
 
     Ok(DecideReport {
         title: a.title.trim().to_string(),
         status: DecisionStatus::Proposed,
         source: a.from.clone(),
         scope: a.scope.clone(),
-        path: rel_to(ctx, &ctx.layout.decision(&id)),
+        path: ctx.rel(&ctx.layout.decision(&id)),
         url: Some(format!("http://127.0.0.1:{}/d/{id}", ctx.cfg.port)),
         next: vec![
             format!("{} accept {id}", ctx.invoked_as),
@@ -184,10 +182,9 @@ fn flip(
     ctx.require_initialized()?;
     let who = HumanActor::require(&ctx.actor, verb)?;
     let id = DecisionId::parse(raw)?;
-    let f = facts(ctx);
+    let f = ctx.facts();
     let done =
         Store::open(ctx).transact(None, &ctx.invocation(), |s, m| plan(s, &f, &who, &id, m))?;
-    project::regenerate(ctx)?;
     Ok((id, done))
 }
 
@@ -223,7 +220,7 @@ pub fn plan_accept(s: &Snapshot, who: &HumanActor, id: &DecisionId) -> Result<Pl
     let d = s.decision(id)?;
     if d.fm.status != DecisionStatus::Proposed {
         return Err(KsError::gate(
-            "decision_not_proposed",
+            GateCode::DecisionNotProposed,
             format!(
                 "{id} is `{}`, not `proposed` — nothing to accept",
                 status_word(d.fm.status)
@@ -271,7 +268,7 @@ pub fn plan_supersede(
     let old = s.decision(id)?;
     if old.fm.status != DecisionStatus::Accepted {
         return Err(KsError::gate(
-            "decision_not_accepted",
+            GateCode::DecisionNotAccepted,
             format!(
                 "{id} is `{}` — only an accepted decision can be superseded",
                 status_word(old.fm.status)
@@ -351,7 +348,7 @@ pub fn plan_revoke(
         DecisionStatus::Revoked | DecisionStatus::Superseded
     ) {
         return Err(KsError::gate(
-            "decision_not_standing",
+            GateCode::DecisionNotStanding,
             format!(
                 "{id} is already `{}` — it steers nobody",
                 status_word(d.fm.status)
@@ -624,7 +621,7 @@ impl Render for WhyReport {
 // ── shared ───────────────────────────────────────────────────────────────────
 
 fn minted_decision(done: &Committed) -> Result<DecisionId> {
-    first_minted(done, "decision", |e| match e {
+    done.first_minted("decision", |e| match e {
         EntityRef::Decision(id) => Some(id.clone()),
         _ => None,
     })

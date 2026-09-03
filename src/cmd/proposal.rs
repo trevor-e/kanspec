@@ -10,9 +10,8 @@
 use serde::Serialize;
 
 use crate::cli::{AbandonArgs, ApproveArgs, CloseArgs, ProposeArgs, ReviewArgs};
-use crate::cmd::ticket::{facts, rel_to};
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{ItemRef, ProposalId, SpecName, TicketId};
 use crate::keys::{Key, ProposalKey};
@@ -112,7 +111,7 @@ pub fn propose(ctx: &Ctx, a: &ProposeArgs) -> Result<ProposeReport> {
         .snapshot
         .proposals
         .get(&id)
-        .map(|p| rel_to(ctx, &ctx.layout.proposal_md(&p.dir)))
+        .map(|p| ctx.rel(&ctx.layout.proposal_md(&p.dir)))
         .unwrap_or_default();
 
     Ok(ProposeReport {
@@ -139,7 +138,7 @@ pub(crate) fn proposal_or_refuse<'a>(
     s.proposals.get(id).ok_or_else(|| {
         if s.closed_ids.contains(id.as_str()) {
             KsError::gate(
-                "proposal_closed",
+                GateCode::ProposalClosed,
                 format!("{id} is closed — closed proposals bind nothing"),
                 fixes![fix!("{} rules", ctx.invoked_as)],
             )
@@ -180,7 +179,7 @@ fn refuse_terminal(ctx: &Ctx, p: &Proposal, already: bool) -> Result<()> {
     }
     let (id, word) = (&p.fm.id, status_word(p.fm.status));
     Err(KsError::gate(
-        "proposal_terminal",
+        GateCode::ProposalTerminal,
         if already {
             format!("{id} is already {word}")
         } else {
@@ -238,6 +237,8 @@ pub struct ReviewReport {
     pub status: ProposalStatus,
     pub url: String,
     pub unresolved: usize,
+    /// where `--export` wrote the static page
+    pub exported: Option<String>,
     pub next: Vec<String>,
 }
 
@@ -266,25 +267,53 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
     // proposal is the exception, because reopening it would unstamp the approval.
     if p.fm.status == S::Approved {
         return Err(KsError::gate(
-            "already_approved",
+            GateCode::AlreadyApproved,
             format!("{id} is already approved — reopening it would unstamp the approval"),
             fixes![fix!("{} close {id}", ctx.invoked_as)],
         ));
     }
 
     let open = unresolved(&snap, p);
-    if p.fm.status != S::Review {
-        Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
+    let needs_move = p.fm.status != S::Review;
+    let mut snap = snap;
+    if needs_move {
+        let done = Store::open(ctx).transact(None, &ctx.invocation(), |_s, _m| {
             Ok(Plan::of(vec![Op::SetFields {
                 entity: EntityRef::Proposal(id.clone()),
                 sets: vec![(Key::Proposal(ProposalKey::Status), Yv::s("review"))],
             }]))
         })?;
+        snap = done.snapshot;
     }
+
+    // `--export`: the page as one static file, so it can be read on a phone or pasted
+    // into a PR when the loopback server is out of reach (t-f3a4). Comment-less on
+    // purpose: threads still live on the served page, and a comment relayed by hand is
+    // recorded as whoever relays it — see `via` on the row.
+    let exported = match &a.export {
+        None => None,
+        Some(rel) => {
+            let path = if rel.is_absolute() {
+                rel.clone()
+            } else {
+                ctx.repo.here().join(rel)
+            };
+            let html = crate::board::render_page_html(&page_of(ctx, &snap, &id.to_string())?);
+            let target = path.clone();
+            Store::open(ctx).transact(None, &ctx.invocation(), move |_s, _m| {
+                Ok(Plan::of(vec![Op::WriteGenerated {
+                    path: target,
+                    contents: html,
+                }]))
+            })?;
+            Some(path.display().to_string())
+        }
+    };
 
     Ok(ReviewReport {
         url: format!("http://127.0.0.1:{}/p/{id}", ctx.cfg.port),
         unresolved: open,
+        exported,
         // The URL is only live while `up` is running, and saying so beats a dead link.
         next: vec![format!("{} up", ctx.invoked_as)],
         status: S::Review,
@@ -315,6 +344,11 @@ impl Render for ReviewReport {
             .dim(dim)
             .url(self.url.clone())
             .write(w, st)?;
+        if let Some(p) = &self.exported {
+            Line::new(glyph::OK, format!("exported {p}"))
+                .dim("static, comment-less — threads stay on the served page")
+                .write(w, st)?;
+        }
         next_lines(&self.next, w, st)
     }
 }
@@ -352,7 +386,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     let open = unresolved(&snap, p);
     if open > 0 {
         return Err(KsError::gate(
-            "unresolved_threads",
+            GateCode::UnresolvedThreads,
             format!(
                 "cannot approve {id} — {}",
                 plural(open, "unresolved review thread")
@@ -366,14 +400,16 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
 
     // `[tN]` bullets become real board tickets. The text before the first `·` is the
     // title; the rest is the DESIGN.md `· S · deps: t-31aa` tail, which `new` already
-    // knows how to take as flags.
-    let wanted: Vec<(ItemRef, String, Vec<String>)> = p
+    // knows how to take as flags. The spec is the bullet's own `(spec: x)`, else the spec
+    // of the `[cN]` it names, else the proposal's first (t-85de).
+    let wanted: Vec<(ItemRef, String, Vec<String>, Option<String>)> = p
         .items
         .iter()
         .filter(|i| i.id.kind == crate::ids::ItemKind::Ticket)
         .map(|i| {
-            let (title, deps) = split_ticket_bullet(&i.text);
-            (i.id.clone(), title, deps)
+            let bullet = split_ticket_bullet(&i.text);
+            let spec = ticket_spec(p, &bullet);
+            (i.id.clone(), bullet.title, bullet.deps, spec)
         })
         .collect();
 
@@ -390,7 +426,6 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         ctx.now.format("%Y-%m-%dT%H:%MZ"),
         ctx.actor.label()
     );
-    let spec = p.fm.specs.first().map(ToString::to_string);
     let pid = id.clone();
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
         let p = live(sn, &pid)?;
@@ -403,8 +438,8 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         }]);
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
-            let f = facts(ctx);
-            for (anchor, title, deps) in &wanted {
+            let f = ctx.facts();
+            for (anchor, title, deps, spec) in &wanted {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
                     spec: spec.clone(),
@@ -457,28 +492,95 @@ fn stamp_tail(p: &Proposal) -> String {
         .unwrap_or_default()
 }
 
-/// `Rate-limit login endpoint · S · deps: t-31aa` -> title + dep ids.
+/// A `[tN]` bullet, taken apart.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TicketBullet {
+    title: String,
+    deps: Vec<String>,
+    /// `(spec: playbooks)` at the head of the bullet
+    spec: Option<String>,
+    /// the `[cN]` tags the bullet says it implements: `· implements: c1, c2` or `· c1`
+    changes: Vec<String>,
+}
+
+/// `(spec: playbooks) Rate-limit login endpoint · S · deps: t-31aa · implements: c1`
+/// -> title, dep ids, the named spec, the named changes.
 ///
 /// The estimate segment is dropped on purpose: `new` has no estimate flag, and inventing a
 /// place to put it would be a field the board never reads.
-fn split_ticket_bullet(text: &str) -> (String, Vec<String>) {
-    let mut title = text.trim();
-    let mut deps = Vec::new();
+fn split_ticket_bullet(text: &str) -> TicketBullet {
+    let mut b = TicketBullet::default();
+    let mut text = text.trim();
+    if let Some(rest) = text.strip_prefix("(spec:") {
+        if let Some((name, tail)) = rest.split_once(')') {
+            b.spec = Some(name.trim().to_string());
+            text = tail.trim();
+        }
+    }
+    let mut title = text;
     if let Some((head, rest)) = text.split_once('·') {
         title = head.trim();
         for seg in rest.split('·') {
             let seg = seg.trim();
-            if let Some(list) = seg.strip_prefix("deps:") {
-                deps.extend(
-                    list.split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(ToString::to_string),
-                );
+            let list = |l: &str| -> Vec<String> {
+                l.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string)
+                    .collect()
+            };
+            if let Some(l) = seg.strip_prefix("deps:") {
+                b.deps.extend(list(l));
+            } else if let Some(l) = seg.strip_prefix("implements:") {
+                b.changes.extend(list(l));
+            } else {
+                // A bare `c1, c2` segment: every entry is a change tag, or it is not a
+                // change list at all (the estimate `S` is one such segment).
+                let items = list(seg);
+                if !items.is_empty() && items.iter().all(|i| is_change_tag(i)) {
+                    b.changes.extend(items);
+                }
             }
         }
     }
-    (title.to_string(), deps)
+    b.title = title.to_string();
+    b
+}
+
+/// `c1`, `c12` — a change anchor's tag, without its proposal.
+fn is_change_tag(s: &str) -> bool {
+    s.strip_prefix('c')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Which spec a minted ticket belongs to (t-85de). On the trial all three tickets minted
+/// from one proposal got its first spec, and the content ticket belonged to another.
+///
+/// 1. the bullet's own `(spec: x)`;
+/// 2. the spec of the first `[cN]` the bullet names — a change bullet opens with its spec,
+///    `- [c1] auth: 5 failed logins …` (DESIGN.md), when the proposal spans several;
+/// 3. the proposal's first spec.
+fn ticket_spec(p: &Proposal, b: &TicketBullet) -> Option<String> {
+    if let Some(s) = &b.spec {
+        return Some(s.clone());
+    }
+    let named: Vec<&SpecName> = p.fm.specs.iter().collect();
+    for tag in &b.changes {
+        let Some(change) = p
+            .items
+            .iter()
+            .find(|i| format!("{}{}", i.id.kind.letter(), i.id.n) == *tag)
+        else {
+            continue;
+        };
+        let Some((head, _)) = change.text.split_once(':') else {
+            continue;
+        };
+        if let Some(s) = named.iter().find(|s| s.as_str() == head.trim()) {
+            return Some(s.to_string());
+        }
+    }
+    p.fm.specs.first().map(ToString::to_string)
 }
 
 impl Render for ApproveReport {
@@ -592,7 +694,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     refuse_terminal(ctx, p, true)?;
     if p.fm.status != S::Approved {
         return Err(KsError::gate(
-            "not_approved",
+            GateCode::NotApproved,
             format!(
                 "{id} is {} — close is the END of an approved proposal, not a way out \
                  of one",
@@ -765,7 +867,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
         flat.truncate(6);
         let head = flat.remove(0);
         return Err(KsError::gate(
-            "undispositioned_items",
+            GateCode::UndispositionedItems,
             msg,
             crate::error::Fixes::new(head, flat),
         ));
@@ -784,7 +886,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
         let mut ledger = ledger.clone();
         let mut plan = Plan::empty();
-        let f = facts(ctx);
+        let f = ctx.facts();
         for (item, text) in &followups {
             let args = crate::cli::NewArgs {
                 title: text.clone(),
@@ -835,7 +937,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
     Ok(CloseReport {
         status: S::Closed,
         ledger: dispositions,
-        moved_to: rel_to(ctx, &dest),
+        moved_to: ctx.rel(&dest),
         next: vec![format!("{} rules", ctx.invoked_as)],
         id,
     })
@@ -1019,7 +1121,12 @@ pub struct SpecContext {
 pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
     ctx.require_initialized()?;
     let s = ctx.snapshot()?;
-    let p = open_proposal(ctx, &s, raw)?;
+    page_of(ctx, &s, raw)
+}
+
+/// [`page`] over a snapshot the caller already holds (§2.16: one store load per command).
+pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
+    let p = open_proposal(ctx, s, raw)?;
 
     let ops = s.comments.get(&p.fm.id).map(Vec::as_slice).unwrap_or(&[]);
     let (live, orphaned) = crate::cmd::comment::fold_threads(p, ops);
@@ -1082,7 +1189,7 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
             })
             .collect();
 
-    let open = unresolved(&s, p);
+    let open = unresolved(s, p);
     let why = section(&p.body, "## Why");
     let (why_headline, why_detail) = split_headline(&why);
     Ok(ProposalPage {
@@ -1105,7 +1212,11 @@ pub fn page(ctx: &Ctx, raw: &str) -> Result<ProposalPage> {
 }
 
 /// `(promote: decision) rate-limit state in Redis` -> `rate-limit state in Redis`.
-fn strip_marker(text: &str) -> String {
+///
+/// Shared with `promote`: the marker is the prescription's TYPE, and a minted decision or
+/// quirk records its type in its own frontmatter, so a title that kept the marker would say
+/// it twice — and say it forever, on every `rules` line and every page (t-5f2b).
+pub(crate) fn strip_marker(text: &str) -> String {
     let t = text.trim();
     if !t.starts_with('(') {
         return t.to_string();

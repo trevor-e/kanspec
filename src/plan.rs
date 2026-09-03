@@ -18,7 +18,7 @@ use serde::Serialize;
 
 use crate::cache::GitState;
 use crate::ctx::Actor;
-use crate::error::{Fix, KsError, Result};
+use crate::error::{Fix, GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::{DecisionId, ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::{Key, TicketKey};
@@ -185,6 +185,21 @@ impl Op {
         !matches!(self, Op::WriteGitState { .. } | Op::WriteGenerated { .. })
     }
 
+    /// Does this step change something `KANSPEC-FEATURES.md` / `KANSPEC-ARCHITECTURE.md`
+    /// are projected from? A spec, decision or quirk record; a rule stamp (a spec body);
+    /// or the git facts the feature map's `Fresh?` column reads. `Store::transact`
+    /// republishes the projections from the post-write snapshot whenever a plan answers
+    /// yes, so no handler can forget to (t-0769).
+    pub fn touches_projection(&self) -> bool {
+        match self {
+            Op::StampRule { .. } | Op::WriteGitState { .. } => true,
+            _ => matches!(
+                self.entity(),
+                Some(EntityRef::Spec(_) | EntityRef::Decision(_) | EntityRef::Quirk(_))
+            ),
+        }
+    }
+
     /// The entity a plan step is about, when it has one. `MoveDir`, `AppendJsonl`,
     /// `WriteGenerated` and `WriteGitState` name raw paths instead; `StampRule` names a
     /// `SpecName` rather than owning an `EntityRef`, so it answers `None` here and
@@ -263,7 +278,7 @@ impl Plan {
                     for (k, _) in sets {
                         if crate::keys::RESERVED_DERIVED.contains(&k.as_str()) {
                             return Err(KsError::gate(
-                                "derived_key_write",
+                                GateCode::DerivedKeyWrite,
                                 format!("`{k}` is a derived fact — it has no write path"),
                                 fixes![fix!("kanspec scan"), fix!("kanspec doctor")],
                             ));

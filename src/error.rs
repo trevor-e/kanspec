@@ -1,7 +1,7 @@
 //! The eight closed error shapes, the exit-code table, and the "next command" renderer.
 //!
 //! **This file never grows.** A new refusal is
-//! `KsError::gate("undispositioned", msg, fixes![fix!("kanspec close {id}")])` **in the
+//! `KsError::gate(GateCode::Undispositioned, msg, fixes![fix!("kanspec close {id}")])` **in the
 //! raising agent's own file** — `code: &'static str` is the stable JSON discriminator, so
 //! agent-facing error kinds stay as precise as a per-situation enum without making
 //! `error.rs` the worst merge magnet in a nine-agent build.
@@ -42,7 +42,12 @@ impl Fix {
     /// — a rewrite applied per surface would let the human and JSON refusals name
     /// different commands, which is the one drift this crate's whole output design forbids.
     pub fn cmd(s: impl Into<String>) -> Fix {
-        Fix(crate::out::spoken(&s.into()))
+        Fix(s.into())
+    }
+
+    /// The fix as the user should type it — `kanspec` rewritten to the binary they ran.
+    pub fn spoken(&self, invoked_as: &str) -> String {
+        crate::out::spoken_as(&self.0, invoked_as)
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -97,6 +102,119 @@ pub enum EnvCode {
 
 /// Structured payloads for the TWO errors whose output quality *is* the product.
 /// Agents constructing a new refusal use `GateDetail::Plain` and never edit this file.
+/// Every gate refusal's situation code — the thing hooks and agents branch on. Typed so
+/// the set is closed and checked exhaustively; serialised as the same snake_case string
+/// `--json` always carried, so nothing reading the envelope changes (t-f217). A new
+/// refusal adds a variant here and raises it from its own file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GateCode {
+    AgentCannotSelfAccept,
+    AlreadyApproved,
+    BindFailed,
+    CiReaderV02,
+    ConfirmWithoutHead,
+    ConfirmWithoutWhy,
+    DecisionNotAccepted,
+    DecisionNotProposed,
+    DecisionNotStanding,
+    DerivedKeyWrite,
+    FollowupsUnanswered,
+    LogViolation,
+    MainBehind,
+    MainBlind,
+    MergeUnknown,
+    NoCodeFromReview,
+    NoCodeWithoutWhy,
+    NoHeadToRecord,
+    NotApproved,
+    NotLanded,
+    NothingToRepair,
+    NothingToShip,
+    PortInUse,
+    ProjectionPathTaken,
+    PromoteSpecShipsInCode,
+    ProposalClosed,
+    ProposalTerminal,
+    QuirkNotActive,
+    QuirkWithoutPaths,
+    QuirksUnanswered,
+    RepairCannotClose,
+    RepairCannotReset,
+    RepairWithoutWhy,
+    SpawnWithoutStep,
+    SpecUnchangedBlanket,
+    SpecUnchangedUnrecorded,
+    StepDroppedWithoutReason,
+    StepsUndispositioned,
+    SyncBranchV04,
+    TriageInputClosed,
+    TriageUnanswered,
+    Undispositioned,
+    UndispositionedItems,
+    UnresolvedThreads,
+    WhyIsRequired,
+}
+
+impl GateCode {
+    /// The snake_case string `--json` carries and `KsError::code` returns.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            GateCode::AgentCannotSelfAccept => "agent_cannot_self_accept",
+            GateCode::AlreadyApproved => "already_approved",
+            GateCode::BindFailed => "bind_failed",
+            GateCode::CiReaderV02 => "ci_reader_v02",
+            GateCode::ConfirmWithoutHead => "confirm_without_head",
+            GateCode::ConfirmWithoutWhy => "confirm_without_why",
+            GateCode::DecisionNotAccepted => "decision_not_accepted",
+            GateCode::DecisionNotProposed => "decision_not_proposed",
+            GateCode::DecisionNotStanding => "decision_not_standing",
+            GateCode::DerivedKeyWrite => "derived_key_write",
+            GateCode::FollowupsUnanswered => "followups_unanswered",
+            GateCode::LogViolation => "log_violation",
+            GateCode::MainBehind => "main_behind",
+            GateCode::MainBlind => "main_blind",
+            GateCode::MergeUnknown => "merge_unknown",
+            GateCode::NoCodeFromReview => "no_code_from_review",
+            GateCode::NoCodeWithoutWhy => "no_code_without_why",
+            GateCode::NoHeadToRecord => "no_head_to_record",
+            GateCode::NotApproved => "not_approved",
+            GateCode::NotLanded => "not_landed",
+            GateCode::NothingToRepair => "nothing_to_repair",
+            GateCode::NothingToShip => "nothing_to_ship",
+            GateCode::PortInUse => "port_in_use",
+            GateCode::ProjectionPathTaken => "projection_path_taken",
+            GateCode::PromoteSpecShipsInCode => "promote_spec_ships_in_code",
+            GateCode::ProposalClosed => "proposal_closed",
+            GateCode::ProposalTerminal => "proposal_terminal",
+            GateCode::QuirkNotActive => "quirk_not_active",
+            GateCode::QuirkWithoutPaths => "quirk_without_paths",
+            GateCode::QuirksUnanswered => "quirks_unanswered",
+            GateCode::RepairCannotClose => "repair_cannot_close",
+            GateCode::RepairCannotReset => "repair_cannot_reset",
+            GateCode::RepairWithoutWhy => "repair_without_why",
+            GateCode::SpawnWithoutStep => "spawn_without_step",
+            GateCode::SpecUnchangedBlanket => "spec_unchanged_blanket",
+            GateCode::SpecUnchangedUnrecorded => "spec_unchanged_unrecorded",
+            GateCode::StepDroppedWithoutReason => "step_dropped_without_reason",
+            GateCode::StepsUndispositioned => "steps_undispositioned",
+            GateCode::SyncBranchV04 => "sync_branch_v04",
+            GateCode::TriageInputClosed => "triage_input_closed",
+            GateCode::TriageUnanswered => "triage_unanswered",
+            GateCode::Undispositioned => "undispositioned",
+            GateCode::UndispositionedItems => "undispositioned_items",
+            GateCode::UnresolvedThreads => "unresolved_threads",
+            GateCode::WhyIsRequired => "why_is_required",
+        }
+    }
+}
+
+impl std::fmt::Display for GateCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "detail", rename_all = "snake_case")]
 pub enum GateDetail {
@@ -131,7 +249,7 @@ pub enum KsError {
     },
     #[error("{message}")]
     Gate {
-        code: &'static str,
+        code: GateCode,
         message: String,
         detail: GateDetail,
         fix: Fixes,
@@ -164,7 +282,7 @@ pub enum KsError {
 }
 
 impl KsError {
-    pub fn gate(code: &'static str, message: impl Into<String>, fix: Fixes) -> KsError {
+    pub fn gate(code: GateCode, message: impl Into<String>, fix: Fixes) -> KsError {
         KsError::gate_detail(code, message, GateDetail::Plain, fix)
     }
 
@@ -172,7 +290,7 @@ impl KsError {
     /// undispositioned item list. Pre-formatting either into `message` would throw away
     /// the `--explain`-grade output that is this tool's selling point.
     pub fn gate_detail(
-        code: &'static str,
+        code: GateCode,
         message: impl Into<String>,
         detail: GateDetail,
         fix: Fixes,
@@ -255,7 +373,7 @@ impl KsError {
     /// The situation code inside the shape — `Gate`'s `code`, `Environment`'s `EnvCode`.
     pub fn code(&self) -> Option<&'static str> {
         match self {
-            KsError::Gate { code, .. } => Some(code),
+            KsError::Gate { code, .. } => Some(code.as_str()),
             KsError::Environment { code, .. } => Some(match code {
                 EnvCode::NotARepo => "not_a_repo",
                 EnvCode::NotInitialized => "not_initialized",
@@ -284,27 +402,29 @@ impl KsError {
 
     /// human -> stderr; json -> a `{"ok":false,…}` envelope on stdout, so an agent that
     /// only reads stdout still gets the refusal and its fix list.
-    pub fn render(&self, mode: &OutMode) {
+    pub fn render(&self, mode: &OutMode, invoked_as: &str) {
         match mode {
             OutMode::Json => {
                 let mut out = std::io::stdout().lock();
                 let _ = writeln!(
                     out,
                     "{}",
-                    serde_json::to_string_pretty(&self.to_json())
+                    serde_json::to_string_pretty(&self.to_json_as(invoked_as))
                         .unwrap_or_else(|_| r#"{"ok":false}"#.to_string())
                 );
             }
             OutMode::Human { color } => {
                 let mut err = std::io::stderr().lock();
-                let _ = err.write_all(self.render_human(*color).as_bytes());
+                let _ = err.write_all(self.render_human(*color, invoked_as).as_bytes());
             }
         }
     }
 
     /// The exact bytes `render` writes in human mode. Split out so it is unit-testable
-    /// without capturing a global stream.
-    pub fn render_human(&self, color: bool) -> String {
+    /// without capturing a global stream. `invoked_as` spells every fix — the same
+    /// rewrite `to_json_as` applies, so the human and JSON refusals cannot name different
+    /// commands.
+    pub fn render_human(&self, color: bool, invoked_as: &str) -> String {
         use crate::out::{paint, Color};
         let mut s = String::new();
         let _ = writeln!(s, "{} {}", paint("✗", Color::Red, color), self);
@@ -328,15 +448,24 @@ impl KsError {
                 let _ = writeln!(s, "    {i}");
             }
         }
+        if let KsError::Git { cmd, exit, .. } = self {
+            let _ = writeln!(s, "    {cmd}   exit {exit}");
+        }
         for f in self.fixes().iter() {
-            let _ = writeln!(s, "  {} {}", paint("→", Color::Cyan, color), f.as_str());
+            let _ = writeln!(
+                s,
+                "  {} {}",
+                paint("→", Color::Cyan, color),
+                f.spoken(invoked_as)
+            );
         }
         s
     }
 
-    /// `{"ok":false,"error":{kind,code,message,detail,fix,exit}}`
-    pub fn to_json(&self) -> serde_json::Value {
-        let fixes: Vec<&str> = self.fixes().iter().map(Fix::as_str).collect();
+    /// `{"ok":false,"error":{kind,code,message,detail,fix,exit}}`, fixes spelled with the
+    /// binary the user ran.
+    pub fn to_json_as(&self, invoked_as: &str) -> serde_json::Value {
+        let fixes: Vec<String> = self.fixes().iter().map(|f| f.spoken(invoked_as)).collect();
         let mut error = serde_json::json!({
             "kind": self.kind(),
             "message": self.to_string(),
@@ -345,6 +474,12 @@ impl KsError {
         });
         if let Some(code) = self.code() {
             error["code"] = serde_json::Value::String(code.to_string());
+        }
+        // The command that failed and how — what `scan --explain` needs and what a bug
+        // report is made of. Recorded on construction; surfaced here (t-f217).
+        if let KsError::Git { cmd, exit, .. } = self {
+            error["cmd"] = serde_json::Value::String(cmd.clone());
+            error["exit"] = serde_json::json!(exit);
         }
         if let Some(d) = self.detail() {
             if !matches!(d, GateDetail::Plain) {
@@ -407,7 +542,7 @@ mod tests {
             },
             KsError::not_found("ticket", "t-0000", fixes![fix!("kanspec ls")]),
             KsError::gate(
-                "merge_unknown",
+                GateCode::MergeUnknown,
                 "cannot verify",
                 fixes![fix!("kanspec scan")],
             ),
@@ -425,7 +560,7 @@ mod tests {
         for e in &cases {
             assert!(e.fixes().iter().next().is_some(), "{} has no fix", e.kind());
             assert!(matches!(e.exit_code(), 1 | 69 | 70));
-            assert_eq!(e.to_json()["ok"], serde_json::json!(false));
+            assert_eq!(e.to_json_as("kanspec")["ok"], serde_json::json!(false));
         }
     }
 
@@ -440,7 +575,7 @@ mod tests {
         };
         assert_eq!(e.to_string(), "t-9c41 is review, not doing — cannot ship");
         assert_eq!(
-            e.render_human(false),
+            e.render_human(false, "kanspec"),
             "✗ t-9c41 is review, not doing — cannot ship\n  → kanspec show t-9c41\n"
         );
     }

@@ -106,6 +106,15 @@ pub enum Tri<T> {
     Unknown(Unknown),
 }
 
+impl<T> From<std::result::Result<T, Unknown>> for Tri<T> {
+    fn from(r: std::result::Result<T, Unknown>) -> Tri<T> {
+        match r {
+            Ok(v) => Tri::Yes(v),
+            Err(u) => Tri::Unknown(u),
+        }
+    }
+}
+
 /// One variant per decline reason, exhaustively matched, each carrying the fields its
 /// badge text needs.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -377,6 +386,34 @@ impl Git {
         self.rev_resolves(s.as_str())
     }
 
+    /// Does the tree at `rev` carry `path` (repo-relative, forward slashes)?
+    /// `cat-file -e rev:path` — no checkout, no diff, one exit code.
+    pub fn carries(&self, rev: &str, path: &str) -> bool {
+        let spec = format!("{rev}:{path}");
+        self.succeeds(&["cat-file", "-e", &spec])
+    }
+
+    /// Does `name` exist as a full ref (`refs/heads/x`, `refs/remotes/origin/x`)?
+    pub fn ref_exists(&self, name: &str) -> bool {
+        self.succeeds(&["rev-parse", "--verify", "--quiet", name])
+    }
+
+    /// The branch name a human would type for `resolved` — `origin/main` → `main`.
+    ///
+    /// Structural rather than a guess: `refs/remotes/{resolved}` existing PROVES `resolved`
+    /// is a remote-tracking ref, and git forbids a `/` in a remote name, so the first
+    /// component is the remote and everything after it is the branch. `git switch` DWIMs
+    /// that short name into a local branch when there is not one already.
+    pub fn short_name(&self, resolved: &str) -> String {
+        if !self.ref_exists(&format!("refs/remotes/{resolved}")) {
+            return resolved.to_string();
+        }
+        match resolved.split_once('/') {
+            Some((_remote, branch)) if !branch.is_empty() => branch.to_string(),
+            _ => resolved.to_string(),
+        }
+    }
+
     /// The configured `main`, or `symbolic-ref refs/remotes/origin/HEAD` when it does not
     /// resolve. Never guesses silently: the fallbacks are ordered and the failure names
     /// the config key.
@@ -466,24 +503,27 @@ impl Git {
     /// `-` means an equivalent patch is already upstream; `+` means it is not — and a `+`
     /// cannot tell an unmerged branch apart from a multi-commit squash, which is why the
     /// ladder maps it to `Unknown` rather than `NotMerged` (D-3).
-    pub fn cherry(&self, base: &str, head: &Sha) -> Tri<Vec<CherryLine>> {
+    ///
+    /// A two-state answer, not a `Tri`: `cherry` reports lines or fails to run, and never
+    /// says `No` — so the type does not promise a `No` the ladder would have to map to a
+    /// verdict nothing else produces (t-c060).
+    pub fn cherry(&self, base: &str, head: &Sha) -> std::result::Result<Vec<CherryLine>, Unknown> {
         let cmd = format!("git cherry {base} {}", head.as_str());
         match self.evidence(&cmd, &["cherry", base, head.as_str()], &[]) {
-            Ok(o) => Tri::Yes(
-                o.out
-                    .lines()
-                    .filter_map(|l| {
-                        let mut it = l.split_whitespace();
-                        let sign = it.next()?;
-                        let sha = it.next()?.to_string();
-                        Some(CherryLine {
-                            upstream: sign == "-",
-                            sha,
-                        })
+            Ok(o) => Ok(o
+                .out
+                .lines()
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let sign = it.next()?;
+                    let sha = it.next()?.to_string();
+                    Some(CherryLine {
+                        upstream: sign == "-",
+                        sha,
                     })
-                    .collect(),
-            ),
-            Err(u) => Tri::Unknown(u),
+                })
+                .collect()),
+            Err(u) => Err(u),
         }
     }
 

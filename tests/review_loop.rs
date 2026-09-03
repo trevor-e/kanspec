@@ -298,6 +298,30 @@ fn a_promoted_decision_lands_proposed_so_an_agent_never_self_accepts() {
     assert!(rules.contains("DECISIONS (0)"), "{rules}");
     // And it points home, so `why` can walk the chain.
     assert!(r.stdout.contains(&format!("{id}#p1")), "{}", r.stdout);
+    // The `(promote: decision)` marker typed the prescription; it is not the title
+    // (t-5f2b: D-0174 on the trial carried it in every listing).
+    let did = r
+        .stdout
+        .split_whitespace()
+        .find(|w| w.starts_with("D-"))
+        .expect("the minted id")
+        .to_string();
+    let file = std::fs::read_dir(repo.root.join(".kanspec/decisions"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(&did))
+        .unwrap_or_else(|| panic!("a file for {did}"));
+    let record = std::fs::read_to_string(&file).unwrap();
+    let title = record
+        .lines()
+        .find_map(|l| l.strip_prefix("title:"))
+        .expect("a title line")
+        .trim();
+    assert!(
+        title.contains("lockout state lives in Redis") && !title.contains("promote:"),
+        "{title}"
+    );
 }
 
 #[test]
@@ -583,4 +607,259 @@ fn features_without_uncovered_still_renders_its_table() {
     let out = repo.ks(["features"]).ok().stdout;
     assert!(out.contains("Login"), "{out}");
     assert!(!out.contains("claimed by a spec"), "{out}");
+}
+
+/// t-660d: a proposal in review is owed a human decision from the moment `review` runs,
+/// not from the seven-day dwell — `approve`, or a comment.
+#[test]
+fn a_proposal_in_review_is_listed_under_you_until_a_human_approves_or_comments() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n\n## Tickets\n",
+    );
+    let you = |repo: &TestRepo| -> Vec<serde_json::Value> {
+        let s: serde_json::Value = repo.json(&["status"]);
+        s["you"].as_array().unwrap().clone()
+    };
+    assert!(
+        !you(&repo).iter().any(|a| a["subject"] == id),
+        "a draft is nobody's to approve yet"
+    );
+
+    repo.ks(["review", id]).ok();
+    let line = you(&repo)
+        .into_iter()
+        .find(|a| a["subject"] == id)
+        .unwrap_or_else(|| panic!("the proposal in review is owed a decision"));
+    assert_eq!(line["fix"], format!("kanspec approve {id}"), "{line}");
+    assert!(
+        line["line"].as_str().unwrap().contains("in review"),
+        "{line}"
+    );
+    let human = repo.ks(["status"]).ok().stdout;
+    assert!(human.starts_with(" YOU (1)"), "{human}");
+
+    // A thread is the other way to discharge it: the threads line takes over.
+    repo.ks(["comment", "add", &format!("{id}#c1"), "--body", "too broad"])
+        .ok();
+    let lines = you(&repo);
+    let mine: Vec<&serde_json::Value> = lines.iter().filter(|a| a["subject"] == id).collect();
+    assert_eq!(mine.len(), 1, "one line per proposal: {lines:?}");
+    assert!(
+        mine[0]["line"]
+            .as_str()
+            .unwrap()
+            .contains("unresolved review threads"),
+        "{lines:?}"
+    );
+
+    // Approved: nothing owed on it any more.
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    repo.ks(["comment", "resolve", &cid, "--note", "narrowed"])
+        .ok();
+    repo.ks(["approve", id]).ok();
+    assert!(
+        !you(&repo).iter().any(|a| a["subject"] == id),
+        "{:?}",
+        you(&repo)
+    );
+}
+
+/// t-85de: three tickets minted from one proposal all got its first spec, and the content
+/// ticket belonged to another. A `[tN]` names its spec, or inherits it from the `[cN]` it
+/// implements, or falls back to the proposal's first.
+#[test]
+fn a_minted_ticket_takes_its_own_spec_or_the_spec_of_the_change_it_implements() {
+    let repo = TestRepo::new();
+    for (name, code) in [("auth", "src/auth/**"), ("playbooks", "docs/**")] {
+        repo.ks(["spec", "new", name, "--feature", "F", "--code", code])
+            .ok();
+    }
+    repo.ks([
+        "propose",
+        "Onboarding interview",
+        "--spec",
+        "auth",
+        "--spec",
+        "playbooks",
+    ])
+    .ok();
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] auth: ask the three questions\n- [c2] playbooks: write the runbook\n\n## Prescriptions\n\n## Tickets\n- [t1] Interview flow · S\n- [t2] (spec: playbooks) Runbook content · S\n- [t3] Runbook wiring · S · implements: c2\n- [t4] Alerts · c1, c2\n",
+    );
+    repo.ks(["review", id]).ok();
+    let r: serde_json::Value = repo.json(&["approve", id]);
+    let minted: Vec<String> = r["minted"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(minted.len(), 4, "{r}");
+    let spec_of = |t: &str| -> String {
+        let v: serde_json::Value = repo.json(&["show", t]);
+        v["spec"].as_str().unwrap_or("").to_string()
+    };
+    assert_eq!(
+        spec_of(&minted[0]),
+        "auth",
+        "the proposal's first spec, as before"
+    );
+    assert_eq!(spec_of(&minted[1]), "playbooks", "named on the bullet");
+    assert_eq!(spec_of(&minted[2]), "playbooks", "inherited from [c2]");
+    assert_eq!(
+        spec_of(&minted[3]),
+        "auth",
+        "inherited from the first change named"
+    );
+    let t2 = repo.read(&format!(".kanspec/tickets/{}.md", minted[1]));
+    assert!(
+        t2.contains("title: Runbook content") && !t2.contains("(spec:"),
+        "the marker is not the title: {t2}"
+    );
+}
+
+/// t-8e31: labels come from git identity, so an agent relaying a human's comment and the
+/// human typing it looked identical. The row carries the kind beside the label.
+#[test]
+fn a_row_an_agent_wrote_says_so_beside_its_label_and_a_humans_does_not() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout after 5 failures\n\n## Prescriptions\n\n## Tickets\n",
+    );
+    // The human seeds the thread.
+    repo.ks(["comment", "add", &format!("{id}#c1"), "--body", "too broad"])
+        .ok();
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    // An agent with a session id replies; then one that Claude Code runs with no session
+    // id at all — the case that used to fall through to the git identity and look human.
+    repo.ks_env(
+        ["comment", "reply", &cid, "--body", "narrowed to /login"],
+        &[
+            ("KANSPEC_ACTOR", "claude/sess-a91"),
+            ("KANSPEC_ACTOR_KIND", "agent"),
+        ],
+    )
+    .ok();
+    // A later clock: rows dedupe on (id, op, at), so two replies in the same frozen
+    // minute would read back as one.
+    repo.ks_env(
+        ["comment", "reply", &cid, "--body", "and documented"],
+        &[
+            ("KANSPEC_ACTOR", ""),
+            ("KANSPEC_ACTOR_KIND", ""),
+            ("KANSPEC_NOW", "2026-08-31T12:01:00Z"),
+            ("CLAUDECODE", "1"),
+        ],
+    )
+    .ok();
+
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let t = &cm["threads"][0];
+    assert!(t["via"].is_null(), "the human's seed carries no kind: {t}");
+    assert_eq!(t["replies"][0]["via"], "agent", "{t}");
+    assert_eq!(t["replies"][0]["by"], "claude/sess-a91", "{t}");
+    assert_eq!(
+        t["replies"][1]["via"], "agent",
+        "an agent with no session id is still an agent: {t}"
+    );
+    assert_eq!(t["replies"][1]["by"], "claude/session", "{t}");
+
+    let human = repo.ks(["comments"]).ok().stdout;
+    assert!(
+        human.contains("claude/sess-a91 via agent: narrowed"),
+        "{human}"
+    );
+    assert!(!human.contains("trevor via"), "{human}");
+
+    // The kind is in the row itself, where a merge or a hand reader sees it.
+    let jsonl = repo.read(&format!(".kanspec/proposals/{p}/comments.jsonl"));
+    assert_eq!(jsonl.matches("\"via\":\"agent\"").count(), 2, "{jsonl}");
+}
+
+/// t-f3a4: the page is loopback-only, and a reviewer on a phone had to have the proposal
+/// mirrored by hand. `review --export` writes the page as one static file: the proposal,
+/// every thread read-only, no script and no form.
+#[test]
+fn review_export_writes_the_page_as_one_static_comment_less_file() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nCredential stuffing hit staging.\n\n## Changes\n- [c1] auth: lockout after 5 failures\n\n## Testing\n- run the login suite\n\n## Prescriptions\n- [p1] (promote: decision) lockout state lives in Redis <only>\n\n## Tickets\n- [t1] Rate-limit login endpoint · S\n",
+    );
+    repo.ks([
+        "comment",
+        "add",
+        &format!("{id}#c1"),
+        "--body",
+        "too broad & vague",
+    ])
+    .ok();
+
+    let r: serde_json::Value = repo.json(&["review", id, "--export", "page.html"]);
+    assert_eq!(r["status"], "review");
+    let exported = r["exported"].as_str().expect("where it wrote");
+    assert!(exported.ends_with("page.html"), "{exported}");
+    let html = std::fs::read_to_string(exported).expect("the file");
+
+    for needle in [
+        "Credential stuffing hit staging.",
+        "lockout after 5 failures",
+        "[c1]",
+        "PROMOTE → decision",
+        "lockout state lives in Redis &lt;only&gt;",
+        "Rate-limit login endpoint",
+        "## Testing".trim_start_matches("## "),
+        "run the login suite",
+        "too broad &amp; vague",
+        "1 open",
+        "<style>",
+    ] {
+        assert!(html.contains(needle), "the page lost {needle:?}:\n{html}");
+    }
+    assert!(
+        !html.contains("<script") && !html.contains("<form") && !html.contains("<button"),
+        "static and comment-less: no script, no form, no button\n{html}"
+    );
+    assert!(
+        !html.contains("(promote:"),
+        "the marker is the badge, not the text"
+    );
+
+    // Re-running exports the page as it is now: the thread resolved shows resolved.
+    let cm: serde_json::Value = repo.json(&["comments"]);
+    let cid = cm["threads"][0]["id"].as_str().unwrap().to_string();
+    repo.ks(["comment", "resolve", &cid, "--note", "narrowed to /login"])
+        .ok();
+    repo.ks(["review", id, "--export", "page.html"]).ok();
+    let html = repo.read("page.html");
+    assert!(
+        html.contains("✓ narrowed to /login") && html.contains("nothing open"),
+        "{html}"
+    );
+    let human = repo.ks(["review", id, "--export", "page.html"]).ok().stdout;
+    assert!(
+        human.contains("exported") && human.contains("page.html"),
+        "{human}"
+    );
 }

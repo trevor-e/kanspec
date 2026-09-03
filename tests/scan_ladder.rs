@@ -135,7 +135,6 @@ fn the_six_real_merge_shapes_land_on_exact_methods_with_two_honest_unknowns() {
     for shape in Shape::all() {
         let predicted = match shape.expected() {
             common::merges::ExpectedStatus::Merged => MergeStatus::Merged,
-            common::merges::ExpectedStatus::NotMerged => MergeStatus::NotMerged,
             common::merges::ExpectedStatus::Unknown => MergeStatus::Unknown,
         };
         assert_eq!(fact(&state, shape.ticket()).status, predicted, "{shape:?}");
@@ -150,13 +149,10 @@ fn an_unmerged_branch_is_unknown_with_a_reason_never_a_confident_no() {
     let repo = TestRepo::with_merges();
     repo.ks(["scan"]).ok();
     let f = fact(&gitstate(&repo), Shape::Never.ticket());
+    // `git cherry` reporting `+` cannot tell an unmerged branch from a multi-commit
+    // squash, so it must not be read as proof of absence (D-3) — and since t-c060 there is
+    // no `NotMerged` it could be read AS: the type has two outcomes, like the ladder.
     assert_eq!(f.status, MergeStatus::Unknown);
-    assert_ne!(
-        f.status,
-        MergeStatus::NotMerged,
-        "`git cherry` reporting `+` cannot tell an unmerged branch from a multi-commit \
-         squash, so it must not be read as proof of absence (D-3)"
-    );
     assert_eq!(f.why.as_deref(), Some("unknown (squash suspected, no gh)"));
 }
 
@@ -240,7 +236,7 @@ fn explain_shows_the_rungs_of_the_run_that_produced_the_verdict() {
         "patch-id",
         "git cherry",
         "+2",
-        "unknown (squash suspected, no gh)",
+        "unknown (squash suspected, no gh · checked 0s ago)",
     ] {
         assert!(
             out.contains(expect),
@@ -257,7 +253,7 @@ fn explain_shows_the_rungs_of_the_run_that_produced_the_verdict() {
         .ks(["scan", Shape::SquashGhTitleOnly.ticket()])
         .ok()
         .stdout;
-    assert!(quiet.contains("unknown (squash suspected, no gh)"));
+    assert!(quiet.contains("unknown (squash suspected, no gh · checked 0s ago)"));
     assert!(!quiet.contains("merge-base --is-ancestor"), "{quiet}");
 }
 
@@ -466,13 +462,13 @@ fn the_done_gate_refuses_an_undetectable_merge_and_hands_back_the_ladder() {
     // `KANSPEC_NOW` and a transcript that shows it can be snapshotted. A `Utc::now()` in
     // here would render "checked 3h ago" against the injected clock and this would fail.
     assert_eq!(
-        proof.badge(ctx.now),
-        "IN MAIN (ancestry · checked 0s ago)",
+        proof.badge().text(ctx.now),
+        "in main (ancestry · checked 0s ago)",
         "the ladder ran at ctx.now, so the proof is exactly zero seconds old"
     );
     assert_eq!(
-        proof.badge(ctx.now + chrono::Duration::hours(2)),
-        "IN MAIN (ancestry · checked 2h ago)"
+        proof.badge().text(ctx.now + chrono::Duration::hours(2)),
+        "in main (ancestry · checked 2h ago)"
     );
 }
 
@@ -603,8 +599,8 @@ fn every_line_of_the_transcript_says_how_it_knows_and_what_to_do_next() {
         "the in-main overlay glyph: {landed}"
     );
     assert!(
-        landed.contains(&format!("in main (ancestry · {sha})")),
-        "a badge names its method AND what landed: {landed}"
+        landed.contains("in main (ancestry · checked 0s ago)") && landed.contains(sha),
+        "a badge names its method, and the row names what landed: {landed}"
     );
     assert!(
         landed.contains(&format!("→ kanspec done {}", Shape::TrueMerge.ticket())),
@@ -616,12 +612,12 @@ fn every_line_of_the_transcript_says_how_it_knows_and_what_to_do_next() {
         .find(|l| l.contains(Shape::Never.ticket()))
         .unwrap_or_else(|| panic!("{out}"));
     assert!(
-        unsure.contains("unknown (squash suspected, no gh)"),
+        unsure.contains("unknown (squash suspected, no gh · checked 0s ago)"),
         "{unsure}"
     );
 
     assert!(
-        out.contains("6 scanned · 4 in main · 2 unknown · 0 not in main"),
+        out.contains("6 scanned · 4 in main · 2 unknown"),
         "the summary counts every shape:\n{out}"
     );
     // `--json` is the same values, not a second rendering of them.

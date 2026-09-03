@@ -44,7 +44,7 @@ use crate::cli::{
     ShowArgs, StartArgs, StatusArgs,
 };
 use crate::ctx::Ctx;
-use crate::error::{code, KsError, Result};
+use crate::error::{code, GateCode, KsError, Result};
 use crate::ids::{ItemRef, ProposalId};
 use crate::{fix, fixes};
 
@@ -83,11 +83,11 @@ pub struct Tick {
 /// The error shape every handler maps into — the same envelope `KsError::to_json` writes,
 /// so an agent hitting the API and an agent running the CLI read identical refusals.
 #[derive(Debug)]
-pub struct ApiError(pub crate::error::KsError);
+pub struct ApiError(pub crate::error::KsError, pub &'static str);
 
 impl From<KsError> for ApiError {
     fn from(e: KsError) -> ApiError {
-        ApiError(e)
+        ApiError(e, "kanspec")
     }
 }
 
@@ -100,7 +100,7 @@ impl IntoResponse for ApiError {
             code::INTERNAL => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::CONFLICT,
         };
-        (status, Json(self.0.to_json())).into_response()
+        (status, Json(self.0.to_json_as(self.1))).into_response()
     }
 }
 
@@ -165,7 +165,7 @@ fn banner(ctx: &Ctx, port: u16) {
 fn bind_error(port: u16, e: &std::io::Error) -> KsError {
     if e.kind() == std::io::ErrorKind::AddrInUse {
         return KsError::gate(
-            "port_in_use",
+            GateCode::PortInUse,
             format!("127.0.0.1:{port} is already in use — kanspec up may already be running"),
             fixes![
                 fix!("kanspec open"),
@@ -174,7 +174,7 @@ fn bind_error(port: u16, e: &std::io::Error) -> KsError {
         );
     }
     KsError::gate(
-        "bind_failed",
+        GateCode::BindFailed,
         format!("cannot bind 127.0.0.1:{port}: {e}"),
         fixes![fix!("kanspec up --port {}", port.saturating_add(1))],
     )
@@ -247,11 +247,13 @@ pub(crate) fn request_ctx(anchor: &Ctx, verb: &str) -> Result<Ctx> {
         repo: Some(anchor.repo.primary_root().to_path_buf()),
         command: Command::Status(StatusArgs { owner: None }),
     };
-    let mut ctx = Ctx::open(&cli, anchor.repo.primary_root())?;
     // This process's own argv is `up --port …`; the log must name the verb the browser
-    // asked for, not the server that relayed it.
-    ctx.invocation = format!("{} {verb} (web)", anchor.invoked_as);
-    Ok(ctx)
+    // asked for, not the server that relayed it — said at construction, not patched after.
+    let inv = crate::ctx::Invocation {
+        invoked_as: anchor.invoked_as,
+        cmdline: format!("{} {verb} (web)", anchor.invoked_as),
+    };
+    Ctx::open(&cli, anchor.repo.primary_root(), inv)
 }
 
 /// Every handler's body: hop to a blocking thread, build a `Ctx`, call the SAME `cmd::*`
@@ -262,12 +264,14 @@ where
     T: Send + 'static,
 {
     let anchor = state.ctx.clone();
+    let invoked_as = anchor.invoked_as;
     let joined = tokio::task::spawn_blocking(move || f(&request_ctx(&anchor, &verb)?)).await;
     match joined {
-        Ok(r) => r.map_err(ApiError),
-        Err(e) => Err(ApiError(KsError::internal(anyhow::anyhow!(
-            "the worker thread failed: {e}"
-        )))),
+        Ok(r) => r.map_err(|e| ApiError(e, invoked_as)),
+        Err(e) => Err(ApiError(
+            KsError::internal(anyhow::anyhow!("the worker thread failed: {e}")),
+            invoked_as,
+        )),
     }
 }
 
@@ -280,10 +284,13 @@ fn body_of<T: serde::de::DeserializeOwned + Default>(
         return Ok(T::default());
     }
     serde_json::from_str(raw).map_err(|e| {
-        ApiError(KsError::invalid(
-            format!("the request body is not the JSON this verb takes: {e}"),
-            fixes![fix!("POST {{}} for a verb with no options")],
-        ))
+        ApiError(
+            KsError::invalid(
+                format!("the request body is not the JSON this verb takes: {e}"),
+                fixes![fix!("POST {{}} for a verb with no options")],
+            ),
+            "kanspec",
+        )
     })
 }
 
@@ -373,7 +380,7 @@ pub struct DoneBody {
     #[serde(default)]
     pub no_followups: bool,
     #[serde(default)]
-    pub spec_unchanged: Option<String>,
+    pub spec_unchanged: Vec<String>,
     #[serde(default)]
     pub quirk: Vec<String>,
     #[serde(default)]
@@ -617,7 +624,7 @@ async fn post_review(
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::proposal::ReviewReport> {
     mutate(&st, "", 0, format!("review {id}"), move |ctx, _: ()| {
-        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id })
+        crate::cmd::proposal::review(ctx, &crate::cli::ReviewArgs { id, export: None })
     })
     .await
 }

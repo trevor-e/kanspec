@@ -11,7 +11,6 @@
 //! Owner: **F** (foundation). FROZEN.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -64,18 +63,6 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// `"kanspec"` or `"ks"` — set once by `run()`, because the log note and every fix line
-/// should name the binary the user actually typed.
-static INVOKED_AS: OnceLock<&'static str> = OnceLock::new();
-
-pub fn set_invoked_as(name: &'static str) {
-    let _ = INVOKED_AS.set(name);
-}
-
-pub fn invoked_as() -> &'static str {
-    INVOKED_AS.get().copied().unwrap_or("kanspec")
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -207,6 +194,10 @@ pub struct InitArgs {
     /// Reinstall the git hooks over an existing store, preserving foreign hooks
     #[arg(long)]
     pub refresh_hooks: bool,
+    /// The branch tickets integrate through (e.g. origin/develop) — written to config.toml
+    /// as `main`. Omit and `start` cuts from origin/main.
+    #[arg(long, value_name = "REV")]
+    pub main: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -327,9 +318,10 @@ pub struct DoneArgs {
     pub no_followups: bool,
 
     // ── knowledge checkpoint ──────────────────────────────────────────────────
-    /// Record why the branch touched a spec's globs without editing the spec
-    #[arg(long, value_name = "REASON", allow_hyphen_values = true)]
-    pub spec_unchanged: Option<String>,
+    /// Record why the branch touched a spec's globs without editing it: `<spec>:<reason>`,
+    /// one per spec; a bare reason is accepted when exactly one spec is unedited
+    #[arg(long, value_name = "SPEC:REASON", allow_hyphen_values = true)]
+    pub spec_unchanged: Vec<String>,
     /// Capture a quirk learned on this ticket; repeatable
     #[arg(long, value_name = "TITLE", allow_hyphen_values = true)]
     pub quirk: Vec<String>,
@@ -693,6 +685,10 @@ pub struct ProposeArgs {
 pub struct ReviewArgs {
     /// The proposal to put up for review
     pub id: String,
+    /// Also write the review page as one self-contained HTML file — static and
+    /// comment-less, for reading away from the machine that runs `kanspec up`
+    #[arg(long, value_name = "FILE")]
+    pub export: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]

@@ -156,8 +156,8 @@ Every prescription is **typed**: `(temp until <ticket>)` dies when its guard tic
 
 ```json
 {"id":"cm-88f1","op":"comment","target":"p-7de2#c3","quote":"ops: alert when lockouts exceed 100/hour","body":"scope creep — split alerting into its own proposal","author":"trevor","at":"2026-08-30T16:02:00Z"}
-{"id":"cm-88f1","op":"reply","by":"agent:claude","body":"Agreed — moved to p-8a10; c3 removed.","at":"2026-08-30T16:21:40Z"}
-{"id":"cm-88f1","op":"resolve","by":"agent:claude","note":"c3 -> p-8a10","at":"2026-08-30T16:21:41Z"}
+{"id":"cm-88f1","op":"reply","by":"claude/sess-a91","via":"agent","body":"Agreed — moved to p-8a10; c3 removed.","at":"2026-08-30T16:21:40Z"}
+{"id":"cm-88f1","op":"resolve","by":"claude/sess-a91","via":"agent","note":"c3 -> p-8a10","at":"2026-08-30T16:21:41Z"}
 ```
 
 The `quote` field captures the item's text at comment time: threads are self-locating for agents (`{target, quote, body}` is the whole payload), "edited since — view diff" is detectable, and a deleted item moves its thread to a visible orphan tray instead of losing it.
@@ -252,7 +252,8 @@ Every command: `--json`, typed errors that name the exact next command, color + 
 
 ```
 SETUP
-  kanspec init                        scaffold .kanspec/, .gitattributes (merge=union), git hooks, gitignore cache/
+  kanspec init [--main <rev>]         scaffold .kanspec/, .gitattributes (merge=union), git hooks, gitignore cache/;
+                                      --main names the branch tickets integrate through (default origin/main)
   kanspec setup claude|cursor|codex   install CLAUDE.md snippet + hooks (+ --remove to uninstall symmetrically)
   kanspec doctor [--fix]              prove invariants: log-trail legality, untyped prescriptions, dead globs,
                                       orphan deps, ledger completeness; exit 1 on violation (run in CI)
@@ -283,7 +284,9 @@ STATUS & GIT TRUTH
 
 PROPOSALS & REVIEW
   kanspec propose "title" [--spec S]  scaffold proposal.md (status draft), prints file path
-  kanspec review p-7de2               status -> review; prints review page URL
+  kanspec review p-7de2 [--export page.html]
+                                      status -> review; prints review page URL; --export writes the
+                                      page as one static, comment-less HTML file for reading elsewhere
   kanspec comments [p-x|t-x] [--unresolved --json]
   kanspec comment add|reply|resolve <target|cm-id> ...     (resolve requires --note)
   kanspec approve p-7de2              human act, recorded who/when; REFUSES with unresolved threads;
@@ -482,7 +485,7 @@ Proposed decisions are **not** injected as standing rules; a pending one sits in
 **The anti-rot mechanism — three interlocking gears (structural, not aspirational):**
 
 1. **The staleness tripwire (detection).** `scan` diffs each merged ticket's changed paths against every spec's `code:` globs. A spec whose globs accumulated N merges (default 3) with zero spec edits raises a `status` line — "payments: 4 merges since last spec edit — stale spec or missing globs?" — with a one-key resolution: spawn a doc ticket, or confirm no behavior change (logged; counter resets). Staleness is a git fact, like merge state.
-2. **The done checkpoint (forced but visibly skippable).** `kanspec done` maps the branch diff to spec globs and quirk paths: if a matching spec wasn't edited on the branch, it requires either the edit or an explicit `--spec-unchanged "reason"` recorded on the ticket and visible on the board. Skippable, but every skip is an auditable act, and the Stop hook blocks a session that dodged the check entirely.
+2. **The done checkpoint (forced but visibly skippable).** `kanspec done` maps the branch diff to spec globs and quirk paths: if a matching spec wasn't edited on the branch, it requires either the edit or an explicit `--spec-unchanged "<spec>:<reason>"` per uncovered spec — each named on its own line with the glob that caught it, never one blanket answer for several — recorded on the ticket and visible on the board. Skippable, but every skip is an auditable act, and the Stop hook blocks a session that dodged the check entirely.
 3. **One-line capture at the moment of pain.** `kanspec quirk add "..." --paths glob` is a single command; the done ritual's one-key "quirks discovered?" prompt fires while the burn is fresh. Capture friction near zero is why this registry accretes where ADR-era logs died.
 
 Residual drift is `doctor`'s job: globs matching zero files (dead quirk / renamed directory), decision scopes matching nothing, spec `code:` entries pointing at deleted paths — amber dots on the board's feature strip, hard failures in CI if you want them.
@@ -532,7 +535,7 @@ STANDING RULES steering agents now (= byte-identical to the rules section of `ka
 Nothing outside this list is served to agents. Closed proposals bind nothing.
 
 $ kanspec rules --audit
- ⚠ D-2c77: source proposal closed 80 days ago; 0 references from open tickets — still wanted?
+ ⚠ D-2c77: source proposal p-19f0 is closed; accepted 81d ago; 0 references from open tickets or shipped rules — still wanted?
  ⚠ spec auth [auth.oauth]: no provenance token (pre-kanspec) — adopt with `kanspec rules --adopt` or delete
 ```
 
@@ -588,7 +591,7 @@ If signals conflict or all fail, the result is **`unknown`**, rendered as such w
 **Close-out (`kanspec done`)** — the anti-stuck ritual, four cheap steps, `--json` mode with per-item flags for agents:
 1. **Verify merged** (refuse otherwise; `--no-code --why` recorded escape for docs/chores).
 2. **Leftover triage:** every unchecked Step must be spawned (`--spawn "..."` → linked `followup_of` ticket), dropped with a logged reason, or marked actually-done — no fourth option; non-interactive mode *requires* `--followup`/`--no-followups`, so "nothing left" is always a recorded claim.
-3. **Knowledge checkpoint:** spec edited on branch, or recorded `--spec-unchanged "reason"`; one-key quirk and decision prompts.
+3. **Knowledge checkpoint:** spec edited on branch, or recorded `--spec-unchanged "<spec>:<reason>"` per spec; one-key quirk and decision prompts.
 4. Log the transition; if this was the proposal's last live ticket, flag it settling and print `→ kanspec close p-x`.
 
 **Repairing a broken trail (`kanspec repair <id> --why "..."`) — the one place a human overrides the log.** Invariant 10 makes the `## Log` the proof of every state, and `Store::transact` re-proves it on the way *in*: a ticket whose log no longer replays cannot be written by any verb. That is the right default and a trap at the edges — an imported tracker, a union-merged log with two `start` lines, a `sed` someone ran last month — because it turns a broken file into a permanently unwritable one. `repair` is the escape: it appends an attributed, timestamped, human-signed `repair` line whose recorded state is **authoritative**, so replay restarts from it and the ticket becomes writable again. It never lets anyone *choose* a state — the state it attests is the one already in the frontmatter — and it refuses without a `--why`, and refuses on a ticket that already replays cleanly.

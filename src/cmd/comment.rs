@@ -14,9 +14,8 @@ use serde::Serialize;
 
 use crate::cli::{CommentArgs, CommentCommand, CommentsArgs, ExpireArgs, PromoteArgs};
 use crate::cmd::proposal::{live, next_lines, proposal_or_refuse};
-use crate::cmd::ticket::facts;
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::ids::{CommentId, ItemRef, ProposalId};
 use crate::model::{CommentOp, CommentOpKind, Proposal, Snapshot};
 use crate::out::{glyph, Color, Line, Render, Style};
@@ -41,6 +40,8 @@ pub struct Thread {
     pub quote: Option<String>,
     pub body: String,
     pub author: Option<String>,
+    /// `"agent"` when an agent process wrote the seed
+    pub via: Option<String>,
     pub at: DateTime<Utc>,
     pub replies: Vec<Reply>,
     pub resolved: Option<String>,
@@ -51,6 +52,8 @@ pub struct Thread {
 #[derive(Debug, Clone, Serialize)]
 pub struct Reply {
     pub by: String,
+    /// `"agent"` when an agent process wrote the reply
+    pub via: Option<String>,
     pub body: String,
     pub at: DateTime<Utc>,
 }
@@ -115,6 +118,7 @@ pub fn fold_threads(p: &Proposal, ops: &[CommentOp]) -> (Vec<Thread>, Vec<Thread
                         quote: op.quote.clone(),
                         body: op.body.clone().unwrap_or_default(),
                         author: op.author.clone(),
+                        via: op.via.clone(),
                         at: op.at,
                         replies: Vec::new(),
                         resolved: None,
@@ -130,6 +134,7 @@ pub fn fold_threads(p: &Proposal, ops: &[CommentOp]) -> (Vec<Thread>, Vec<Thread
                             .clone()
                             .or_else(|| op.author.clone())
                             .unwrap_or_default(),
+                        via: op.via.clone(),
                         body: op.body.clone().unwrap_or_default(),
                         at: op.at,
                     });
@@ -250,7 +255,7 @@ fn thread_block(t: &Thread, w: &mut dyn std::io::Write, st: &Style) -> std::io::
     };
     let mut head = Line::new(g, t.target.clone()).id(t.id.clone());
     if let Some(a) = &t.author {
-        head = head.dim(a.clone());
+        head = head.dim(via_label(a, t.via.as_deref()));
     }
     head.write(w, st)?;
     if let Some(q) = &t.quote {
@@ -268,7 +273,7 @@ fn thread_block(t: &Thread, w: &mut dyn std::io::Write, st: &Style) -> std::io::
     }
     writeln!(w, "   {}", t.body)?;
     for r in &t.replies {
-        writeln!(w, "   ↳ {}: {}", r.by, r.body)?;
+        writeln!(w, "   ↳ {}: {}", via_label(&r.by, r.via.as_deref()), r.body)?;
     }
     if let Some(note) = &t.resolved {
         writeln!(
@@ -278,6 +283,14 @@ fn thread_block(t: &Thread, w: &mut dyn std::io::Write, st: &Style) -> std::io::
         )?;
     }
     Ok(())
+}
+
+/// `trevor` / `trevor via agent` — the label, and the kind when an agent wrote it.
+fn via_label(label: &str, via: Option<&str>) -> String {
+    match via {
+        Some(v) => format!("{label} via {v}"),
+        None => label.to_string(),
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -429,6 +442,7 @@ pub fn comment(ctx: &Ctx, a: &CommentArgs) -> Result<CommentReport> {
             note: prep.note.clone(),
             author: seeds.then(|| ctx.actor.label()),
             by: (!seeds).then(|| ctx.actor.label()),
+            via: ctx.actor.via(),
             at: ctx.now,
         };
         let line = serde_json::to_string(&row).map_err(|e| {
@@ -557,7 +571,10 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
 
     let pid = item.proposal.clone();
     let anchor = item.to_string();
-    let title = text.trim().to_string();
+    // `(promote: decision) lockout state lives in Redis` is the prescription; the record's
+    // title is what follows the marker. The marker typed the item, and the record's own
+    // frontmatter now carries that type.
+    let title = crate::cmd::proposal::strip_marker(&text);
     if title.is_empty() {
         return Err(KsError::invalid(
             format!("{item} has no text to promote"),
@@ -573,7 +590,7 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
             // competing write path for the one record type that is deliberately edited as
             // ordinary code and reviewed in the PR.
             return Err(KsError::gate(
-                "promote_spec_ships_in_code",
+                GateCode::PromoteSpecShipsInCode,
                 format!(
                     "a spec rule is written on the branch that implements it, not minted \
                      here — add the bullet with the exact item token {{{item}}} (a bare \
@@ -593,7 +610,7 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
                 from: Some(anchor.clone()),
                 scope: a.scope.clone(),
             };
-            let f = facts(ctx);
+            let f = ctx.facts();
             let done = Store::open(ctx).transact(None, &ctx.invocation(), |sn, m| {
                 let mut plan = crate::cmd::decision::plan_decide(sn, &f, &args, m)?;
                 let id = minted_record(&plan.minted)?;
@@ -640,7 +657,6 @@ pub fn promote(ctx: &Ctx, a: &PromoteArgs) -> Result<PromoteReport> {
             )
         }
     };
-    crate::project::regenerate(ctx)?;
     Ok(PromoteReport {
         item,
         record,

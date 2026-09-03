@@ -107,7 +107,7 @@ fn fixture(repo: &TestRepo) {
 /// S3's, and because a hand-written cache is the harsher test: nothing in the projection
 /// may depend on having produced it.
 const CACHE: &str = r#"{
-  "version": 1,
+  "version": 2,
   "scanned_at": "2026-08-31T11:56:00Z",
   "main": "origin/main",
   "fetch_age_secs": 10,
@@ -611,4 +611,52 @@ fn a_board_with_nothing_owed_says_so_rather_than_printing_nothing() {
         out.contains("never scanned"),
         "no cache yet, and it says so: {out}"
     );
+}
+
+/// t-c0f5: the cache is a plain file anything can write, and `doctor` once panicked
+/// indexing into an empty dead-glob row. Load validates: the bad row is dropped, named,
+/// and every other row still answers.
+#[test]
+fn a_cache_row_that_breaks_an_invariant_is_dropped_on_load_and_named_by_doctor() {
+    let repo = TestRepo::new();
+    fixture(&repo);
+    repo.ks([
+        "quirk",
+        "add",
+        "Stripe webhooks replay",
+        "--paths",
+        "src/billing/**",
+    ])
+    .ok();
+    let quirks: serde_json::Value = repo.json(&["quirks"]);
+    let qid = quirks["rows"][0]["id"]
+        .as_str()
+        .expect("a quirk id")
+        .to_string();
+    let forged = CACHE.trim_end().trim_end_matches('}').to_string()
+        + &format!(",\n  \"quirk_dead_globs\": {{\"{qid}\": []}}\n}}\n");
+    repo.write(".kanspec/cache/gitstate.json", &forged);
+
+    // No panic, and the badges the good rows answer are intact.
+    let d = repo.ks(["doctor", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&d.stdout).unwrap_or_else(|e| {
+        panic!(
+            "doctor must still print JSON ({e}):\n{}\n{}",
+            d.stdout, d.stderr
+        )
+    });
+    let findings = v["findings"].as_array().expect("findings");
+    let dropped: Vec<&serde_json::Value> = findings
+        .iter()
+        .filter(|f| f["check"] == "cache_rows_dropped")
+        .collect();
+    assert_eq!(dropped.len(), 1, "{v}");
+    assert_eq!(dropped[0]["severity"], "warning", "{v}");
+    assert!(
+        dropped[0]["message"].as_str().unwrap().contains(&qid),
+        "{v}"
+    );
+    assert!(!findings.iter().any(|f| f["check"] == "dead_globs"), "{v}");
+    let s = repo.ks(["status"]).ok().stdout;
+    assert!(s.contains("merge state checked"), "{s}");
 }

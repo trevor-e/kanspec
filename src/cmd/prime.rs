@@ -69,9 +69,10 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
     let mut snap = ctx.snapshot()?;
 
     // Every subprocess and every network call happens HERE, before anything is rendered
-    // and before the short cache-write transaction (§2.16).
-    if refresh(ctx, &snap) {
-        snap = ctx.snapshot()?;
+    // and before the short cache-write transaction (§2.16). The transaction hands back the
+    // post-write snapshot, so the store is parsed once before it and never again after.
+    if let Some(fresh) = refresh(ctx, &snap) {
+        snap = fresh;
     }
 
     let scope = if a.paths.is_empty() {
@@ -217,12 +218,12 @@ fn branch_scope(ctx: &Ctx) -> Result<Scope> {
     }
 }
 
-/// The throttled refresh. Returns `true` when the cache actually moved, so the caller
-/// knows to reload.
-fn refresh(ctx: &Ctx, snap: &Snapshot) -> bool {
+/// The throttled refresh. Returns the post-write snapshot when the cache actually moved,
+/// so the caller carries on from it rather than loading the store a second time.
+fn refresh(ctx: &Ctx, snap: &Snapshot) -> Option<Snapshot> {
     let max = Duration::from_secs(ctx.cfg.windows.fetch_max_age_secs.max(1));
     if !snap.git.is_stale(ctx.now, max) {
-        return false;
+        return None;
     }
     // BEST EFFORT, deliberately. `prime` runs from a SessionStart hook: a held lock, a
     // remote that is down or a repo mid-rebase must cost the agent its refresh, never its
@@ -235,13 +236,14 @@ fn refresh(ctx: &Ctx, snap: &Snapshot) -> bool {
             only: None,
         },
     ) else {
-        return false;
+        return None;
     };
     Store::open(ctx)
         .transact(None, &ctx.invocation(), move |_s, _m| {
             Ok(Plan::of(vec![Op::WriteGitState { token, state }]))
         })
-        .is_ok()
+        .ok()
+        .map(|c| c.snapshot)
 }
 
 impl Render for PrimeReport {

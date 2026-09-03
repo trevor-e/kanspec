@@ -9,16 +9,15 @@
 use serde::Serialize;
 
 use crate::cli::{QuirkArgs, QuirkCommand, QuirksArgs, SeverityArg};
-use crate::cmd::ticket::{first_minted, write_next};
 use crate::ctx::Ctx;
-use crate::error::{KsError, Result};
+use crate::error::{GateCode, KsError, Result};
 use crate::fm::{self, Yv};
 use crate::ids::{QuirkId, TicketId};
 use crate::keys::{Key, QuirkKey};
 use crate::model::{QuirkStatus, Severity};
+use crate::out::write_next;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{EntityRef, Op, Plan};
-use crate::project;
 use crate::rulesdoc::{severity_word, Scope};
 use crate::store::Store;
 use crate::{fix, fixes};
@@ -91,11 +90,10 @@ fn add(
         Ok(plan)
     })?;
 
-    let id = first_minted(&done, "quirk", |e| match e {
+    let id = done.first_minted("quirk", |e| match e {
         EntityRef::Quirk(id) => Some(id.clone()),
         _ => None,
     })?;
-    project::regenerate(ctx)?;
     Ok(QuirkReport::Added {
         next: vec![
             format!(
@@ -123,7 +121,7 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
         s.ticket(&by)?;
         if q.fm.status != QuirkStatus::Active {
             return Err(KsError::gate(
-                "quirk_not_active",
+                GateCode::QuirkNotActive,
                 format!("{id} is already `{}`", status_word(q.fm.status)),
                 fixes![fix!("kanspec quirks")],
             ));
@@ -136,7 +134,6 @@ fn fix_quirk(ctx: &Ctx, raw: &str, by: &str) -> Result<QuirkReport> {
             ],
         }]))
     })?;
-    project::regenerate(ctx)?;
 
     Ok(QuirkReport::Fixed {
         // `Committed::snapshot` is the post-write reload; the title did not move.

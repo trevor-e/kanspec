@@ -16,7 +16,6 @@ use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::out::{Color, Render, Style};
 use crate::plan::{Op, Plan};
-use crate::project;
 use crate::rulesdoc::{self, AuditWarning, RulesDoc, Scope};
 use crate::store::Store;
 
@@ -48,12 +47,13 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
     // snapshot reloaded inside the lock. What was adopted is then MEASURED — the bullets
     // that were adoptable before and are not after — rather than recorded by the planner as
     // a side effect, so the summary and the `--json` body describe the same corpus.
-    let before = a
-        .adopt
-        .then(|| ctx.snapshot().map(|s| adoptable_names(&s)))
-        .transpose()?;
+    // One store load before the transaction, and `Committed.snapshot` after it (§2.16):
+    // the report describes the corpus as it is NOW, without parsing the store a third
+    // time to find out.
+    let mut snap = ctx.snapshot()?;
+    let before = a.adopt.then(|| adoptable_names(&snap));
     if a.adopt {
-        Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
+        let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
             // An empty plan is a success that writes nothing (`Store::transact` short-
             // circuits it), which is exactly right for a second `--adopt`.
             Ok(Plan::of(
@@ -67,18 +67,11 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
                     .collect(),
             ))
         })?;
-        // D-20: a spec body was rewritten, so the committed projections are republished
-        // from the state this write produced. No projection renders rule TEXT today — the
-        // feature map's `last_shipped` reads `{p-xxxx}` provenance, which `{pre-kanspec}`
-        // deliberately is not — so this rewrites the same bytes. It is here anyway, because
-        // the invariant is "a handler that writes a projected entity republishes", and
-        // resting on a fact about today's renderers is how the committed page comes to rot.
-        project::regenerate(ctx)?;
+        // A spec body was rewritten; `Store::transact` republishes the projections itself
+        // (t-0769), and the snapshot it hands back is the corpus after the stamps.
+        snap = done.snapshot;
     }
 
-    // Read AFTER any stamps: the report must describe the corpus as it is now, or `--json`
-    // consumers see the standing set as it was a moment ago.
-    let snap = ctx.snapshot()?;
     let adopted = before
         .map(|b| {
             let after = adoptable_names(&snap);

@@ -26,13 +26,13 @@
 use serde::Serialize;
 
 use crate::cli::FeaturesArgs;
-use crate::cmd::ticket::{rel_to, write_next};
 use crate::ctx::Ctx;
 use crate::derive::Staleness;
 use crate::error::{KsError, Result};
 use crate::fm::Yv;
 use crate::ids::SpecName;
 use crate::keys::{Key, SpecKey};
+use crate::out::write_next;
 use crate::out::{glyph, Color, Line, Render, Style, Table};
 use crate::plan::{EntityRef, Op, Plan};
 use crate::project::{self, FeatureRow};
@@ -181,7 +181,7 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
         ("by".into(), Yv::s(ctx.actor.label())),
         ("why".into(), Yv::s(&why)),
     ]);
-    Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
         s.spec(&name)?;
         Ok(Plan::of(vec![Op::SetFields {
             entity: EntityRef::Spec(name.clone()),
@@ -192,11 +192,15 @@ fn confirm(ctx: &Ctx, raw: &str, why: &str) -> Result<FeaturesReport> {
     // frontmatter, and the committed feature map is a function of `feature:`/`code:`/
     // provenance — so it usually does NOT move, and claiming "regenerated" every time
     // would put a line in front of the human that `git status` then contradicts.
-    let written = project::regenerate(ctx)?.then(|| rel_to(ctx, ctx.layout.features_md()));
+    let written = done
+        .regenerated
+        .iter()
+        .any(|p| p == ctx.layout.features_md())
+        .then(|| ctx.rel(ctx.layout.features_md()));
 
-    let snap = ctx.snapshot()?;
+    let snap = &done.snapshot;
     Ok(FeaturesReport {
-        rows: project::feature_rows(&snap)
+        rows: project::feature_rows(snap)
             .into_iter()
             .filter(|r| r.spec == name)
             .collect(),

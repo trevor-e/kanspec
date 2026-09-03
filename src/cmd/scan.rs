@@ -16,7 +16,7 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::cache::{MergeFact, MergeStatus};
+use crate::cache::MergeStatus;
 use crate::cli::ScanArgs;
 use crate::ctx::Ctx;
 use crate::error::Result;
@@ -32,7 +32,6 @@ use crate::transitions::{State, Verb};
 pub struct ScanReport {
     pub scanned: usize,
     pub landed: Vec<ScanRow>,
-    pub not_landed: Vec<ScanRow>,
     pub unknown: Vec<ScanRow>,
     pub fetch_age_secs: Option<u64>,
     pub checked_at: DateTime<Utc>,
@@ -92,7 +91,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
     let mut report = ScanReport {
         scanned: detections.len(),
         landed: Vec::new(),
-        not_landed: Vec::new(),
         unknown: Vec::new(),
         fetch_age_secs: state.fetch_age_secs,
         checked_at: ctx.now,
@@ -108,7 +106,7 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
         let row = ScanRow {
             id: id.clone(),
             title: t.fm.title.clone(),
-            badge: badge(fact),
+            badge: crate::derive::Badge::from_fact(fact, t.fm.head.as_deref()).text(ctx.now),
             method: (fact.method != crate::git::Method::None).then(|| fact.method.to_string()),
             sha: fact.sha.as_ref().map(|s| s[..7.min(s.len())].to_string()),
             pr: fact.pr,
@@ -121,7 +119,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
         };
         match fact.status {
             MergeStatus::Merged => report.landed.push(row),
-            MergeStatus::NotMerged => report.not_landed.push(row),
             MergeStatus::Unknown => report.unknown.push(row),
         }
     }
@@ -155,7 +152,6 @@ pub fn scan(ctx: &Ctx, a: &ScanArgs) -> Result<ScanReport> {
     // was computed from the gitignored cache, so the same commit rendered different bytes
     // on different machines. The D-34 reason above is the one that still holds.)
     // See `project::regenerate`.
-    crate::project::regenerate(ctx)?;
     Ok(report)
 }
 
@@ -171,7 +167,7 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
 
     // Every git call happens BEFORE the lock (§2.16). The SHA the human is attesting to is
     // resolved through git so the log line names a commit that provably exists.
-    let sha = scan::ticket_rev(t).and_then(|(rev, _)| ctx.git.head_sha(&rev).ok());
+    let sha = crate::derive::ticket_rev(t).and_then(|(rev, _)| ctx.git.head_sha(&rev).ok());
     let f = ConfirmFacts {
         sha: sha.map(|h| h.sha().clone()),
         actor: ctx.actor.clone(),
@@ -208,7 +204,6 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
             fix: fix.clone(),
             trace: Vec::new(),
         }],
-        not_landed: Vec::new(),
         unknown: Vec::new(),
         fetch_age_secs: None,
         checked_at: ctx.now,
@@ -216,28 +211,6 @@ fn confirm(ctx: &Ctx, a: &ScanArgs, raw: &str) -> Result<ScanReport> {
         next: fix.into_iter().collect(),
         quiet: a.quiet,
     })
-}
-
-/// `"in main (gh-pr #142 · a1b9c3d)"` · `"unknown (squash suspected, no gh)"`.
-fn badge(f: &MergeFact) -> String {
-    match f.status {
-        MergeStatus::Merged => {
-            let pr = f.pr.map(|n| format!(" #{n}")).unwrap_or_default();
-            let sha = f
-                .sha
-                .as_ref()
-                .map(|s| format!(" · {}", &s[..7.min(s.len())]))
-                .unwrap_or_default();
-            format!("in main ({}{pr}{sha})", f.method)
-        }
-        MergeStatus::NotMerged => "not in main".to_string(),
-        // `Unknown::badge()`, carried through the cache so a card explains itself without
-        // re-running anything.
-        MergeStatus::Unknown => f
-            .why
-            .clone()
-            .unwrap_or_else(|| "unknown (no reason recorded)".to_string()),
-    }
 }
 
 /// The one command that moves this ticket forward — invariant 9, on a per-row basis.
@@ -274,13 +247,14 @@ impl Render for ScanReport {
             return Ok(());
         }
 
-        for (g, rows) in [
-            (glyph::IN_MAIN, &self.landed),
-            ('?', &self.unknown),
-            ('·', &self.not_landed),
-        ] {
+        for (g, rows) in [(glyph::IN_MAIN, &self.landed), ('?', &self.unknown)] {
             for r in rows {
+                // The badge is the one merge-state vocabulary (`Badge::text`); what landed
+                // rides beside it, dim, so a row still names the commit.
                 let mut line = Line::new(g, r.badge.clone()).id(&r.id);
+                if let Some(sha) = &r.sha {
+                    line = line.dim(sha.clone());
+                }
                 if let Some(f) = &r.fix {
                     line = line.fix(f.clone());
                 }
@@ -312,11 +286,10 @@ impl Render for ScanReport {
         };
         writeln!(
             w,
-            " {} scanned · {} in main · {} unknown · {} not in main{age}",
+            " {} scanned · {} in main · {} unknown{age}",
             self.scanned,
             self.landed.len(),
             self.unknown.len(),
-            self.not_landed.len(),
         )
     }
 }
