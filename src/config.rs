@@ -113,6 +113,9 @@ pub struct Windows {
     pub in_main_dwell_secs: u64,
     pub settling_dwell_secs: u64,
     pub discovered_dwell_secs: u64,
+    /// how long an accepted decision stands before `rules --audit` asks whether it is
+    /// still wanted once its source proposal has closed
+    pub decision_review_secs: u64,
     /// spec staleness tripwire
     pub stale_merges: u32,
     pub fetch_max_age_secs: u64,
@@ -126,6 +129,7 @@ impl Default for Windows {
             in_main_dwell_secs: 86_400,
             settling_dwell_secs: 259_200,
             discovered_dwell_secs: 604_800,
+            decision_review_secs: 7_776_000,
             stale_merges: 3,
             fetch_max_age_secs: 300,
         }
@@ -305,6 +309,7 @@ review_dwell_secs     = {review}   # in review this long -> a WATCHING line
 in_main_dwell_secs    = {in_main}    # landed but not closed
 settling_dwell_secs   = {settling}   # proposal's last ticket landed, not closed
 discovered_dwell_secs = {discovered}   # discovered_in ticket sitting untriaged
+decision_review_secs  = {decision_review}  # accepted this long, proposal closed -> audit asks
 stale_merges          = {stale}        # merges touching a spec's globs before it is stale
 fetch_max_age_secs    = {fetch_max}      # older than this and a scan says so on the badge
 
@@ -343,6 +348,7 @@ spec_budget_tokens = {spec_budget}   # spec rules `prime` injects, in tokens; 0 
             in_main = d.windows.in_main_dwell_secs,
             settling = d.windows.settling_dwell_secs,
             discovered = d.windows.discovered_dwell_secs,
+            decision_review = d.windows.decision_review_secs,
             stale = d.windows.stale_merges,
             fetch_max = d.windows.fetch_max_age_secs,
             fetch = d.git.fetch,
@@ -427,6 +433,11 @@ mod tests {
         assert_eq!(c.paths.architecture, d.paths.architecture);
         assert_eq!(c.windows.stall_secs, d.windows.stall_secs);
         assert_eq!(c.windows.fetch_max_age_secs, d.windows.fetch_max_age_secs);
+        assert_eq!(
+            c.windows.decision_review_secs,
+            d.windows.decision_review_secs
+        );
+        assert_eq!(d.windows.decision_review_secs, 90 * 86_400);
         assert_eq!(c.git.fetch, d.git.fetch);
         assert_eq!(c.git.gh, d.git.gh);
         assert_eq!(c.ci.provider, d.ci.provider);

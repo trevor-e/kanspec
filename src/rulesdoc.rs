@@ -594,12 +594,27 @@ pub fn severity_word(s: Severity) -> &'static str {
 /// `rules --audit` / `--adopt`.
 ///
 /// Two decays, both of them "this rule is still steering agents and nobody remembers why":
-/// an accepted decision whose source proposal is closed and which no live ticket
-/// references, and a spec rule with no provenance token at all.
+/// an accepted decision that has stood for `[windows] decision_review_secs`, whose source
+/// proposal is closed and which no live ticket and no shipped rule references; and a spec
+/// rule with no provenance token at all.
 pub fn audit(s: &Snapshot, d: &RulesDoc) -> Vec<AuditWarning> {
     let mut out = Vec::new();
 
     for x in &d.decisions {
+        // The normal path is promote → accept → close, minutes apart. Asking "still
+        // wanted?" the moment the proposal closes fired on every decision the trial made
+        // (t-e560); DESIGN.md's own example is a proposal closed 80 days ago. The age is
+        // the decision's: how long it has been steering agents.
+        let Some(age) = s
+            .decisions
+            .get(&x.id)
+            .and_then(|dd| (s.now.date_naive() - dd.fm.date).to_std().ok())
+        else {
+            continue;
+        };
+        if age.as_secs() < s.cfg.windows.decision_review_secs {
+            continue;
+        }
         // A decision minted by `kanspec decide` with no `--from` legitimately has no
         // source: DESIGN.md's second update trigger is exactly "a real architectural call
         // made outside a proposal". Warning on it would fire on the normal path and teach
@@ -619,12 +634,21 @@ pub fn audit(s: &Snapshot, d: &RulesDoc) -> Vec<AuditWarning> {
             .values()
             .filter(|t| !t.fm.state.terminal() && t.fm.proposal.as_ref() == Some(&pid))
             .count();
-        if refs == 0 {
+        // A rule that shipped under the proposal cites it forever, and a decision that
+        // came out of the same proposal is the reasoning behind that rule: still wanted.
+        let shipped = s
+            .specs
+            .values()
+            .flat_map(|sp| &sp.rules)
+            .filter(|r| r.provenance.contains(&pid))
+            .count();
+        if refs == 0 && shipped == 0 {
             out.push(AuditWarning {
                 subject: x.id.to_string(),
                 message: format!(
-                    "source proposal {pid} is closed; 0 references from open tickets — \
-                     still wanted?"
+                    "source proposal {pid} is closed; accepted {} ago; 0 references from \
+                     open tickets or shipped rules — still wanted?",
+                    crate::derive::short(age)
                 ),
                 fix: format!("kanspec revoke {} --why \"...\"", x.id),
                 adoptable: false,
@@ -1151,12 +1175,46 @@ mod tests {
     fn audit_flags_a_decision_whose_source_proposal_closed_with_nothing_left_referencing_it() {
         let mut s = corpus();
         s.closed_ids.insert("p-7de2".to_string());
-        let d = build(&s, &Scope::none());
-        let w = audit(&s, &d);
+        // The corpus spec's rule carries `{p-7de2}`; it comes back below as the reference
+        // that keeps the decision wanted.
+        let auth = s.specs.remove(&SpecName::parse("auth").unwrap()).unwrap();
+        let flagged = |s: &Snapshot| {
+            let d = build(s, &Scope::none());
+            audit(s, &d)
+                .into_iter()
+                .find(|x| x.subject == "D-8c1a")
+                .map(|x| x.message)
+        };
+        // Accepted yesterday, proposal closed today: the normal promote → accept → close
+        // path, not decay (t-e560). The corpus decision is dated 2026-09-02 against a
+        // 2026-08-31 clock — a future date is age zero, never a warning.
+        assert_eq!(flagged(&s), None, "a fresh decision is not asked about");
+        s.decisions
+            .get_mut(&DecisionId::parse("D-8c1a").unwrap())
+            .unwrap()
+            .fm
+            .date = NaiveDate::from_ymd_opt(2026, 6, 1).unwrap();
+        let msg = flagged(&s).expect("a 91-day-old decision with a closed source is asked about");
         assert!(
-            w.iter()
-                .any(|x| x.subject == "D-8c1a" && x.message.contains("closed")),
-            "{w:?}"
+            msg.contains("p-7de2 is closed") && msg.contains("accepted 91d ago"),
+            "{msg}"
         );
+        // The window is a knob.
+        s.cfg.windows.decision_review_secs = 365 * 86_400;
+        assert_eq!(flagged(&s), None);
+        s.cfg.windows.decision_review_secs = 0;
+        assert!(
+            flagged(&s).is_some(),
+            "0 = ask as soon as the proposal closes"
+        );
+
+        // A rule that shipped under the proposal is a reference: the decision is the
+        // reasoning behind a rule still steering agents.
+        assert_eq!(
+            auth.rules[0].provenance,
+            [ProposalId::parse("p-7de2").unwrap()]
+        );
+        s.specs.insert(auth.name.clone(), auth);
+        assert_eq!(flagged(&s), None, "a shipped rule cites the proposal");
     }
 }

@@ -54,6 +54,7 @@ review_dwell_secs     = 604800   # in review this long -> a WATCHING line
 in_main_dwell_secs    = 86400    # landed but not closed
 settling_dwell_secs   = 259200   # proposal's last ticket landed, not closed
 discovered_dwell_secs = 604800   # a discovered_in ticket sitting untriaged
+decision_review_secs  = 7776000  # accepted this long with its proposal closed -> `rules --audit` asks
 stale_merges          = 3        # merges touching a spec's globs before it is stale
 fetch_max_age_secs    = 300      # older than this and a scan says so on the badge
 ```

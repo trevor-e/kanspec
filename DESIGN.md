@@ -533,7 +533,7 @@ STANDING RULES steering agents now (= byte-identical to the rules section of `ka
 Nothing outside this list is served to agents. Closed proposals bind nothing.
 
 $ kanspec rules --audit
- ⚠ D-2c77: source proposal closed 80 days ago; 0 references from open tickets — still wanted?
+ ⚠ D-2c77: source proposal p-19f0 is closed; accepted 81d ago; 0 references from open tickets or shipped rules — still wanted?
  ⚠ spec auth [auth.oauth]: no provenance token (pre-kanspec) — adopt with `kanspec rules --adopt` or delete
 ```
 
