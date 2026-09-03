@@ -1,7 +1,7 @@
 ---
 id: t-f3a4
 title: Review page reachable away from the Mac
-state: doing
+state: done
 spec: null
 proposal: null
 item: null
@@ -11,8 +11,8 @@ discovered_in: null
 branch: ks/t-f3a4-review-page-reachable-away-from-the-mac
 worktree: null
 claimed_by: noreply
-pr: null
-head: null
+pr: 1
+head: 693389a9c5804c7801fbb79780112f2ec1c80728
 spec_unchanged: null
 created: 2026-09-02T03:50:18Z
 ---
@@ -25,3 +25,5 @@ Found in the adulting trial: the page is loopback-only, Trevor was on his phone,
 ## Log
 - 2026-09-02T03:50Z  todo     trevor                new
 - 2026-09-03T04:01Z  doing    noreply               start (branch created)
+- 2026-09-03T04:46Z  review   claude/3871e3aa-3ccf  ship (head 693389a · PR #1)
+- 2026-09-03T04:46Z  done     claude/3871e3aa-3ccf  done (in main 693389a via ancestry #1)
