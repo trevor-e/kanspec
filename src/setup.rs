@@ -154,15 +154,18 @@ pub fn run(ctx: &Ctx, agent: Agent, remove: bool) -> Result<Vec<SetupChange>> {
         }
     }
 
-    crate::cmd::init::apply(&edits)?;
     // The git hooks are part of "setup installs everything": merge badges and the
     // squash-surviving trailer are what make the agent contract's "never state whether
-    // something is merged" answerable at all.
-    let hooks = if remove {
-        crate::hooks::remove(ctx)?
+    // something is merged" answerable at all. Plan and apply them before agent context:
+    // a broken/sandboxed hooks path must not leave a CLAUDE.md or settings block claiming
+    // setup succeeded when the command returned an error.
+    let (mut hook_edits, hooks) = if remove {
+        crate::hooks::plan_remove(ctx)?
     } else {
-        crate::hooks::install(ctx, false)?
+        crate::hooks::plan_install(ctx, false)?
     };
+    hook_edits.extend(edits);
+    crate::cmd::init::apply(&hook_edits)?;
     changes.extend(hooks.into_iter().map(|h| SetupChange {
         path: h.path,
         what: "git hook",

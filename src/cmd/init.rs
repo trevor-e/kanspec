@@ -72,12 +72,13 @@ pub fn init(ctx: &Ctx, a: &InitArgs) -> Result<InitReport> {
 
     let scaffold = plan_scaffold(ctx, a);
     let config_created = scaffold.created.iter().any(|p| p.ends_with("config.toml"));
-    apply(&scaffold.edits)?;
 
-    // Hooks are a separately idempotent step `init` always runs, so a repo initialised
-    // before a hook existed catches up with `init --refresh-hooks` and never needs
-    // re-scaffolding.
-    let mut hooks = crate::hooks::install(ctx, a.refresh_hooks)?;
+    // Resolve and install hooks first. The hooks directory is the path most likely to be
+    // unwritable (sandboxed .git, a broken core.hooksPath); failing there must not leave a
+    // .kanspec scaffold behind while `init` reports an error.
+    let (mut edits, mut hooks) = crate::hooks::plan_install(ctx, a.refresh_hooks)?;
+    edits.extend(scaffold.edits.iter().cloned());
+    apply(&edits)?;
 
     let root = ctx.repo.primary_root().to_path_buf();
     for h in &mut hooks {

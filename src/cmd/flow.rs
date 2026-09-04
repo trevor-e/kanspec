@@ -219,7 +219,7 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     // the second half, and is what §2.16 asks of every other subprocess in this handler.
     let movable = wt_abs.is_none() && primary_is_movable(ctx);
 
-    let made = create_branch(ctx, &branch, &base, existed, wt_abs.as_deref())?;
+    let made = create_branch(ctx, &id, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {
         base: ctx.facts(),
@@ -510,6 +510,7 @@ struct Made {
 
 fn create_branch(
     ctx: &Ctx,
+    id: &TicketId,
     branch: &str,
     base: &str,
     existed: bool,
@@ -548,12 +549,19 @@ fn create_branch(
         (None, false) => {
             let out = ctx.git.run(&["branch", "--no-track", branch, base])?;
             if out.code != 0 {
+                // A failed `git branch` normally creates nothing (permissions, a ref-name
+                // collision, invalid storage). Suggesting `branch -D` in that case sends
+                // the user to delete a ref that never existed and hides the useful retry.
+                // Keep the cleanup only for the narrow race where the ref appeared after
+                // `existed` was measured but before this command returned.
+                let next = if branch_exists(ctx, branch) {
+                    fixes![fix!("git branch -D {branch}"), fix!("kanspec start {id}"),]
+                } else {
+                    fixes![fix!("kanspec start {id}")]
+                };
                 return Err(KsError::conflict(
                     format!("cannot create branch `{branch}`: {}", out.err.trim()),
-                    fixes![
-                        fix!("git branch -D {branch}"),
-                        fix!("kanspec where --branch {branch}"),
-                    ],
+                    next,
                 ));
             }
             made.branch = Some(branch.to_string());

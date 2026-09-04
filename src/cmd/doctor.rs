@@ -8,6 +8,7 @@ use crate::cli::DoctorArgs;
 use crate::ctx::Ctx;
 use crate::doctor::{self, Finding, Severity};
 use crate::error::{code, Result};
+use crate::model::Snapshot;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::store::Store;
 
@@ -33,7 +34,7 @@ impl DoctorReport {
 
 pub fn doctor(ctx: &Ctx, a: &DoctorArgs) -> Result<DoctorReport> {
     ctx.require_initialized()?;
-    let mut findings = doctor::run_all(&ctx.snapshot()?);
+    let mut findings = doctor::run_all(&with_live_globs(ctx, ctx.snapshot()?));
     let mut fixed: Vec<String> = Vec::new();
 
     if a.fix && findings.iter().any(|f| f.fixable) {
@@ -54,7 +55,7 @@ pub fn doctor(ctx: &Ctx, a: &DoctorArgs) -> Result<DoctorReport> {
             .collect();
         // Re-prove against what is now on disk, so the report is about the repaired repo
         // rather than the broken one.
-        findings = doctor::run_all(&committed.snapshot);
+        findings = doctor::run_all(&with_live_globs(ctx, committed.snapshot));
     }
 
     let mut next: Vec<String> = Vec::new();
@@ -76,6 +77,13 @@ pub fn doctor(ctx: &Ctx, a: &DoctorArgs) -> Result<DoctorReport> {
         checks_run: doctor::CHECKS.len(),
         next,
     })
+}
+
+fn with_live_globs(ctx: &Ctx, mut snap: Snapshot) -> Snapshot {
+    let mut git = snap.git.clone();
+    crate::scan::refresh_glob_liveness(ctx, &snap, &mut git);
+    snap.git = git;
+    snap
 }
 
 impl Render for DoctorReport {

@@ -112,7 +112,7 @@ fn version_exits_zero() {
     for name in ["kanspec", "ks"] {
         let (code, stdout, _) = run(name, &["--version"]);
         assert_eq!(code, 0);
-        assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+        assert!(stdout.contains(env!("KANSPEC_BUILD_VERSION")));
     }
 }
 

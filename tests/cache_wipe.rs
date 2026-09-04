@@ -633,6 +633,12 @@ fn a_cache_row_that_breaks_an_invariant_is_dropped_on_load_and_named_by_doctor()
         .as_str()
         .expect("a quirk id")
         .to_string();
+    // `doctor` probes glob liveness from tracked files rather than trusting the cache.
+    // Keep the fixture's payments spec genuinely live so this test isolates the malformed
+    // cache row it is about.
+    repo.write("src/payments/charge.ts", "export const charge = 1;\n");
+    repo.git(&["add", "-A"]);
+    repo.commit("track the payments implementation");
     let forged = CACHE.trim_end().trim_end_matches('}').to_string()
         + &format!(",\n  \"quirk_dead_globs\": {{\"{qid}\": []}}\n}}\n");
     repo.write(".kanspec/cache/gitstate.json", &forged);

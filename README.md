@@ -63,9 +63,11 @@ by default), `[paths]` to rename the generated projections, `[git] gh` (whether 
 
 ## Status
 
-v0.1. The daily loop, merge detection, the knowledge layer, the board and server are done and
-tested (536 tests). Proposals, the per-item comment round-trip, review pages and the `landcheck` Stop
-hook are v0.2 — those commands exist but refuse with a typed error.
+The package still carries the `0.1.0` version while the next slices land. The daily loop, merge
+detection, knowledge layer, board and server, proposals, review pages, comment round-trip, and
+`landcheck` are implemented and tested. The planned import/backtest workflow and CI-provider reader
+are not implemented yet. Path installs include the source revision in `kanspec --version`, because
+the package version alone cannot distinguish an older local build from the current checkout.
 
 Sharp edges worth knowing:
 
@@ -73,12 +75,16 @@ Sharp edges worth knowing:
   dirty on your ticket branch, so a reflexive `git add -A` commits `.kanspec/` where main never sees
   it. kanspec detects and recovers that, but escaping with `git stash` or `checkout -f` leaves it
   blind.
-- **Put `doctor` in CI, not `status`** — only `doctor` exits non-zero.
+- **Put `doctor` in CI, not `status`** — only `doctor` exits non-zero. Glob liveness is checked
+  against tracked files on every doctor run, so a brand-new uncommitted file does not make its glob
+  live yet.
 - `doctor` **detects** forged state, it does not prevent it. The log is a plain text file. A careless
   forgery is caught by replay and by corroboration against git; a careful one — a copied close note
   on a ticket git has never definitively answered "no" about — is not. Merge state is unaffected
   either way, because it is never read out of a file.
 - The `gh` rung has not yet run against a real GitHub remote.
+- There is no tagged release yet. Pinning a Git revision is currently the reproducible way to put
+  the same binary in CI; an unpinned path install follows whatever checkout happens to be present.
 
 ## Docs
 

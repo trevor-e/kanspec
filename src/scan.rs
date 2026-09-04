@@ -783,27 +783,7 @@ pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<S
             .insert(name.clone(), spec_anchor(ctx, &main, spec));
     }
 
-    // Glob rot for the other two path-scoped records, recorded the same way — only the
-    // rotted globs, only for records that are standing. A revoked decision's scope and a
-    // fixed quirk's paths steer nobody, so their rot is nobody's finding.
-    for d in snap.decisions.values() {
-        if d.fm.status != DecisionStatus::Accepted {
-            continue;
-        }
-        let dead = dead_globs(&ctx.git, &d.scope);
-        if !dead.is_empty() {
-            state.decision_dead_globs.insert(d.fm.id.clone(), dead);
-        }
-    }
-    for q in snap.quirks.values() {
-        if q.fm.status != QuirkStatus::Active {
-            continue;
-        }
-        let dead = dead_globs(&ctx.git, &q.fm.paths);
-        if !dead.is_empty() {
-            state.quirk_dead_globs.insert(q.fm.id.clone(), dead);
-        }
-    }
+    refresh_glob_liveness(ctx, snap, &mut state);
 
     Ok((state, ScanToken(()), detections))
 }
@@ -816,6 +796,52 @@ fn dead_globs(git: &Git, globs: &[String]) -> Vec<String> {
         .filter(|g| !glob_matches_anything(git, g))
         .cloned()
         .collect()
+}
+
+/// Refresh the disposable glob-rot projection directly from tracked files.
+///
+/// A full scan calls this while rebuilding the cache, and `doctor` calls it at read time.
+/// The latter matters in CI: a fresh checkout has no cache and must still diagnose a dead
+/// scope without first running an unrelated merge-detection scan.
+pub fn refresh_glob_liveness(ctx: &Ctx, snap: &Snapshot, state: &mut GitState) {
+    state.specs.retain(|name, _| snap.specs.contains_key(name));
+    for (name, spec) in &snap.specs {
+        if let Some(anchor) = state.specs.get_mut(name) {
+            anchor.dead_globs = dead_globs(&ctx.git, &spec.fm.code);
+        } else {
+            state.specs.insert(
+                name.clone(),
+                SpecAnchor {
+                    last_edit_sha: None,
+                    last_edit_at: None,
+                    merges_since: 0,
+                    dead_globs: dead_globs(&ctx.git, &spec.fm.code),
+                },
+            );
+        }
+    }
+
+    state.decision_dead_globs.clear();
+    for d in snap.decisions.values() {
+        if d.fm.status != DecisionStatus::Accepted {
+            continue;
+        }
+        let dead = dead_globs(&ctx.git, &d.scope);
+        if !dead.is_empty() {
+            state.decision_dead_globs.insert(d.fm.id.clone(), dead);
+        }
+    }
+
+    state.quirk_dead_globs.clear();
+    for q in snap.quirks.values() {
+        if q.fm.status != QuirkStatus::Active {
+            continue;
+        }
+        let dead = dead_globs(&ctx.git, &q.fm.paths);
+        if !dead.is_empty() {
+            state.quirk_dead_globs.insert(q.fm.id.clone(), dead);
+        }
+    }
 }
 
 /// How many trailer-matched commits the fallback below will diff. A branch bigger than this
@@ -912,7 +938,8 @@ fn spec_anchor(ctx: &Ctx, main: &str, spec: &Spec) -> SpecAnchor {
         last_edit_sha: touch.as_ref().map(|(s, _)| s.as_str().to_string()),
         last_edit_at: touch.as_ref().map(|(_, at)| *at),
         merges_since,
-        dead_globs: dead_globs(&ctx.git, &spec.fm.code),
+        // Filled for every path-scoped record in one pass by `refresh_glob_liveness`.
+        dead_globs: Vec::new(),
     }
 }
 

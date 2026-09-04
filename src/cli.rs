@@ -21,7 +21,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "kanspec",
-    version,
+    version = env!("KANSPEC_BUILD_VERSION"),
     about = "kanban + spec review over plain git-tracked files",
     long_about = "kanspec turns a .kanspec/ directory of plain markdown files — tickets, \
                   proposals, living specs, decisions, quirks — into a live kanban board and \

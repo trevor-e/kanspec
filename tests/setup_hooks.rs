@@ -106,6 +106,39 @@ fn init_scaffolds_a_working_store_from_nothing() {
 }
 
 #[test]
+fn init_does_not_scaffold_when_the_hooks_path_is_broken() {
+    let repo = TestRepo::new();
+    without_store(&repo);
+    repo.write(".blocked-hooks", "this is a file, not a hooks directory\n");
+    repo.git(&["config", "core.hooksPath", ".blocked-hooks"]);
+
+    let r = repo.ks(["init"]);
+    assert_ne!(r.code, 0, "a broken hooks path must fail init");
+    assert!(
+        !repo.exists(".kanspec/config.toml"),
+        "init reported failure after leaving a partial scaffold"
+    );
+}
+
+#[test]
+fn setup_does_not_write_agent_files_when_the_hooks_path_is_broken() {
+    let repo = TestRepo::new();
+    repo.write(".blocked-hooks", "this is a file, not a hooks directory\n");
+    repo.git(&["config", "core.hooksPath", ".blocked-hooks"]);
+
+    let r = repo.ks(["setup", "claude"]);
+    assert_ne!(r.code, 0, "a broken hooks path must fail setup");
+    assert!(
+        !repo.exists("CLAUDE.md"),
+        "setup reported failure after writing agent context"
+    );
+    assert!(
+        !repo.exists(".claude/settings.json"),
+        "setup reported failure after writing agent settings"
+    );
+}
+
+#[test]
 fn init_from_a_linked_worktree_scaffolds_the_primary_one() {
     let repo = TestRepo::new();
     without_store(&repo);

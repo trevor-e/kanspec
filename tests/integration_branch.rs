@@ -129,6 +129,31 @@ fn start_refuses_to_cut_from_a_main_that_has_never_carried_the_store() {
 }
 
 #[test]
+fn branch_creation_failure_does_not_suggest_deleting_a_nonexistent_branch() {
+    let repo = TestRepo::new();
+    let id = new_ticket(&repo, "Rate-limit login endpoint");
+
+    // Default ticket branches live below `refs/heads/ks/`. A file at the parent ref makes
+    // Git reject the child branch deterministically while leaving that child nonexistent.
+    let main = repo.git(&["rev-parse", "main"]);
+    std::fs::write(repo.root.join(".git/refs/heads/ks"), main).unwrap();
+    let err = refusal(&repo, &["start", &id]);
+    assert_eq!(err["kind"], "conflict", "{err}");
+    let f = fixes(&err);
+    assert_eq!(f, [format!("kanspec start {id}")], "{err}");
+    assert!(
+        !f.iter().any(|line| line.contains("branch -D")),
+        "Git created no branch, so deleting one is misleading: {err}"
+    );
+    assert!(
+        repo.git(&["branch", "--list", &format!("ks/{id}-*")])
+            .trim()
+            .is_empty(),
+        "the failed start must not leave a ticket branch"
+    );
+}
+
+#[test]
 fn start_refuses_when_main_is_merely_unpushed_and_says_push() {
     let repo = TestRepo::new();
     push_storeless_branch(&repo, "trial");

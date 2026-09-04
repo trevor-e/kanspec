@@ -1,9 +1,9 @@
 //! `tests/glob_rot.rs`
 //!
-//! Glob rot on the REAL binary, for all three path-scoped records. `scan` records which
-//! globs match no tracked file; `doctor` grades the damage: a record that lost SOME globs
-//! is a Warning, one that lost them ALL is an Error, because at that point it steers
-//! nothing and CI is the only thing left that will notice.
+//! Glob rot on the REAL binary, for all three path-scoped records. `doctor` checks globs
+//! against tracked files directly, even when a fresh CI checkout has no disposable scan
+//! cache. A record that lost SOME globs is a Warning, one that lost them ALL is an Error,
+//! because at that point it steers nothing and CI is the only thing left that will notice.
 
 mod common;
 
@@ -43,8 +43,6 @@ fn a_record_whose_every_glob_rotted_fails_doctor_and_a_partial_one_warns() {
     ]);
     let id = d["id"].as_str().unwrap().to_string();
     repo.ks(["accept", &id]).ok();
-    repo.ks(["scan"]).ok();
-
     let r = repo.ks(["doctor"]);
     let out = format!("{}{}", r.stdout, r.stderr);
     assert_ne!(r.code, 0, "two records steer nothing; CI must fail:\n{out}");
@@ -64,11 +62,11 @@ fn a_record_whose_every_glob_rotted_fails_doctor_and_a_partial_one_warns() {
         "one live glob remains, so this is not the Error grade:\n{out}"
     );
 
-    // The one-definition property: fix the file and the finding leaves on the next scan.
+    // The one-definition property: fix the tracked file and the next doctor sees it live,
+    // without relying on a preceding scan or cache write.
     repo.write("src/vanished/retry.ts", "export const retry = 1;\n");
     repo.git(&["add", "-A"]);
     repo.commit("the quirk's path exists again");
-    repo.ks(["scan"]).ok();
     let out = {
         let r = repo.ks(["doctor"]);
         format!("{}{}", r.stdout, r.stderr)
