@@ -712,11 +712,13 @@ fn a_refusal_names_the_binary_the_user_actually_typed() {
         "a ticket without frontmatter must refuse:\n{stderr}"
     );
     assert!(
-        stderr.contains(".kanspec/tickets/t-9999.md"),
+        stderr
+            .replace('\\', "/")
+            .contains(".kanspec/tickets/t-9999.md"),
         "the `.kanspec/` PATH was corrupted by the rename:\n{stderr}"
     );
     assert!(
-        !stderr.contains(".ks/tickets"),
+        !stderr.replace('\\', "/").contains(".ks/tickets"),
         "a naive replace rewrote a path into one that does not exist:\n{stderr}"
     );
     let fixes = fix_lines(&stderr);
@@ -727,7 +729,7 @@ fn a_refusal_names_the_binary_the_user_actually_typed() {
     assert!(
         fixes
             .iter()
-            .any(|f| f.contains(".kanspec/tickets/t-9999.md")),
+            .any(|f| f.replace('\\', "/").contains(".kanspec/tickets/t-9999.md")),
         "the PATH half of the same refusal was rewritten: {fixes:?}"
     );
 }

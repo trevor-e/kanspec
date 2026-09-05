@@ -119,7 +119,7 @@ fn twenty_concurrent_processes_serialise_on_one_lock() {
 }
 
 #[test]
-fn kill_dash_nine_mid_transaction_releases_the_lock() {
+fn forced_process_termination_mid_transaction_releases_the_lock() {
     let repo = TestRepo::new();
     let ctx = ctx_at(&repo.root);
     let layout = &ctx.layout;
@@ -148,12 +148,10 @@ fn kill_dash_nine_mid_transaction_releases_the_lock() {
     );
     assert!(e.fixes().iter().next().is_some(), "invariant 9");
 
-    // SIGKILL: no destructor runs, no note is truncated, no cleanup happens at all.
-    let killed = Command::new("kill")
-        .args(["-9", &holder.id().to_string()])
-        .status()
-        .expect("kill runs");
-    assert!(killed.success());
+    // SIGKILL on Unix, TerminateProcess on Windows: no destructor or cleanup runs.
+    holder
+        .kill()
+        .expect("the holder can be forcibly terminated");
     let _ = holder.wait();
 
     // The kernel dropped the flock when the process died. There is no reaper here, and

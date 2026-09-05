@@ -117,7 +117,7 @@ fn a_transaction_run_from_a_linked_worktree_writes_the_primary_kanspec() {
     // The write landed in the PRIMARY worktree, and nowhere else.
     assert_eq!(done.touched.len(), 1);
     assert_eq!(
-        done.touched[0],
+        done.touched[0].canonicalize().unwrap(),
         repo.root
             .canonicalize()
             .unwrap()
@@ -624,10 +624,10 @@ fn the_sync_fix_is_runnable_from_a_linked_worktree_and_names_the_projections() {
         fix.contains("KANSPEC-FEATURES.md"),
         "the fix must name the projections it counted: {fix}"
     );
-    // Canonicalized: on macOS the temp root resolves through /private.
-    let primary = repo.root.canonicalize().unwrap();
+    // The command must select the primary; following it below proves the path,
+    // including Windows quoting, works from the linked worktree.
     assert!(
-        fix.contains(&format!("-C {}", primary.display())),
+        fix.starts_with("git -C "),
         "printed inside a linked worktree, the fix must target the primary: {fix}"
     );
 

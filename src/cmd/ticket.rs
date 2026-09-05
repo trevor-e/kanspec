@@ -722,7 +722,7 @@ pub fn here_branch(ctx: &Ctx) -> Option<String> {
 /// git records a worktree's path as it was given; `Repo::here` is canonicalized. On macOS
 /// that is the difference between `/var/folders/…` and `/private/var/folders/…`.
 fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+    crate::paths::canon(p)
 }
 
 /// branch -> ticket, by the three signals that exist, strongest first.

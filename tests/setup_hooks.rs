@@ -347,15 +347,15 @@ fn the_displaced_hook_runs_first_and_its_exit_code_wins() {
         // Builtins only, so this proves the dispatcher and nothing about the environment.
         &format!(
             "#!/bin/sh\n: > {}\nexit 0\n",
-            shell_quote(&marker.to_string_lossy())
+            shell_quote(&marker.to_string_lossy().replace('\\', "/"))
         ),
     );
     repo.ks(["init"]).ok();
 
     // Run the installed entrypoint the way git would, with kanspec deliberately absent so
     // only the dispatch is under test.
-    let out = std::process::Command::new("/bin/sh")
-        .arg(&hook)
+    let out = std::process::Command::new("sh")
+        .arg(hook.to_string_lossy().replace('\\', "/"))
         .current_dir(&repo.root)
         .env("KANSPEC_BIN", "/nonexistent/kanspec")
         .output()
@@ -369,8 +369,8 @@ fn the_displaced_hook_runs_first_and_its_exit_code_wins() {
         &repo.root.join(".git/hooks/post-merge.d/10-post-merge"),
         "#!/bin/sh\nexit 3\n",
     );
-    let out = std::process::Command::new("/bin/sh")
-        .arg(&hook)
+    let out = std::process::Command::new("sh")
+        .arg(hook.to_string_lossy().replace('\\', "/"))
         .current_dir(&repo.root)
         .env("KANSPEC_BIN", "/nonexistent/kanspec")
         .output()
@@ -384,8 +384,17 @@ fn the_scan_hooks_are_silent_when_kanspec_is_not_on_the_path() {
     without_store(&repo);
     repo.ks(["init"]).ok();
 
+    // Resolve the shell before deliberately clearing the child's PATH. Unix
+    // searches the replacement PATH, whereas Windows uses the parent's PATH.
+    let executable = if cfg!(windows) { "sh.exe" } else { "sh" };
+    let shell = std::env::split_paths(&std::env::var_os("PATH").expect("PATH is set"))
+        .map(|dir| dir.join(executable))
+        .find(|path| path.is_file())
+        .expect("a shell is available for Git hooks")
+        .canonicalize()
+        .unwrap();
     for hook in ["post-merge", "post-checkout"] {
-        let out = std::process::Command::new("/bin/sh")
+        let out = std::process::Command::new(&shell)
             .arg(hook_path(&repo, hook))
             .args(["a", "b", "1"])
             .current_dir(&repo.root)

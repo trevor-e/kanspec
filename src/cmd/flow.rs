@@ -486,7 +486,12 @@ fn branch_name(ctx: &Ctx, id: &TicketId, title: &str) -> String {
 /// `<worktree_dir>/<id>`, kept RELATIVE to the primary root exactly as DESIGN.md's
 /// frontmatter shows it — an absolute temp path in a committed file is not portable.
 fn worktree_rel(ctx: &Ctx, id: &TicketId) -> PathBuf {
-    ctx.cfg.worktree_dir.join(id.as_str())
+    let path = ctx.cfg.worktree_dir.join(id.as_str());
+    // These paths are committed in tickets and pasted into shell commands.
+    // Forward slashes work on both platforms and keep the tracker portable.
+    #[cfg(windows)]
+    let path = PathBuf::from(path.to_string_lossy().replace('\\', "/"));
+    path
 }
 
 fn branch_exists(ctx: &Ctx, branch: &str) -> bool {

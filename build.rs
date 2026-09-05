@@ -35,5 +35,26 @@ fn repository_revision(manifest: &str) -> Option<String> {
     if Path::new(&top).canonicalize().ok()? != Path::new(manifest).canonicalize().ok()? {
         return None;
     }
+    // A path install may reuse Cargo's build cache even after a new commit.
+    // Track HEAD and its ref so --version follows updates without cargo clean.
+    let watch = |name: &str| {
+        if let Some(path) = output(&["rev-parse", "--path-format=absolute", "--git-path", name]) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    };
+    watch("HEAD");
+    if let Some(reference) = output(&["symbolic-ref", "-q", "HEAD"]) {
+        let loose = output(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            &reference,
+        ])?;
+        watch(if Path::new(&loose).exists() {
+            &reference
+        } else {
+            "packed-refs"
+        });
+    }
     output(&["rev-parse", "--short=12", "HEAD"]).filter(|s| !s.is_empty())
 }

@@ -174,8 +174,37 @@ fn first_worktree(dir: &Path) -> Result<PathBuf> {
 
 /// `canonicalize` when the path exists (macOS `/tmp` -> `/private/tmp` matters for the
 /// `git_dir == common_dir` comparison), otherwise the path unchanged.
-fn canon(p: &Path) -> PathBuf {
-    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+pub(crate) fn canon(p: &Path) -> PathBuf {
+    let p = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    #[cfg(windows)]
+    let p = command_path(p);
+    p
+}
+
+/// Git for Windows rejects verbatim paths when creating worktrees. Canonicalize
+/// first, then spell ordinary drive/UNC paths in the form external commands use.
+/// Device namespaces retain their original spelling.
+#[cfg(windows)]
+fn command_path(p: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut parts = p.components();
+    let prefix = match parts.next() {
+        Some(Component::Prefix(prefix)) => prefix.kind(),
+        _ => return p,
+    };
+    let mut out = match prefix {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut prefix = std::ffi::OsString::from(r"\\");
+            prefix.push(server);
+            prefix.push(r"\");
+            prefix.push(share);
+            PathBuf::from(prefix)
+        }
+        _ => return p,
+    };
+    out.extend(parts);
+    out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -346,6 +375,19 @@ mod tests {
 
     fn layout_at(root: &Path) -> Layout {
         layout_with(root, &Config::default())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn git_command_paths_preserve_drive_and_unc_roots() {
+        for (input, expected) in [
+            (r"\\?\C:\work space\repo", r"C:\work space\repo"),
+            (r"\\?\UNC\server\share\repo", r"\\server\share\repo"),
+            (r"C:\repo", r"C:\repo"),
+            (r"\\.\pipe\name", r"\\.\pipe\name"),
+        ] {
+            assert_eq!(command_path(PathBuf::from(input)), Path::new(expected));
+        }
     }
 
     fn layout_with(root: &Path, cfg: &Config) -> Layout {

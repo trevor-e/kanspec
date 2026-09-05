@@ -87,6 +87,7 @@ fn build_template(dir: &Path) {
         ("user.name", "kanspec test"),
         ("commit.gpgsign", "false"),
         ("tag.gpgsign", "false"),
+        ("core.autocrlf", "false"),
         ("core.hooksPath", ""),
     ] {
         if v.is_empty() {
@@ -409,7 +410,13 @@ fn copy_dir(from: &Path, to: &Path) {
             // git never puts a symlink in `.git`, but a fixture might grow one.
             let target = std::fs::read_link(&src).unwrap();
             #[cfg(unix)]
-            let _ = std::os::unix::fs::symlink(target, &dst);
+            std::os::unix::fs::symlink(target, &dst).unwrap();
+            #[cfg(windows)]
+            if src.is_dir() {
+                std::os::windows::fs::symlink_dir(target, &dst).unwrap();
+            } else {
+                std::os::windows::fs::symlink_file(target, &dst).unwrap();
+            }
         } else {
             std::fs::copy(&src, &dst).unwrap();
         }

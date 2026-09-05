@@ -1135,7 +1135,8 @@ fn the_git_add_dash_a_wedge_is_visible_and_the_printed_recovery_undoes_it() {
     );
     assert!(
         repo.git(&["status", "--porcelain"]).trim().is_empty(),
-        "and it leaves no rubble behind"
+        "and it leaves no rubble behind: {}",
+        repo.git(&["status", "--porcelain"])
     );
     // The whole point of getting to main: main's board can now see the ship record.
     let on_main = repo.read(&ticket);
