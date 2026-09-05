@@ -1,1 +1,3 @@
 .kanspec/proposals/**/comments.jsonl merge=union
+# These byte-preservation fixtures intentionally mix LF, CRLF, BOMs and no EOF newline.
+tests/fixtures/frontmatter/** -text

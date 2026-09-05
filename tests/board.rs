@@ -219,7 +219,12 @@ fn fixture_paths(repo: &TestRepo) -> Vec<String> {
     ] {
         let s = p.to_string_lossy().to_string();
         if !out.contains(&s) {
-            out.push(s);
+            out.push(s.clone());
+        }
+        for spelling in [s.replace('\\', "/"), s.replace('\\', "\\\\")] {
+            if !out.contains(&spelling) {
+                out.push(spelling);
+            }
         }
     }
     // Longest first, so `/private/var/…` is rewritten before `/var/…` can nibble at it.
@@ -564,6 +569,7 @@ impl Server {
     }
 
     /// SIGINT, then the wall-clock time to exit.
+    #[cfg(unix)]
     fn interrupt(&mut self) -> Duration {
         let started = Instant::now();
         let signalled = Command::new("kill")
@@ -788,6 +794,7 @@ fn a_cli_verb_in_another_terminal_pushes_a_tick_to_an_open_sse_stream() {
 /// Ctrl-C is instant **with an SSE client attached** — which is the case that breaks a
 /// naive `with_graceful_shutdown`, because an SSE response never completes on its own.
 #[test]
+#[cfg(unix)]
 fn ctrl_c_exits_in_under_a_second_even_with_an_sse_client_connected() {
     let repo = plain_repo();
     let mut server = Server::start(&repo);

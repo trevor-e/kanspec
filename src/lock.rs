@@ -1,4 +1,5 @@
-//! `flock(2)` via libc. The kernel releases the lock when the process dies, so there is
+//! Native file locks: `flock(2)` on Unix, `LockFileEx` on Windows. The kernel
+//! releases the lock when the process dies, so there is
 //! **no stale-lock reaper** to get subtly wrong (pid reuse, clock skew) and `kill -9`
 //! mid-transaction cannot wedge the repo (J-5).
 //!
@@ -9,6 +10,7 @@
 //! Owner: **S1**. This file and `cmd/init.rs` are the only entries on
 //! `tests/single_write_path.rs`'s allowlist — it creates the very lockfile it then locks.
 
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -31,7 +33,7 @@ pub struct LockToken {
 }
 
 /// Written AFTER acquiring, so a reader may legitimately see it empty -> render "held by
-/// an unknown process", never a wrong pid. flock alone gives a blocked syscall and nothing
+/// an unknown process", never a wrong pid. A lock alone gives a blocked syscall and nothing
 /// to print, but invariant 9 demands a fix line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LockOwner {
@@ -80,7 +82,7 @@ fn hostname() -> String {
 }
 
 impl LockToken {
-    /// `LOCK_EX|LOCK_NB`, 25ms poll to `timeout` (`cfg.lock_timeout_secs`, default 5s).
+    /// Nonblocking exclusive lock, 25ms poll to `timeout` (default 5s).
     pub fn acquire(layout: &Layout, owner: LockOwner, timeout: Duration) -> Result<LockToken> {
         let path = layout.lock();
         if let Some(dir) = path.parent() {
@@ -100,20 +102,12 @@ impl LockToken {
 
         let deadline = Instant::now() + timeout;
         loop {
-            // SAFETY: `file` owns the descriptor for the whole call and outlives it.
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-            if rc == 0 {
+            if try_lock(&file).map_err(|err| {
+                KsError::internal(anyhow::anyhow!("lock({}) failed: {err}", path.display()))
+            })? {
                 let token = LockToken { file, path };
                 token.write_note(&owner);
                 return Ok(token);
-            }
-            let err = std::io::Error::last_os_error();
-            let raw = err.raw_os_error().unwrap_or(0);
-            if raw != libc::EWOULDBLOCK && raw != libc::EINTR {
-                return Err(KsError::internal(anyhow::anyhow!(
-                    "flock({}) failed: {err}",
-                    path.display()
-                )));
             }
             if Instant::now() >= deadline {
                 let held = LockToken::read_owner(layout)
@@ -166,8 +160,59 @@ impl LockToken {
 impl Drop for LockToken {
     fn drop(&mut self) {
         // Truncating the note is the only cleanup that matters: the kernel drops the
-        // flock when `file` closes, which is exactly what makes `kill -9` safe.
+        // native lock when `file` closes, including after forced process termination.
         let _ = self.file.set_len(0);
+    }
+}
+
+#[cfg(unix)]
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    // SAFETY: the file owns the descriptor and outlives this synchronous call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK | libc::EINTR) => Ok(false),
+        _ => Err(err),
+    }
+}
+
+#[cfg(windows)]
+fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // Lock one byte well beyond the owner note. Windows locks are mandatory, so
+    // locking its contents would prevent other sessions from reading the holder.
+    // A lock beyond EOF does not extend the file and is released on handle close.
+    let mut overlapped = OVERLAPPED::default();
+    overlapped.Anonymous.Anonymous.Offset = 0;
+    overlapped.Anonymous.Anonymous.OffsetHigh = 0x7fff_ffff;
+    // SAFETY: the handle and initialized OVERLAPPED outlive this synchronous,
+    // nonblocking call; the file was opened with read/write access.
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        Ok(false)
+    } else {
+        Err(err)
     }
 }
 
@@ -198,11 +243,20 @@ mod tests {
         let held = LockToken::acquire(&layout, owner, Duration::from_millis(50)).unwrap();
         assert!(held.path().exists());
 
-        // The note is readable while the lock is held — flock is advisory, so a *reader*
-        // is never blocked, which is what makes the contention message possible at all.
+        // The note stays readable while either platform's lock is held.
         let seen = LockToken::read_owner(&layout).expect("the note is written after acquiring");
         assert_eq!(seen.pid, std::process::id());
         assert!(seen.describe().contains("kanspec ship t-9c41"));
+
+        let contender = LockToken::acquire(
+            &layout,
+            LockOwner::here("competing writer", Utc::now()),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(contender.to_string().contains("kanspec ship t-9c41"));
+        assert_eq!(LockToken::read_owner(&layout).unwrap().pid, seen.pid);
+        assert!(std::fs::metadata(held.path()).unwrap().len() < 4096);
 
         drop(held);
         // Dropping truncates the note, so a stale pid can never be reported.
@@ -236,5 +290,77 @@ mod tests {
                 "note {body:?} must not yield an owner"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "child process for the crash-release test"]
+    fn lock_holder_child() {
+        let Some(root) = std::env::var_os("KANSPEC_TEST_LOCK_ROOT") else {
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        let layout = layout_in(root);
+        let _held = LockToken::acquire(
+            &layout,
+            LockOwner::here("child lock holder", Utc::now()),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        std::fs::write(root.join("holder.ready"), "ready").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn killing_the_holder_releases_the_lock_without_a_stale_lock_reaper() {
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let layout = layout_in(tmp.path());
+        let mut child = ChildGuard(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "lock::tests::lock_holder_child", "--ignored"])
+                .env("KANSPEC_TEST_LOCK_ROOT", tmp.path())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !tmp.path().join("holder.ready").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "lock holder exited early"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "lock holder did not become ready"
+            );
+            std::thread::sleep(POLL);
+        }
+        let refusal = LockToken::acquire(
+            &layout,
+            LockOwner::here("parent contender", Utc::now()),
+            Duration::ZERO,
+        )
+        .unwrap_err();
+        assert!(refusal.to_string().contains("child lock holder"));
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let recovered = LockToken::acquire(
+            &layout,
+            LockOwner::here("recovered writer", Utc::now()),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            LockToken::read_owner(&layout).unwrap().cmd,
+            "recovered writer"
+        );
+        drop(recovered);
+        assert!(LockToken::read_owner(&layout).is_none());
     }
 }

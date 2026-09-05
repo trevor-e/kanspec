@@ -347,15 +347,15 @@ fn the_displaced_hook_runs_first_and_its_exit_code_wins() {
         // Builtins only, so this proves the dispatcher and nothing about the environment.
         &format!(
             "#!/bin/sh\n: > {}\nexit 0\n",
-            shell_quote(&marker.to_string_lossy())
+            shell_quote(&marker.to_string_lossy().replace('\\', "/"))
         ),
     );
     repo.ks(["init"]).ok();
 
     // Run the installed entrypoint the way git would, with kanspec deliberately absent so
     // only the dispatch is under test.
-    let out = std::process::Command::new("/bin/sh")
-        .arg(&hook)
+    let out = std::process::Command::new("sh")
+        .arg(hook.to_string_lossy().replace('\\', "/"))
         .current_dir(&repo.root)
         .env("KANSPEC_BIN", "/nonexistent/kanspec")
         .output()
@@ -369,8 +369,8 @@ fn the_displaced_hook_runs_first_and_its_exit_code_wins() {
         &repo.root.join(".git/hooks/post-merge.d/10-post-merge"),
         "#!/bin/sh\nexit 3\n",
     );
-    let out = std::process::Command::new("/bin/sh")
-        .arg(&hook)
+    let out = std::process::Command::new("sh")
+        .arg(hook.to_string_lossy().replace('\\', "/"))
         .current_dir(&repo.root)
         .env("KANSPEC_BIN", "/nonexistent/kanspec")
         .output()
@@ -385,7 +385,7 @@ fn the_scan_hooks_are_silent_when_kanspec_is_not_on_the_path() {
     repo.ks(["init"]).ok();
 
     for hook in ["post-merge", "post-checkout"] {
-        let out = std::process::Command::new("/bin/sh")
+        let out = std::process::Command::new("sh")
             .arg(hook_path(&repo, hook))
             .args(["a", "b", "1"])
             .current_dir(&repo.root)

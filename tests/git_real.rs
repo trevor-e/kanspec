@@ -430,7 +430,9 @@ fn every_wrapper_call_from_a_linked_worktree_is_anchored_to_the_primary() {
         "`git -C <primary_root>` — never the cwd"
     );
     assert_eq!(
-        std::path::PathBuf::from(ctx.layout.ks().display().to_string()),
+        std::path::PathBuf::from(ctx.layout.ks().display().to_string())
+            .canonicalize()
+            .unwrap(),
         repo.root.canonicalize().unwrap().join(".kanspec"),
         "one board per machine, via git-common-dir"
     );

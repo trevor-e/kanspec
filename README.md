@@ -18,6 +18,40 @@ cargo install --path .        # installs both `kanspec` and its `ks` alias
 
 Needs `git`. `gh` is optional and only improves squash-merge detection.
 
+### Windows
+
+Native Windows builds use `LockFileEx`; no WSL or background service is needed.
+Install [Rust](https://rust-lang.org/tools/install/) and Git for Windows, then run
+from this checkout in PowerShell:
+
+```powershell
+.\scripts\install-windows.ps1
+kanspec --version
+kanspec prime
+```
+
+The default Rust MSVC toolchain needs the Visual Studio C++ build tools. With a
+Rust GNU toolchain, pass the `bin` directory of a complete GCC/MinGW toolchain:
+
+```powershell
+.\scripts\install-windows.ps1 -GnuBin C:\tools\mingw64\bin
+```
+
+The script installs `kanspec.exe`, `ks.exe`, and `kanspec-update.cmd` in
+`%USERPROFILE%\.local\bin` and adds that directory to your **user PATH** without
+replacing its existing entries. Restart an existing terminal or app only if its
+PATH does not already contain that directory.
+
+Run `kanspec-update` to fast-forward the installed source checkout's current
+tracked branch and rebuild into the same location. Local changes or divergent
+history stop the update; a build failure leaves the previous executables usable.
+To select another existing source branch, use `kanspec-update -Branch main`.
+This is an explicit update command, not an automatic background updater. Keep the
+source checkout in a stable location because the update command points to it.
+
+Windows and Linux CI run the tests, formatting, and lint checks; Windows CI also
+produces an artifact containing both release executables.
+
 ## The daily loop
 
 ```sh

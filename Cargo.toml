@@ -64,6 +64,9 @@ rusqlite      = { version = "0.40.2", features = ["bundled"], optional = true }
 #   futures     — tokio-stream's merge + map_while replaces take_until
 #   a git library — shell out for exact parity with the user's git
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [dev-dependencies]
 insta    = { version = "1.48.0", features = ["json", "filters"] }
 tempfile = "3.27.0"

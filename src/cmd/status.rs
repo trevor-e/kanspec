@@ -140,14 +140,14 @@ pub fn status(ctx: &Ctx, a: &StatusArgs) -> Result<StatusReport> {
         for p in [&ctx.cfg.paths.features, &ctx.cfg.paths.architecture] {
             if ctx.layout.repo_root().join(p).exists() {
                 paths.push(' ');
-                paths.push_str(&p.to_string_lossy());
+                paths.push_str(&shell_arg(&p.to_string_lossy()));
             }
         }
         if ctx.repo.linked() {
             format!(
                 "git -C {} add -A {paths} && git -C {} commit -m \"kanspec: sync\"",
-                ctx.repo.primary_root().display(),
-                ctx.repo.primary_root().display()
+                shell_arg(&ctx.repo.primary_root().to_string_lossy()),
+                shell_arg(&ctx.repo.primary_root().to_string_lossy())
             )
         } else {
             format!("git add -A {paths} && git commit -m \"kanspec: sync\"")
@@ -280,11 +280,18 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
     // Printed where it is read: from a linked worktree a bare `git` would operate on the
     // wrong tree, exactly as the `sync_fix` above learned.
     let g = if ctx.repo.linked() {
-        format!("git -C {}", ctx.repo.primary_root().display())
+        format!(
+            "git -C {}",
+            shell_arg(&ctx.repo.primary_root().to_string_lossy())
+        )
     } else {
         "git".to_string()
     };
-    let list = paths.join(" ");
+    let list = paths
+        .iter()
+        .map(|p| shell_arg(p))
+        .collect::<Vec<_>>()
+        .join(" ");
     // Named paths rather than `.kanspec/tickets`: a wholesale checkout would also revert any
     // ticket main changed while this branch was away.
     let transplant = format!(
@@ -310,6 +317,20 @@ fn tracker_drift(ctx: &Ctx) -> Option<TrackerDrift> {
         main_blind: false,
         fix,
     })
+}
+
+/// Quote paths in the POSIX shell commands printed as remediation. Backslashes
+/// in Windows paths are shell escapes unless quoted, even without spaces.
+fn shell_arg(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_./:-".contains(&b))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// Repo-relative paths out of a `-z` git listing. `--porcelain=v1 -z` prefixes each record
