@@ -213,8 +213,12 @@ fn escape(s: &str) -> String {
 fn fixture_paths(repo: &TestRepo) -> Vec<String> {
     let mut out = Vec::new();
     let tmp = repo.root.parent().unwrap_or(Path::new("/")).to_path_buf();
+    // CI may put TEMP behind an 8.3 alias (RUNNER~1). Git reports the expanded
+    // path without Rust's verbatim prefix, so include that spelling as well.
+    let primary = kanspec::paths::Repo::discover(&repo.root, None).unwrap();
     for p in [
         std::fs::canonicalize(&tmp).unwrap_or_else(|_| tmp.clone()),
+        primary.primary_root().parent().unwrap().to_path_buf(),
         tmp,
     ] {
         let s = p.to_string_lossy().to_string();
