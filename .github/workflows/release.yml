@@ -1,0 +1,106 @@
+name: Release
+
+# Publishes prebuilt `kanspec` + `ks` executables to a GitHub Release.
+#
+# Two ways in:
+#   - push a tag `v*` (the normal path once a version is cut on main)
+#   - Run workflow → give a tag name; the release is created at the run's commit
+#
+# Every archive holds both executables; SHA256SUMS covers all of them. Linux builds are
+# static musl binaries so they run on any distro or container image, which is what a
+# SessionStart hook in a downstream repository relies on:
+#   https://github.com/trevor-e/kanspec/releases/latest/download/kanspec-x86_64-unknown-linux-musl.tar.gz
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.1.0). Created at this commit if it does not exist.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Install musl linker
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --locked --release --bins --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="target/${{ matrix.target }}/release"
+          "$out/kanspec" --version
+          mkdir -p dist
+          tar -C "$out" -czf "dist/kanspec-${{ matrix.target }}.tar.gz" kanspec ks
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $out = "target/${{ matrix.target }}/release"
+          & "$out/kanspec.exe" --version
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "$out/kanspec.exe", "$out/ks.exe" -DestinationPath "dist/kanspec-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kanspec-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum kanspec-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "kanspec $TAG" \
+              --generate-notes
+          fi
