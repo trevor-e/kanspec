@@ -8,14 +8,14 @@ _generated [ts] · merge state checked [age] ago_
 
 ## Attention
 
-- ⇂ **t-88fe** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-88fe`
-- ⇂ **t-9c41** in main [age] (ancestry · checked [age] ago), not closed — `kanspec done t-9c41`
-- ⇂ **t-bbbb** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-bbbb`
-- ⇂ **t-eeee** in main [age] (patch-id · checked [age] ago), not closed — `kanspec done t-eeee`
-- ○ **t-disc** ready — `kanspec start t-disc`
-- ○ **t-rdyy** ready · auth — `kanspec start t-rdyy`
-- ◈ **t-cccc** in review [age], no movement — `kanspec show t-cccc`
-- ◈ **t-dddd** in review [age], no movement — `kanspec show t-dddd`
+- ⇂ **t-88fe-fixture** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-88fe`
+- ⇂ **t-9c41-fixture-truemerge** in main [age] (ancestry · checked [age] ago), not closed — `kanspec done t-9c41`
+- ⇂ **t-bbbb-fixture-rebase** in main [age] (trailer · checked [age] ago), not closed — `kanspec done t-bbbb`
+- ⇂ **t-eeee-fixture** in main [age] (patch-id · checked [age] ago), not closed — `kanspec done t-eeee`
+- ○ **t-disc-retry-the-webhook** ready — `kanspec start t-disc`
+- ○ **t-rdyy-rotate-the-signing** ready · auth — `kanspec start t-rdyy`
+- ◈ **t-cccc-fixture-never** in review [age], no movement — `kanspec show t-cccc`
+- ◈ **t-dddd-fixture** in review [age], no movement — `kanspec show t-dddd`
 
 ## BACKLOG (1)
 

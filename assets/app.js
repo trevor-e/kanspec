@@ -284,7 +284,7 @@ function renderCard(card) {
 
   const top = el('div', 'card-top');
   top.appendChild(el('span', 'g', inMain ? IN_MAIN : (GLYPH[card.state] || '?')));
-  top.appendChild(el('span', 'id', card.id));
+  top.appendChild(el('span', 'id', card.label || card.id));
   n.appendChild(top);
 
   n.appendChild(el('div', 'title', card.title));
@@ -403,7 +403,7 @@ function renderReviewQueue(b) {
   for (const r of rows) {
     const tr = el('tr');
     const id = el('td', 'ref');
-    const link = el('a', null, r.id);
+    const link = el('a', null, r.label || r.id);
     link.href = '/p/' + r.id;
     id.appendChild(link);
     tr.appendChild(id);
@@ -542,7 +542,7 @@ function renderRules() {
   for (const x of d.decisions || []) {
     const card = el('div', 'card s-done');
     const top = el('div', 'card-top');
-    top.appendChild(el('span', 'id', x.id));
+    top.appendChild(el('span', 'id', x.label || x.id));
     card.appendChild(top);
     card.appendChild(el('div', 'title', x.title));
     const chips = el('div', 'chips');
@@ -647,7 +647,7 @@ async function openTicket(id) {
 
   clear(d);
   d.appendChild(closeButton());
-  d.appendChild(el('div', 'sub', (GLYPH[t.state] || '?') + ' ' + t.id + ' · ' + t.state));
+  d.appendChild(el('div', 'sub', (GLYPH[t.state] || '?') + ' ' + (t.label || t.id) + ' · ' + t.state));
   d.appendChild(el('h2', null, t.title));
 
   const badge = el('div');

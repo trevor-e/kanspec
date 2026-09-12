@@ -92,6 +92,7 @@ pub fn status(ctx: &Ctx, a: &StatusArgs) -> Result<StatusReport> {
         .map(|f| Attention {
             owner: Owner::You,
             glyph: glyph::FAIL,
+            label: f.subject.clone(),
             subject: f.subject,
             line: f.message,
             fix: f.fix,
@@ -379,7 +380,7 @@ impl Render for StatusReport {
             for a in group {
                 let mut line = Line::new(a.glyph, &a.line);
                 if !a.subject.is_empty() {
-                    line = line.id(&a.subject);
+                    line = line.id(&a.label);
                 }
                 if !a.fix.is_empty() {
                     line = line.fix(&a.fix);

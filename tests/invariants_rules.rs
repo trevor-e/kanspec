@@ -858,12 +858,17 @@ fn an_agent_cannot_accept_revoke_or_supersede_a_standing_rule() {
         "an agent must still be able to PROPOSE:\n{}",
         proposed.stderr
     );
+    // The transcript shows the LABEL (`D-47ff-rate-limits-live-in`); the key is what the
+    // file is named after, and every verb accepts either.
     let did = proposed
         .stdout
         .split_whitespace()
         .find(|w| w.starts_with("D-"))
         .expect("the minted decision id")
-        .to_string();
+        .split('-')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("-");
 
     // ...but it may not make its own proposal binding, retire one, or swap one out.
     for args in [

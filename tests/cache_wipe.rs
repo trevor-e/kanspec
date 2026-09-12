@@ -512,7 +512,19 @@ fn status_renders_design_mds_transcript() {
     let repo = TestRepo::new();
     fixture(&repo);
     let out = repo.ks(["status"]).stdout;
-    let lines: Vec<&str> = out.lines().collect();
+    // A fix that does not fit beside its line takes a `    →` continuation line (the id
+    // column carries a title slug, so at a 100-column pipe the YOU line wraps). Fold each
+    // continuation back onto its entry so the transcript is pinned entry by entry.
+    let mut lines: Vec<String> = Vec::new();
+    for l in out.lines() {
+        match lines.last_mut() {
+            Some(prev) if l.starts_with("    \u{2192}") => {
+                prev.push(' ');
+                prev.push_str(l.trim_start());
+            }
+            _ => lines.push(l.to_string()),
+        }
+    }
 
     // grouped by WHO OWES THE NEXT VERB, with a count per group
     assert_eq!(lines[0], " YOU (1)", "{out}");
@@ -531,7 +543,8 @@ fn status_renders_design_mds_transcript() {
     assert_eq!(lines[2], " AGENT (1)", "{out}");
     assert!(
         lines[3].starts_with(" \u{25cb} t-66d1")
-            && lines[3].contains("ready \u{b7} auth \u{b7} unblocked when t-31aa closed"),
+            && lines[3].contains("ready \u{b7} auth \u{b7} unblocked when t-31aa-")
+            && lines[3].contains(" closed"),
         "{out}"
     );
 

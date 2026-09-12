@@ -17,7 +17,7 @@ use crate::derive::{self, Badge};
 use crate::error::{GateCode, KsError, Result};
 use crate::fm::Yv;
 use crate::ids::Minter;
-use crate::ids::{ProposalId, QuirkId, SpecName, TicketId};
+use crate::ids::{label, ProposalId, QuirkId, SpecName, TicketId};
 use crate::keys::TicketKey;
 use crate::model::{DecisionStatus, QuirkStatus, Snapshot, Ticket};
 use crate::out::join;
@@ -52,6 +52,9 @@ pub struct BlockedRow {
     pub id: TicketId,
     pub title: String,
     pub blocked_by: Vec<TicketId>,
+    /// `blocked_by` as a human reads it — labels, never bare keys
+    #[serde(skip)]
+    pub blocked_by_label: String,
 }
 
 pub fn ready(ctx: &Ctx, a: &ReadyArgs) -> Result<ReadyReport> {
@@ -80,10 +83,15 @@ pub fn ready(ctx: &Ctx, a: &ReadyArgs) -> Result<ReadyReport> {
         .values()
         .filter(|t| t.fm.state == State::Todo && !derive::is_ready(&snap, t))
         .filter(|t| matches(t))
-        .map(|t| BlockedRow {
-            id: t.fm.id.clone(),
-            title: t.fm.title.clone(),
-            blocked_by: derive::blocked_by(&snap, t).into_iter().cloned().collect(),
+        .map(|t| {
+            let blocked_by: Vec<TicketId> =
+                derive::blocked_by(&snap, t).into_iter().cloned().collect();
+            BlockedRow {
+                id: t.fm.id.clone(),
+                title: t.fm.title.clone(),
+                blocked_by_label: snap.labels(&blocked_by, ", "),
+                blocked_by,
+            }
         })
         .collect();
 
@@ -111,7 +119,7 @@ impl Render for ReadyReport {
             }
             // Through `spoken`, like every `Fix`: a `ks` user is told to run `ks`.
             let mut line = Line::state(State::Todo, &r.title)
-                .id(&r.id)
+                .id(label(&r.id, &r.title))
                 .fix(format!("kanspec start {}", r.id));
             if !chips.is_empty() {
                 line = line.dim(format!("· {}", chips.join(" · ")));
@@ -126,9 +134,17 @@ impl Render for ReadyReport {
         for b in &self.blocked {
             Line::new(
                 '·',
-                format!("{} — blocked by {}", b.title, ids(&b.blocked_by)),
+                format!(
+                    "{} — blocked by {}",
+                    b.title,
+                    if b.blocked_by.is_empty() {
+                        "nothing"
+                    } else {
+                        &b.blocked_by_label
+                    }
+                ),
             )
-            .id(&b.id)
+            .id(label(&b.id, &b.title))
             .write(w, st)?;
         }
         Ok(())
@@ -338,7 +354,7 @@ impl Render for StartReport {
             w,
             "  {}  {}  {}          ({})",
             crate::out::paint("claimed", Color::Green, st.color),
-            crate::out::paint(self.id.as_str(), Color::Bold, st.color),
+            crate::out::paint(&label(&self.id, &self.title), Color::Bold, st.color),
             self.title,
             crate::out::paint(
                 &format!("logged: {} · {}", self.state, self.claimed_by),
@@ -864,7 +880,7 @@ pub fn plan_ship(s: &Snapshot, f: &ShipFacts, a: &ShipArgs, _m: &Minter) -> Resu
 impl Render for ShipReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, &self.title)
-            .id(&self.id)
+            .id(label(&self.id, &self.title))
             .dim(format!(
                 "· head {}{}",
                 &self.head[..7.min(self.head.len())],
@@ -940,7 +956,7 @@ pub fn plan_park(s: &Snapshot, f: &Facts, a: &ParkArgs, _m: &Minter) -> Result<P
 impl Render for ParkReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, format!("{} — {}", self.title, self.why))
-            .id(&self.id)
+            .id(label(&self.id, &self.title))
             // `· ` prefix like every other dim chip in the crate: without it the reason and
             // the chip run together — `… — waiting on the limiter to land unclaimed`.
             .dim("· unclaimed")
@@ -1016,7 +1032,7 @@ pub fn plan_drop(s: &Snapshot, f: &Facts, a: &DropArgs, _m: &Minter) -> Result<P
 impl Render for DropReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, format!("{} — {}", self.title, self.why))
-            .id(&self.id)
+            .id(label(&self.id, &self.title))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)?;
         if !self.unblocked.is_empty() {

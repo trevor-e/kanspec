@@ -250,6 +250,9 @@ fn resolve_discovered_in(ctx: &Ctx, snap: &Snapshot, a: &NewArgs) -> Result<Opti
 #[derive(Debug, Serialize)]
 pub struct ShowReport {
     pub id: TicketId,
+    /// the id as a human reads it — `t-9c41-rate-limit-login`; the SPA's ticket drawer
+    /// shows it, so it is serialized where the other labels are not
+    pub label: String,
     pub title: String,
     pub state: State,
     pub column: Column,
@@ -261,6 +264,11 @@ pub struct ShowReport {
     pub proposal: Option<ProposalId>,
     pub deps: Vec<TicketId>,
     pub blocked_by: Vec<TicketId>,
+    /// `deps` / `blocked_by` as a human reads them — labels, never bare keys
+    #[serde(skip)]
+    pub dep_labels: String,
+    #[serde(skip)]
+    pub blocked_by_label: String,
     pub branch: Option<String>,
     pub worktree: Option<String>,
     pub claimed_by: Option<String>,
@@ -279,7 +287,9 @@ pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowReport> {
     let snap = ctx.snapshot()?;
     let t = snap.ticket(&id)?;
     let badge = derive::badge(&snap, t);
+    let blocked_by: Vec<TicketId> = derive::blocked_by(&snap, t).into_iter().cloned().collect();
     Ok(ShowReport {
+        label: snap.label(&id),
         title: t.fm.title.clone(),
         state: t.fm.state,
         column: derive::column(&snap, t),
@@ -288,7 +298,9 @@ pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowReport> {
         spec: t.fm.spec.clone(),
         proposal: t.fm.proposal.clone(),
         deps: t.fm.deps.clone(),
-        blocked_by: derive::blocked_by(&snap, t).into_iter().cloned().collect(),
+        dep_labels: snap.labels(&t.fm.deps, ", "),
+        blocked_by_label: snap.labels(&blocked_by, ", "),
+        blocked_by,
         branch: t.fm.branch.clone(),
         worktree: t.fm.worktree.as_ref().map(|p| p.display().to_string()),
         claimed_by: t.fm.claimed_by.clone(),
@@ -305,7 +317,7 @@ pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowReport> {
 impl Render for ShowReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, &self.title)
-            .id(&self.id)
+            .id(&self.label)
             .dim(format!("· {}", self.badge_text))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)?;
@@ -337,11 +349,11 @@ impl Render for ShowReport {
             writeln!(
                 w,
                 "   deps {}{}",
-                join(&self.deps, ", "),
+                self.dep_labels,
                 if self.blocked_by.is_empty() {
                     " (all satisfied)".to_string()
                 } else {
-                    format!(" · blocked by {}", join(&self.blocked_by, ", "))
+                    format!(" · blocked by {}", self.blocked_by_label)
                 }
             )?;
         }
@@ -498,6 +510,20 @@ impl Render for LsReport {
             return Line::new('·', what).fix("kanspec new \"...\"").write(w, st);
         }
         let mut table = Table::new(&["", "id", "title", "spec", "claimed", "merge", "age"], st);
+        // The id column never wraps: a label split across two lines is not an id anyone
+        // can copy. Dynamic arrangement squeezes the title and badge columns instead.
+        let id_width = self
+            .rows
+            .iter()
+            .map(|r| crate::ids::label(&r.id, &r.title).len())
+            .max()
+            .unwrap_or(0)
+            .min(u16::MAX as usize) as u16;
+        if let Some(col) = table.column_mut(1) {
+            col.set_constraint(comfy_table::ColumnConstraint::LowerBoundary(
+                comfy_table::Width::Fixed(id_width),
+            ));
+        }
         for r in &self.rows {
             table.add_row(vec![
                 format!(
@@ -509,7 +535,7 @@ impl Render for LsReport {
                         ' '
                     }
                 ),
-                r.id.to_string(),
+                crate::ids::label(&r.id, &r.title),
                 r.title.clone(),
                 r.spec.as_ref().map(SpecName::to_string).unwrap_or_default(),
                 r.claimed_by.clone().unwrap_or_default(),
@@ -666,7 +692,7 @@ impl Render for WhereReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         match (&self.ticket, &self.title, self.state) {
             (Some(id), Some(title), Some(state)) => Line::state(state, title)
-                .id(id)
+                .id(crate::ids::label(id, title))
                 .fix(
                     self.next
                         .first()
@@ -801,7 +827,7 @@ pub fn owed(ctx: &Ctx, snap: &Snapshot, t: &Ticket) -> Vec<String> {
 impl Render for NewReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::state(self.state, &self.title)
-            .id(&self.id)
+            .id(crate::ids::label(&self.id, &self.title))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)?;
         let mut chips: Vec<String> = vec![self.path.clone()];

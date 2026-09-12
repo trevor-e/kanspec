@@ -361,7 +361,68 @@ pub struct Snapshot {
     pub rev: u64,
 }
 
+/// An id that can look up its own title in a [`Snapshot`] to render as a display label.
+/// See [`crate::ids::label`]: the slug is cosmetic, the key is what is stored and parsed.
+pub trait Labeled {
+    fn label_in(&self, s: &Snapshot) -> String;
+}
+
+impl Labeled for TicketId {
+    fn label_in(&self, s: &Snapshot) -> String {
+        match s.tickets.get(self) {
+            Some(t) => crate::ids::label(self, &t.fm.title),
+            None => self.to_string(),
+        }
+    }
+}
+impl Labeled for ProposalId {
+    fn label_in(&self, s: &Snapshot) -> String {
+        match s.proposals.get(self) {
+            Some(p) => crate::ids::label(self, &p.fm.title),
+            None => self.to_string(),
+        }
+    }
+}
+impl Labeled for DecisionId {
+    fn label_in(&self, s: &Snapshot) -> String {
+        match s.decisions.get(self) {
+            Some(d) => crate::ids::label(self, &d.fm.title),
+            None => self.to_string(),
+        }
+    }
+}
+impl Labeled for QuirkId {
+    fn label_in(&self, s: &Snapshot) -> String {
+        match s.quirks.get(self) {
+            Some(q) => crate::ids::label(self, &q.fm.title),
+            None => self.to_string(),
+        }
+    }
+}
+impl<T: Labeled> Labeled for &T {
+    fn label_in(&self, s: &Snapshot) -> String {
+        (*self).label_in(s)
+    }
+}
+
 impl Snapshot {
+    /// `t-9c41-rate-limit-login` for a known id, the bare key for one the snapshot does not
+    /// hold (a closed ticket cited as a `source:`, say). Never an error: a label is cosmetic.
+    pub fn label<L: Labeled>(&self, id: L) -> String {
+        id.label_in(self)
+    }
+    /// The labels of many ids, joined — `blocked by t-31aa-lockout-table, t-66d1-...`.
+    pub fn labels<'a, L: Labeled + 'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a L>,
+        sep: &str,
+    ) -> String {
+        ids.into_iter()
+            .map(|i| i.label_in(self))
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
+
     pub fn ticket(&self, id: &TicketId) -> Result<&Ticket> {
         self.tickets.get(id).ok_or_else(|| {
             KsError::not_found(

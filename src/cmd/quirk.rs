@@ -189,15 +189,18 @@ impl Render for QuirkReport {
                 severity,
                 ..
             } => (
-                Line::new('▸', title.as_str()).id(id).dim(format!(
-                    "· {} · {}",
-                    severity_word(*severity),
-                    paths.join(" ")
-                )),
+                Line::new('▸', title.as_str())
+                    .id(crate::ids::label(id, title))
+                    .dim(format!(
+                        "· {} · {}",
+                        severity_word(*severity),
+                        paths.join(" ")
+                    )),
                 self.next(),
             ),
             QuirkReport::Fixed { id, title, by, .. } => (
-                Line::new(glyph::OK, format!("{title} — retired by {by}")).id(id),
+                Line::new(glyph::OK, format!("{title} — retired by {by}"))
+                    .id(crate::ids::label(id, title)),
                 self.next(),
             ),
         };
@@ -234,6 +237,9 @@ pub struct QuirkRow {
     pub severity: Severity,
     pub status: QuirkStatus,
     pub source: Option<TicketId>,
+    /// `source` as a human reads it
+    #[serde(skip)]
+    pub source_label: Option<String>,
     pub body: Option<String>,
 }
 
@@ -263,6 +269,7 @@ pub fn quirks(ctx: &Ctx, a: &QuirksArgs) -> Result<QuirksReport> {
             paths: q.fm.paths.clone(),
             severity: q.fm.severity,
             status: q.fm.status,
+            source_label: q.fm.source.as_ref().map(|t| snap.label(t)),
             source: q.fm.source.clone(),
             body: {
                 let b = q.body.trim().to_string();
@@ -310,7 +317,7 @@ impl Render for QuirksReport {
         if self.touched.is_some() {
             for r in &self.rows {
                 Line::new('⚠', format!("{} — {}", severity_word(r.severity), r.title))
-                    .id(&r.id)
+                    .id(crate::ids::label(&r.id, &r.title))
                     .write(w, st)?;
             }
             return Ok(());
@@ -318,13 +325,14 @@ impl Render for QuirksReport {
 
         for r in &self.rows {
             Line::new('⚠', &r.title)
-                .id(&r.id)
+                .id(crate::ids::label(&r.id, &r.title))
                 .dim(format!(
                     "· {} · {}{}",
                     severity_word(r.severity),
                     r.paths.join(" "),
-                    r.source
-                        .as_ref()
+                    r.source_label
+                        .as_deref()
+                        .or(r.source.as_ref().map(TicketId::as_str))
                         .map(|t| format!(" ← {t}"))
                         .unwrap_or_default()
                 ))

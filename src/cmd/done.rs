@@ -52,6 +52,9 @@ pub struct DoneReport {
     pub spec_check: SpecCheck,
     /// the proposal whose last live ticket this was
     pub settling: Option<ProposalId>,
+    /// `settling` as a human reads it
+    #[serde(skip)]
+    pub settling_label: Option<String>,
     /// the `code:` globs the branch actually landed inside — what the checkpoint is about
     pub spec_globs: Vec<String>,
     /// "parked 2 discovered tickets" — nothing captured along the way rots silently
@@ -245,6 +248,7 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         decisions,
         spec_check: triage.spec.clone(),
         spec_globs,
+        settling_label: settling.as_ref().map(|p| snap.label(p)),
         settling,
         discovered,
         next,
@@ -514,12 +518,14 @@ impl Render for DoneReport {
             )?;
         }
 
-        let settling = match &self.settling {
-            Some(p) => format!(" · {p} is settling (last ticket landed)"),
-            None => String::new(),
-        };
+        let settling = self
+            .settling_label
+            .as_deref()
+            .or(self.settling.as_ref().map(ProposalId::as_str))
+            .map(|p| format!(" · {p} is settling (last ticket landed)"))
+            .unwrap_or_default();
         Line::state(self.state, format!("done{settling}"))
-            .id(&self.id)
+            .id(crate::ids::label(&self.id, &self.title))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)?;
 
