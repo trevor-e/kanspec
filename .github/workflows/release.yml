@@ -14,9 +14,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # TEMPORARY: cut the first release from the branch that introduces this workflow, since
-    # `workflow_dispatch` only sees workflows already on the default branch. Remove after.
-    branches: ['claude/windows-support-status-0rcpkk']
   workflow_dispatch:
     inputs:
       tag:
