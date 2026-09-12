@@ -14,9 +14,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # TEMPORARY: cut the first release from the branch that introduces this workflow, since
-    # `workflow_dispatch` only sees workflows already on the default branch. Remove after.
-    branches: ['claude/windows-support-status-0rcpkk']
   workflow_dispatch:
     inputs:
       tag:
@@ -107,18 +104,9 @@ jobs:
           fi
           echo "release tag: $TAG"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-      - name: Probe what the token may do
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          echo "repo permissions as seen by this token:"
-          gh api "repos/$GITHUB_REPOSITORY" --jq '.permissions' || true
-          echo "draft release (no tag involved):"
-          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="probe-$GITHUB_RUN_ID" -F draft=true --jq .id) \
-            && echo "  created draft $id" \
-            && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" && echo "  deleted draft"
-          true
+      # The tag is pushed through git rather than left to the releases API: letting
+      # `gh release create --target` create it was refused with 403 for the job token,
+      # while a git push and a release against an existing tag both work.
       - name: Ensure the tag exists
         run: |
           set -euo pipefail
