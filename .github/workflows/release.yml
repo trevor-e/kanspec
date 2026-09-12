@@ -14,6 +14,9 @@ name: Release
 on:
   push:
     tags: ['v*']
+    # TEMPORARY: cut the first release from the branch that introduces this workflow, since
+    # `workflow_dispatch` only sees workflows already on the default branch. Remove after.
+    branches: ['claude/windows-support-status-0rcpkk']
   workflow_dispatch:
     inputs:
       tag:
@@ -90,9 +93,8 @@ jobs:
           cd dist
           sha256sum kanspec-* > SHA256SUMS
           cat SHA256SUMS
-      - name: Create or update the release
+      - name: Resolve the tag
         env:
-          GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
@@ -104,12 +106,41 @@ jobs:
             TAG="v$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           fi
           echo "release tag: $TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - name: Probe what the token may do
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          echo "repo permissions as seen by this token:"
+          gh api "repos/$GITHUB_REPOSITORY" --jq '.permissions' || true
+          echo "draft release (no tag involved):"
+          id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="probe-$GITHUB_RUN_ID" -F draft=true --jq .id) \
+            && echo "  created draft $id" \
+            && gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id" && echo "  deleted draft"
+          true
+      - name: Ensure the tag exists
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "tag $TAG already exists"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" "$GITHUB_SHA" -m "kanspec $TAG"
+            git push origin "refs/tags/$TAG"
+          fi
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --target "$GITHUB_SHA" \
+              --verify-tag \
               --title "kanspec $TAG" \
               --generate-notes
           fi
