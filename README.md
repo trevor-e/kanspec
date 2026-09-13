@@ -18,6 +18,23 @@ cargo install --path .        # installs both `kanspec` and its `ks` alias
 
 Needs `git`. `gh` is optional and only improves squash-merge detection.
 
+### Prebuilt binaries
+
+Every [release](https://github.com/trevor-e/kanspec/releases) ships an archive per platform
+holding both `kanspec` and `ks`, plus a `SHA256SUMS` file. The Linux archives are static musl
+builds, so they run on any distro or container image. To put the latest Linux build on the PATH
+of a machine without a Rust toolchain (a CI job, a Claude Code cloud session):
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/trevor-e/kanspec/releases/latest/download/kanspec-x86_64-unknown-linux-musl.tar.gz \
+  | tar -xz -C ~/.local/bin kanspec ks
+```
+
+Targets: `x86_64-unknown-linux-musl`, `aarch64-unknown-linux-musl`, `aarch64-apple-darwin`,
+`x86_64-apple-darwin` (`.tar.gz`) and `x86_64-pc-windows-msvc` (`.zip`). Releases are cut by
+the `Release` workflow: push a `v*` tag, or run it by hand with a tag name.
+
 ### Windows
 
 Native Windows builds use `LockFileEx`; no WSL or background service is needed.
