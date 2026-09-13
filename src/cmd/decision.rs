@@ -145,7 +145,7 @@ impl Render for DecideReport {
             .map(|s| format!("source {s} · "))
             .unwrap_or_default();
         let mut line = Line::new('▸', format!("{} created", self.title))
-            .id(&self.id)
+            .id(crate::ids::label(&self.id, &self.title))
             .dim(format!("· proposed · {src}{}", self.path));
         if let Some(u) = &self.url {
             line = line.url(format!("accept: {u}"));
@@ -392,7 +392,7 @@ impl Render for DecisionReport {
                 self.by
             ),
         )
-        .id(&self.id);
+        .id(crate::ids::label(&self.id, &self.title));
         if let Some(r) = &self.replacement {
             line = line.dim(format!("· replaced by {r}"));
         }
@@ -427,6 +427,16 @@ pub struct WhyReport {
     pub prs: Vec<u64>,
     pub decisions: Vec<DecisionId>,
     pub next: Vec<String>,
+    /// the chain as a human reads it — labels, never bare keys
+    #[serde(skip)]
+    pub labels: WhyLabels,
+}
+
+#[derive(Debug, Default)]
+pub struct WhyLabels {
+    pub proposal: Option<String>,
+    pub tickets: String,
+    pub decisions: String,
 }
 
 /// Walks rule → `{p-xxxx}` token → proposal item → tickets → PR, from whichever end the
@@ -449,6 +459,7 @@ pub fn why(ctx: &Ctx, a: &WhyArgs) -> Result<WhyReport> {
         prs: Vec::new(),
         decisions: Vec::new(),
         next: Vec::new(),
+        labels: WhyLabels::default(),
     };
 
     // Each id kind is accepted only if it names something that EXISTS — `DecisionId::parse`
@@ -562,6 +573,11 @@ pub fn why(ctx: &Ctx, a: &WhyArgs) -> Result<WhyReport> {
             .filter_map(|id| snap.tickets.get(id).and_then(|t| t.fm.pr))
             .collect();
     }
+    r.labels = WhyLabels {
+        proposal: r.proposal.as_ref().map(|p| snap.label(p)),
+        tickets: snap.labels(&r.tickets, " "),
+        decisions: snap.labels(&r.decisions, " "),
+    };
 
     // Never hand back the anchor the caller already typed: a fix that re-runs the command
     // you just ran is not a next step.
@@ -595,14 +611,19 @@ impl Render for WhyReport {
             // started. The JSON key stays `rule` — it is the contract's name for it.
             writeln!(w, "   record     {rule}")?;
         }
-        match (&self.proposal, &self.item) {
+        let proposal = self
+            .labels
+            .proposal
+            .clone()
+            .or_else(|| self.proposal.as_ref().map(|p| p.to_string()));
+        match (&proposal, &self.item) {
             (Some(p), Some(i)) => writeln!(w, "   proposal   {p} · item {i}")?,
             (Some(p), None) => writeln!(w, "   proposal   {p}")?,
             (None, Some(i)) => writeln!(w, "   source     {i}")?,
             (None, None) => writeln!(w, "   proposal   (none recorded)")?,
         }
         if !self.tickets.is_empty() {
-            writeln!(w, "   tickets    {}", join(&self.tickets, " "))?;
+            writeln!(w, "   tickets    {}", self.labels.tickets)?;
         }
         if !self.prs.is_empty() {
             writeln!(
@@ -612,7 +633,7 @@ impl Render for WhyReport {
             )?;
         }
         if !self.decisions.is_empty() {
-            writeln!(w, "   decisions  {}", join(&self.decisions, " "))?;
+            writeln!(w, "   decisions  {}", self.labels.decisions)?;
         }
         write_next(w, st, &self.next)
     }

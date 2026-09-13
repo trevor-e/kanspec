@@ -306,6 +306,17 @@ impl<'s> Minter<'s> {
     pub fn comment(&self, body: &str)   -> Result<CommentId>;
 }
 pub fn slug(title: &str) -> String;   // "Rate-limit login" -> "rate-limit-login", <= 40 chars
+/// The human form of an id (DESIGN.md "Readable ids"): key + `slug(title)` cut at a word
+/// boundary within `LABEL_SLUG_MAX` (20) — `t-9c41-rate-limit-login`. Cosmetic: nothing
+/// stores it; `parse` strips everything after the hex body, so a label pastes into any
+/// verb, and so do branch names (minus `ks/`) and proposal directory names.
+pub const LABEL_SLUG_MAX: usize = 20;
+pub fn label(id: &impl Display, title: &str) -> String;
+// model.rs: `Snapshot::label(&id)` / `Snapshot::labels(&ids, sep)` look the title up
+// (trait `Labeled` for the four record ids); an id the snapshot does not hold renders
+// as the bare key. Every `Line::id` and every human cross-reference (`blocked by …`,
+// `discovered in …`, `← source`) goes through one of these; `Fix` strings, ledgers,
+// frontmatter and `--json` ids stay bare keys.
 ```
 
 ### 2.3 `src/keys.rs` — invariant 1 as an absent variant ✅

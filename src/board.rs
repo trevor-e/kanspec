@@ -60,6 +60,8 @@ pub struct BoardModel {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReviewRow {
     pub id: ProposalId,
+    /// the id as a human reads it — `p-7de2-rate-limiting`
+    pub label: String,
     pub title: String,
     pub specs: Vec<SpecName>,
     pub unresolved: usize,
@@ -80,6 +82,8 @@ pub struct ColumnModel {
 #[derive(Debug, Clone, Serialize)]
 pub struct Card {
     pub id: TicketId,
+    /// the id as a human reads it — `t-9c41-rate-limit-login`. Cosmetic: `id` is the key.
+    pub label: String,
     pub title: String,
     /// the stored state, so the SPA and the terminal draw the same one-glyph badge
     pub state: State,
@@ -95,6 +99,8 @@ pub struct Card {
     pub badge_text: String,
     pub stalled_secs: Option<u64>,
     pub discovered_in: Option<TicketId>,
+    /// `discovered_in` as a human reads it
+    pub discovered_in_label: Option<String>,
     pub deps: Vec<TicketId>,
     /// the unsatisfied subset of `deps` — what a BACKLOG card is actually waiting on
     pub blocked_by: Vec<TicketId>,
@@ -216,6 +222,7 @@ fn review_queue(snap: &Snapshot) -> Vec<ReviewRow> {
             let unresolved = derive::unresolved(snap, &p.fm.id);
             let url = format!("http://127.0.0.1:{}/p/{}", snap.cfg.port, p.fm.id);
             ReviewRow {
+                label: snap.label(&p.fm.id),
                 id: p.fm.id.clone(),
                 title: p.fm.title.clone(),
                 specs: p.fm.specs.clone(),
@@ -272,6 +279,7 @@ fn card(snap: &Snapshot, t: &Ticket) -> Card {
     Card {
         badge_text: badge.text(snap.now),
         fix: card_fix(snap, t, &blocked_by),
+        label: snap.label(&t.fm.id),
         id: t.fm.id.clone(),
         title: t.fm.title.clone(),
         state: t.fm.state,
@@ -289,6 +297,7 @@ fn card(snap: &Snapshot, t: &Ticket) -> Card {
             .unwrap_or(0),
         badge,
         stalled_secs: derive::stalled(snap, t).map(|d| d.as_secs()),
+        discovered_in_label: t.fm.discovered_in.as_ref().map(|d| snap.label(d)),
         discovered_in: t.fm.discovered_in.clone(),
         deps: t.fm.deps.clone(),
         blocked_by,
@@ -420,7 +429,7 @@ pub fn render_markdown(m: &BoardModel) -> String {
             let subject = if a.subject.is_empty() {
                 String::new()
             } else {
-                format!("**{}** ", a.subject)
+                format!("**{}** ", a.label)
             };
             let fix = if a.fix.is_empty() {
                 String::new()
@@ -845,7 +854,7 @@ pub fn render_terminal(
         for a in &m.attention {
             let mut line = Line::new(a.glyph, a.line.as_str());
             if !a.subject.is_empty() {
-                line = line.id(&a.subject);
+                line = line.id(&a.label);
             }
             line.fix(a.fix.as_str()).write(w, st)?;
         }
@@ -863,7 +872,7 @@ pub fn render_terminal(
             writeln!(w, "   {}", crate::out::paint("—", Color::Dim, st.color))?;
         }
         for card in &c.cards {
-            let mut line = Line::new(card_glyph(card), card.title.as_str()).id(&card.id);
+            let mut line = Line::new(card_glyph(card), card.title.as_str()).id(&card.label);
             if let Some(f) = &card.fix {
                 line = line.fix(f.as_str());
             }
@@ -892,7 +901,7 @@ pub fn render_terminal(
                 n => format!("{n} open"),
             };
             Line::new(crate::out::state_glyph(State::Review), r.title.as_str())
-                .id(&r.id)
+                .id(&r.label)
                 .dim(open)
                 .fix(&r.fix)
                 .write(w, st)?;
@@ -956,6 +965,7 @@ fn card_glyph(c: &Card) -> char {
 fn card_detail(c: &Card) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(d) = &c.discovered_in {
+        let d = c.discovered_in_label.as_deref().unwrap_or(d.as_str());
         parts.push(format!("{} discovered in {d}", glyph::DISCOVERED));
     }
     if let Some(s) = &c.spec {
@@ -1066,6 +1076,7 @@ mod tests {
     fn a_card(id: &str) -> Card {
         Card {
             id: TicketId::parse(id).unwrap(),
+            label: crate::ids::label(&TicketId::parse(id).unwrap(), "Rate-limit login"),
             title: "Rate-limit login".into(),
             state: State::Doing,
             spec: None,
@@ -1079,6 +1090,7 @@ mod tests {
             badge_text: "unpushed".into(),
             stalled_secs: None,
             discovered_in: None,
+            discovered_in_label: None,
             deps: vec![],
             blocked_by: vec![],
             fix: Some(format!("kanspec ship {id}")),
@@ -1105,6 +1117,7 @@ mod tests {
                 owner: Owner::You,
                 glyph: glyph::IN_MAIN,
                 subject: "t-31aa".into(),
+                label: "t-31aa-lockout-table".into(),
                 line: "in main 2h, not closed".into(),
                 fix: "kanspec done t-31aa".into(),
                 url: None,

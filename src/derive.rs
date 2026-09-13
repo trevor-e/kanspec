@@ -20,7 +20,7 @@ use serde::Serialize;
 
 use crate::cache::{MergeFact, MergeStatus};
 use crate::git::Method;
-use crate::ids::{ItemRef, ProposalId, SpecName, TicketId};
+use crate::ids::{DecisionId, ItemRef, ProposalId, SpecName, TicketId};
 use crate::logentry::LogEntry;
 use crate::model::{
     CommentOpKind, DecisionStatus, Proposal, ProposalStatus, Snapshot, Spec, Ticket,
@@ -928,7 +928,7 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
                 .is_some_and(|dep| in_main(s, dep).is_some())
         });
         let tail = pending
-            .map(|d| format!(" · unblocked when {d} closed"))
+            .map(|d| format!(" · unblocked when {} closed", s.label(d)))
             .unwrap_or_default();
         agent.push((
             AGENT_READY,
@@ -1058,20 +1058,50 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
         });
         out.extend(group.drain(..).map(|(_, a)| a));
     }
+    for a in &mut out {
+        a.label = label_subject(s, &a.subject);
+    }
     out
 }
 
 /// One attention line without a `url` — the shape every entry but the two review-thread
 /// ones has, so each push above reads as (rank, owner, glyph, subject, line, fix).
 fn att(owner: Owner, glyph: char, subject: impl ToString, line: String, fix: String) -> Attention {
+    let subject = subject.to_string();
     Attention {
         owner,
         glyph,
-        subject: subject.to_string(),
+        label: subject.clone(),
+        subject,
         line,
         fix,
         url: None,
     }
+}
+
+/// The display label of an attention subject: a ticket, proposal or decision the snapshot
+/// holds is labeled with its title slug; anything else (a spec name, an unknown id) is
+/// shown as it is.
+fn label_subject(s: &Snapshot, subject: &str) -> String {
+    if let Some(id) = TicketId::parse(subject)
+        .ok()
+        .filter(|i| s.tickets.contains_key(i))
+    {
+        return s.label(&id);
+    }
+    if let Some(id) = ProposalId::parse(subject)
+        .ok()
+        .filter(|i| s.proposals.contains_key(i))
+    {
+        return s.label(&id);
+    }
+    if let Some(id) = DecisionId::parse(subject)
+        .ok()
+        .filter(|i| s.decisions.contains_key(i))
+    {
+        return s.label(&id);
+    }
+    subject.to_string()
 }
 
 /// How many ready tickets `status` names before it collapses the rest into one line.
@@ -1134,7 +1164,11 @@ pub fn dispositioned(ledger: &[String], item: &ItemRef) -> bool {
 pub struct Attention {
     pub owner: Owner,
     pub glyph: char,
+    /// the bare key (or spec name) — what an agent passes to the fix
     pub subject: String,
+    /// `subject` as a human reads it — `t-9c41-rate-limit-login`; equal to `subject` when
+    /// it names nothing the snapshot holds a title for
+    pub label: String,
     pub line: String,
     pub fix: String,
     pub url: Option<String>,
@@ -2183,7 +2217,15 @@ mod tests {
 
         let agent = line("t-66d1");
         assert_eq!(agent.owner, Owner::Agent);
-        assert_eq!(agent.line, "ready · auth · unblocked when t-31aa closed");
+        // the dep is named by its LABEL — key plus title slug — and the key comes first
+        assert!(
+            agent
+                .line
+                .starts_with("ready · auth · unblocked when t-31aa-")
+                && agent.line.ends_with(" closed"),
+            "{}",
+            agent.line
+        );
         assert_eq!(agent.fix, "kanspec start t-66d1");
 
         let watching = line("t-88fe");

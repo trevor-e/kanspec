@@ -3,43 +3,47 @@ source: tests/board.rs
 expression: r.stdout
 ---
  ATTENTION
- ⇂ t-88fe   in main [age] (trailer · checked [age] ago), not closed              → kanspec done t-88fe
- ⇂ t-9c41   in main [age] (ancestry · checked [age] ago), not closed             → kanspec done t-9c41
- ⇂ t-bbbb   in main [age] (trailer · checked [age] ago), not closed              → kanspec done t-bbbb
- ⇂ t-eeee   in main [age] (patch-id · checked [age] ago), not closed             → kanspec done t-eeee
- ○ t-disc   ready                                                             → kanspec start t-disc
- ○ t-rdyy   ready · auth                                                      → kanspec start t-rdyy
- ◈ t-cccc   in review [age], no movement                                      → kanspec show t-cccc
- ◈ t-dddd   in review [age], no movement                                      → kanspec show t-dddd
+ ⇂ t-88fe-fixture                in main [age] (trailer · checked [age] ago), not closed
+    → kanspec done t-88fe
+ ⇂ t-9c41-fixture-truemerge      in main [age] (ancestry · checked [age] ago), not closed
+    → kanspec done t-9c41
+ ⇂ t-bbbb-fixture-rebase         in main [age] (trailer · checked [age] ago), not closed
+    → kanspec done t-bbbb
+ ⇂ t-eeee-fixture                in main [age] (patch-id · checked [age] ago), not closed
+    → kanspec done t-eeee
+ ○ t-disc-retry-the-webhook      ready                                        → kanspec start t-disc
+ ○ t-rdyy-rotate-the-signing     ready · auth                                 → kanspec start t-rdyy
+ ◈ t-cccc-fixture-never          in review [age], no movement                 → kanspec show t-cccc
+ ◈ t-dddd-fixture                in review [age], no movement                 → kanspec show t-dddd
 
  BACKLOG (1)
- ○ t-blkd   Session rotation
+ ○ t-blkd-session-rotation       Session rotation
              auth · [age] ago · blocked by t-dong · unknown (no branch or head SHA recorded · checked [age] ago)
 
  READY (2)
- ○ t-disc   Retry the webhook                                                 → kanspec start t-disc
-             ◇ discovered in t-dong · [age] ago · unknown (no branch or head SHA recorded · checked [age] ago)
- ○ t-rdyy   Rotate the signing key                                            → kanspec start t-rdyy
+ ○ t-disc-retry-the-webhook      Retry the webhook                            → kanspec start t-disc
+             ◇ discovered in t-dong-alert-wiring · [age] ago · unknown (no branch or head SHA recorded · checked [age] ago)
+ ○ t-rdyy-rotate-the-signing     Rotate the signing key                       → kanspec start t-rdyy
              auth · [age] ago · unknown (no branch or head SHA recorded · checked [age] ago)
 
  DOING (1)
- ◐ t-dong   Alert wiring                                                       → kanspec ship t-dong
+ ◐ t-dong-alert-wiring           Alert wiring                                  → kanspec ship t-dong
              auth · ⎇ ks/t-dong-alert-wiring · ⌂ …/kanspec-wt/t-dong · trevor · [age] ago · unknown (branch has no commits of its own · checked [age] ago)
 
  REVIEW (2)
- ◈ t-cccc   fixture Never                                                      → kanspec scan t-cccc
+ ◈ t-cccc-fixture-never          fixture Never                                 → kanspec scan t-cccc
              auth · ⎇ ks/t-cccc-never · trevor · [age] ago · unknown (squash suspected, no gh · checked [age] ago)
- ◈ t-dddd   fixture SquashGhTitleOnly                                          → kanspec scan t-dddd
+ ◈ t-dddd-fixture                fixture SquashGhTitleOnly                     → kanspec scan t-dddd
              auth · ⎇ ks/t-dddd-squash-title-only · trevor · [age] ago · unknown (squash suspected, no gh · checked [age] ago)
 
  IN MAIN ⇂ (4)
- ⇂ t-88fe   fixture SquashGitNative                                            → kanspec done t-88fe
+ ⇂ t-88fe-fixture                fixture SquashGitNative                       → kanspec done t-88fe
              auth · ⎇ ks/t-88fe-squash-native · trevor · [age] ago · in main (trailer · checked [age] ago)
- ⇂ t-9c41   fixture TrueMerge                                                  → kanspec done t-9c41
+ ⇂ t-9c41-fixture-truemerge      fixture TrueMerge                             → kanspec done t-9c41
              auth · ⎇ ks/t-9c41-true-merge · trevor · [age] ago · in main (ancestry · checked [age] ago)
- ⇂ t-bbbb   fixture Rebase                                                     → kanspec done t-bbbb
+ ⇂ t-bbbb-fixture-rebase         fixture Rebase                                → kanspec done t-bbbb
              auth · ⎇ ks/t-bbbb-rebase · trevor · [age] ago · in main (trailer · checked [age] ago)
- ⇂ t-eeee   fixture SquashOneCommit                                            → kanspec done t-eeee
+ ⇂ t-eeee-fixture                fixture SquashOneCommit                       → kanspec done t-eeee
              auth · ⎇ ks/t-eeee-squash-one · trevor · [age] ago · in main (patch-id · checked [age] ago)
 
  DONE (7d) (0)
@@ -52,5 +56,5 @@ expression: r.stdout
                                                                              commits of its own ·   
                                                                              checked [age] ago)        
  FEATURES
- ● auth     Login sessions, lockout after five failures fresh
+ ● auth                          Login sessions, lockout after five failures fresh
    merge state checked [age] ago

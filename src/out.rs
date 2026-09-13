@@ -119,8 +119,12 @@ pub fn state_glyph(s: crate::transitions::State) -> char {
 /// The shared human primitive: most output is a list of these.
 ///
 /// ```text
-/// ⇂ t-31aa   in main 2h (gh-pr #142 · checked 4m ago)   → kanspec done t-31aa
+/// ⇂ t-31aa-lockout-table        in main 2h (gh-pr #142 · checked 4m ago)   → kanspec done t-31aa
 /// ```
+///
+/// The id column carries a display *label* — key plus a short title slug, see
+/// [`crate::ids::label`] — wherever the caller knows the title; the fix keeps the bare
+/// key, which is all any verb needs.
 #[derive(Clone, Debug, Default)]
 pub struct Line {
     pub glyph: char,
@@ -211,9 +215,11 @@ impl Line {
     }
 }
 
-/// The id column in [`Line::write`] — wide enough for `t-31aa` plus the three spaces
-/// DESIGN.md's transcripts show before the text.
-const ID_COL: usize = 9;
+/// The id column in [`Line::write`] — wide enough for a full display label
+/// (`t-31aa-` + [`crate::ids::LABEL_SLUG_MAX`] chars of slug) plus the three spaces
+/// DESIGN.md's transcripts show before the text. Fixed rather than fitted so the text
+/// column lines up across lines whose labels differ in length.
+const ID_COL: usize = 2 + 4 + 1 + crate::ids::LABEL_SLUG_MAX + 3;
 
 /// Pad `s` on the right to `width` **visible** columns, never truncating.
 ///
@@ -481,7 +487,10 @@ mod tests {
             );
             assert_eq!(
                 s.trim_end(),
-                " ● t-63b9   Rate-limit login endpoint",
+                format!(
+                    " ● {}Rate-limit login endpoint",
+                    pad_visible("t-63b9", ID_COL)
+                ),
                 "{s:?}"
             );
         }
@@ -505,7 +514,13 @@ mod tests {
     /// wrapping.
     #[test]
     fn a_wide_glyph_is_budgeted_in_columns_on_both_sides_of_the_line() {
-        let st = Style::plain(); // width 100
+        // Wide enough that the labelled id column (`ID_COL`) plus the quoted CJK fix below
+        // still fits (105 columns), and narrow enough that the wide-text case after it
+        // (124 columns) does not.
+        let st = Style {
+            width: 110,
+            ..Style::plain()
+        };
         let render = |line: &Line| {
             let mut buf: Vec<u8> = Vec::new();
             line.write(&mut buf, &st).unwrap();
@@ -535,12 +550,12 @@ mod tests {
                 .fix("kanspec start t-0001"),
         );
         let (first, rest) = out.trim_end_matches('\n').split_once('\n').expect("a wrap");
-        assert_eq!(visible_len(first), 12 + 68, "{first:?}");
+        assert_eq!(visible_len(first), 3 + ID_COL + 68, "{first:?}");
         assert_eq!(rest, "    → kanspec start t-0001");
-        // THE BUG: the `char` count made that 12 + 34 + 3 + 20 = 69, which "fits", so the
-        // fix was right-aligned — and the line the terminal actually drew was 134 columns.
+        // THE BUG: the `char` count made that 3 + ID_COL + 34 + 3 + 20, which "fits", so
+        // the fix was right-aligned — and the line the terminal actually drew was wider.
         assert!(
-            12 + long.chars().count() + 3 + 20 <= st.width,
+            3 + ID_COL + long.chars().count() + 3 + 20 <= st.width,
             "the old budget thought this fit"
         );
     }
@@ -565,7 +580,7 @@ mod tests {
         );
         assert_eq!(visible_len(&painted), 6);
 
-        // The helper pads a PAINTED id to nine visible columns…
+        // The helper pads a PAINTED id to the column's visible width…
         let padded = pad_visible(&painted, ID_COL);
         assert_eq!(visible_len(&padded), ID_COL, "{padded:?}");
         assert!(padded.ends_with("   "), "{padded:?}");
@@ -577,10 +592,13 @@ mod tests {
         );
 
         // Plain input is byte-identical to the specifier it replaces.
-        assert_eq!(pad_visible("t-ec64", ID_COL), format!("{:<9}", "t-ec64"));
+        assert_eq!(
+            pad_visible("t-ec64", ID_COL),
+            format!("{:<width$}", "t-ec64", width = ID_COL)
+        );
         // Over-wide input is never truncated — an id wider than the column pushes the
         // text right rather than losing characters.
-        assert_eq!(pad_visible("t-abcdefghij", ID_COL), "t-abcdefghij");
+        assert_eq!(pad_visible("t-abcdefghij", 9), "t-abcdefghij");
         assert_eq!(pad_visible(&paint("wide-id-here", Color::Bold, true), 4), {
             paint("wide-id-here", Color::Bold, true)
         });
@@ -720,7 +738,8 @@ mod tests {
         .write(&mut buf, &Style::plain())
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(s.starts_with(" ⇂ t-31aa   in main 2h"), "{s:?}");
+        assert!(s.starts_with(" ⇂ t-31aa "), "{s:?}");
+        assert!(s.contains("   in main 2h"), "{s:?}");
         assert!(s.trim_end().ends_with("→ kanspec done t-31aa"), "{s:?}");
 
         let mut buf: Vec<u8> = Vec::new();

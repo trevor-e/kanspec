@@ -218,7 +218,7 @@ fn the_walking_skeleton_runs_end_to_end_from_a_linked_worktree() {
         transcript,
         vec![
             format!(
-                "  claimed  {id}  Rate-limit login endpoint          (logged: doing · trevor)"
+                "  claimed  {id}-rate-limit-login  Rate-limit login endpoint          (logged: doing · trevor)"
             ),
             format!(
                 "  branch   ks/{id}-rate-limit-login-endpoint    worktree ../kanspec-wt/{id}"
@@ -885,10 +885,20 @@ fn the_close_out_transcript_reads_like_design_md_and_flags_the_settling_proposal
         )
         .ok()
         .stdout;
-    let last = out.lines().last().unwrap_or_default().to_string();
+    // the done line plus its `    →` continuation, when the fix did not fit beside it
+    let last = out
+        .lines()
+        .rev()
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
         last.contains(&followup)
-            && last.contains("done \u{b7} p-7de2 is settling (last ticket landed)")
+            && last.contains("done \u{b7} p-7de2-")
+            && last.contains(" is settling (last ticket landed)")
             && last.contains("\u{2192} kanspec close p-7de2"),
         "the settling proposal is prompted, never remembered:\n{out}"
     );

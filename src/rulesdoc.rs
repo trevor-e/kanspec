@@ -32,7 +32,7 @@ use serde::Serialize;
 
 use crate::error::{KsError, Result};
 use crate::git::ChangedPath;
-use crate::ids::{DecisionId, ProposalId, QuirkId, SpecName};
+use crate::ids::{DecisionId, ProposalId, QuirkId, SpecName, TicketId};
 use crate::model::{DecisionStatus, QuirkStatus, Severity, Snapshot};
 use crate::{fix, fixes};
 
@@ -307,7 +307,10 @@ pub const CHARS_PER_TOKEN: usize = 4;
 #[derive(Debug, Clone, Serialize)]
 pub struct StandingDecision {
     pub id: DecisionId,
+    /// the id as a human reads it — `D-0174-dates-not-booleans`; the board shows it
+    pub label: String,
     pub title: String,
+    /// the provenance as a human reads it: a ticket or proposal source is labeled
     pub source: Option<String>,
     pub scope: Vec<String>,
     pub accepted: String,
@@ -318,9 +321,12 @@ pub struct StandingDecision {
 #[derive(Debug, Clone, Serialize)]
 pub struct StandingQuirk {
     pub id: QuirkId,
+    /// the id as a human reads it — `q-11ba-stripe-webhooks-replay`
+    pub label: String,
     pub title: String,
     pub paths: Vec<String>,
     pub severity: Severity,
+    /// the source ticket, labeled
     pub source: Option<String>,
     pub body: Option<String>,
 }
@@ -373,9 +379,10 @@ fn build_within(s: &Snapshot, scope: &Scope, budget_chars: Option<usize>) -> Rul
         // nothing, so wherever the agent is standing, it is standing inside it.
         let matched = scope.reaches(&d.scope);
         decisions.push(StandingDecision {
+            label: s.label(&d.fm.id),
             id: d.fm.id.clone(),
             title: d.fm.title.clone(),
-            source: d.fm.source.clone(),
+            source: d.fm.source.as_deref().map(|src| label_source(s, src)),
             scope: d.scope.clone(),
             accepted: d.fm.date.to_string(),
             body: matched.then(|| trimmed(&d.body)),
@@ -393,11 +400,12 @@ fn build_within(s: &Snapshot, scope: &Scope, budget_chars: Option<usize>) -> Rul
         }
         let body = trimmed(&q.body);
         quirks.push(StandingQuirk {
+            label: s.label(&q.fm.id),
             id: q.fm.id.clone(),
             title: q.fm.title.clone(),
             paths: q.fm.paths.clone(),
             severity: q.fm.severity,
-            source: q.fm.source.as_ref().map(|t| t.to_string()),
+            source: q.fm.source.as_ref().map(|t| s.label(t)),
             // `quirk add` seeds the body from the title, so repeating it would double every
             // landmine in the payload for no information.
             body: (matched && !body.is_empty() && body != q.fm.title).then_some(body),
@@ -566,6 +574,25 @@ pub fn render_text(d: &RulesDoc) -> String {
 
     o.push_str("Nothing outside this list is served to agents. Closed proposals bind nothing.\n");
     o
+}
+
+/// A decision's `source:` is free text — a ticket id, a proposal item anchor, or anything a
+/// human typed. Whichever of those names a record the snapshot holds is labeled; the rest
+/// pass through untouched.
+fn label_source(s: &Snapshot, src: &str) -> String {
+    if let Some(id) = TicketId::parse(src)
+        .ok()
+        .filter(|i| s.tickets.contains_key(i))
+    {
+        return s.label(&id);
+    }
+    if let Some(id) = ProposalId::parse(src)
+        .ok()
+        .filter(|i| s.proposals.contains_key(i))
+    {
+        return s.label(&id);
+    }
+    src.to_string()
 }
 
 fn push_body(o: &mut String, body: Option<&str>) {

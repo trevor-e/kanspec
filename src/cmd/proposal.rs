@@ -210,7 +210,7 @@ fn short(i: &ItemRef) -> String {
 impl Render for ProposeReport {
     fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
         Line::new('▸', format!("{} created", self.title))
-            .id(&self.id)
+            .id(crate::ids::label(&self.id, &self.title))
             .dim(format!("· draft · {}", self.path))
             .fix(self.next.first().cloned().unwrap_or_default())
             .write(w, st)

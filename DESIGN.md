@@ -21,7 +21,7 @@ kanspec is a single static binary that turns a `.kanspec/` directory of plain fi
 **Components:**
 
 1. **`kanspec` (alias `ks`)** — one static Rust binary. Every command works cold, takes `--json`, and validates transitions (illegal moves are typed errors, not warnings).
-2. **The file store** — `.kanspec/` in the repo, git-tracked, one file per entity (ticket, decision, quirk, spec; one directory per proposal). Files are the only source of truth. IDs are 4-hex-char hashes (collision-free across parallel agents/worktrees).
+2. **The file store** — `.kanspec/` in the repo, git-tracked, one file per entity (ticket, decision, quirk, spec; one directory per proposal). Files are the only source of truth. IDs are 4-hex-char hashes (collision-free across parallel agents/worktrees); wherever a human reads one it wears a short title slug — `t-9c41-rate-limit-login` — that every verb ignores, the way a Reddit URL carries the post title (see *Readable ids* below).
 3. **The server** — `kanspec up` runs the same binary as a loopback-only (127.0.0.1:5757), **stateless, foreground** process serving one embedded single-page app: the board, proposal review pages, decision pages, the rules page. It fs-watches `.kanspec/` and pushes SSE, and runs a merge-detection scan every 60s while up. Kill it and nothing is lost; the CLI never needs it.
 4. **The cache** — `.kanspec/cache/` is gitignored and disposable: `gitstate.json` (last merge-detection results with method + timestamp) and an advisory lockfile. No SQLite in v0.1; glob-and-parse is fast at this scale.
 
@@ -87,6 +87,8 @@ KANSPEC-ARCHITECTURE.md  # GENERATED to the repo root — accepted decisions + s
 ```
 
 ID prefixes: `t-` tickets, `p-` proposals, `D-` decisions, `q-` quirks, `cm-` comments. Spec rules use human-named bracket IDs (`[auth.lockout]`).
+
+**Readable ids.** The four-hex key is right for merging and for citations; it is wrong as the thing a human reads. So every listing, status line, `rules`/`prime` provenance, board card and page shows a *label* — the key plus the first words of the title as a slug, `D-0174-dates-not-booleans`, `t-9c41-rate-limit-login` — and every verb accepts a label as the id: `kanspec show t-9c41-rate-limit-login` is `kanspec show t-9c41`. The slug is cosmetic, exactly like the title in a Reddit URL: nothing after the hex body is parsed, nothing is stored for it, and a title edit changes what you see without breaking anything you copied. Inside files the key stands alone — `deps:`, `source:`, ledgers, log lines, commit trailers and the `next` commands in `--json` all write `t-9c41` — so a citation never rots. Not sequential numbers, not slug-as-key, no slug lookup: `kanspec why dates` is not a thing, `kanspec why D-0174-dates` is. The label is a prefix of the branch (`ks/t-9c41-rate-limit-login…`) and proposal-directory names minted from the same title, so those parse as ids too.
 
 ### Ticket — `tickets/t-9c41.md`
 
@@ -315,7 +317,7 @@ KNOWLEDGE
 
 ```
 $ kanspec start t-9c41 --worktree
-  claimed  t-9c41  Rate-limit login endpoint          (logged: doing · claude/sess-a91)
+  claimed  t-9c41-rate-limit-login  Rate-limit login endpoint          (logged: doing · claude/sess-a91)
   branch   ks/t-9c41-rate-limit-login    worktree ../kanspec-wt/t-9c41
   context  spec auth (3 rules) · 1 decision in scope (D-8c1a) · 2 quirks match paths (q-11ba, q-83d0)
   board    http://127.0.0.1:5757/t/t-9c41
@@ -326,15 +328,15 @@ $ kanspec start t-9c41 --worktree
 ```
 $ kanspec status
  YOU (3)
-  ◈ p-7de2   3 unresolved review threads await you        → http://127.0.0.1:5757/p/p-7de2
-  ⇂ t-31aa   in main 2h (gh-pr #142 · checked 4m ago), not closed  → kanspec done t-31aa
-  ● p-19f0   settling: last ticket landed, 2 items undispositioned → kanspec close p-19f0
+  ◈ p-7de2-rate-limiting          3 unresolved review threads await you        → http://127.0.0.1:5757/p/p-7de2
+  ⇂ t-31aa-lockout-table          in main 2h (gh-pr #142 · checked 4m ago), not closed  → kanspec done t-31aa
+  ● p-19f0-captcha-retirement     settling: last ticket landed, 2 items undispositioned → kanspec close p-19f0
  AGENT (2)
-  ○ t-66d1   ready · auth · unblocked when t-31aa closed
-  ◈ p-7de2   1 answered thread awaits your resolve        → kanspec comments p-7de2 --unresolved
+  ○ t-66d1-rate-limit-login       ready · auth · unblocked when t-31aa-lockout-table closed
+  ◈ p-7de2-rate-limiting          1 answered thread awaits your resolve        → kanspec comments p-7de2 --unresolved
  WATCHING (2)
-  ◐ t-88fe   STALLED: doing, no commits or updates for 3h → kanspec park t-88fe --why "..."
-  ⚠ payments 4 merges touched src/payments/** since spec last edited → kanspec features --stale
+  ◐ t-88fe-session-rotation       STALLED: doing, no commits or updates for 3h → kanspec park t-88fe --why "..."
+  ⚠ payments                      4 merges touched src/payments/** since spec last edited → kanspec features --stale
 ```
 
 **Transcript — closing a ticket:**
@@ -348,7 +350,7 @@ Leftover triage — 1 unchecked step:
   ✓ spawned t-c412 "test concurrent same-key requests" (followup_of t-9c41)
 Knowledge check — branch touched src/auth/** (spec: auth): spec edited on this branch ✓
 Quirks discovered? [enter = none]:
-● t-9c41 done · p-7de2 is settling (last ticket landed) → kanspec close p-7de2
+● t-9c41-rate-limit-login  done · p-7de2-rate-limiting is settling (last ticket landed) → kanspec close p-7de2
 ```
 
 Non-interactive/agent form (required flags, no silent defaults): `kanspec done t-9c41 --json --spawn "test concurrent same-key requests" --no-quirks` — and `--no-followups` must be passed explicitly when there are none, so "no leftover work" is a recorded claim, never an omission.

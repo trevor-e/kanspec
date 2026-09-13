@@ -38,6 +38,11 @@ macro_rules! id_kinds {
                     }
                     None => raw,
                 };
+                // Reddit-style: `t-9c41-rate-limit-login` IS `t-9c41`. Everything after the
+                // hex body is a cosmetic slug — pasted from a listing, a branch name or a
+                // proposal directory — and is ignored, so a title edit can never break an
+                // id someone copied.
+                let body = body.split('-').next().unwrap_or(body);
                 if !crate::ids::is_id_body(body) {
                     return Err(crate::ids::bad_id(Self::NOUN, Self::PREFIX, raw));
                 }
@@ -334,6 +339,34 @@ fn fnv1a64(parts: &[&[u8]]) -> u64 {
     h
 }
 
+/// The slug budget of a display [`label`]: `t-9c41-rate-limit-login`, not the whole
+/// 40-char branch slug, so the id column stays a column. Cut at a word boundary, so a
+/// label is always a prefix of the branch / proposal-directory name minted from the same
+/// title — and `parse` accepts either.
+pub const LABEL_SLUG_MAX: usize = 20;
+
+/// The human form of an id: the key plus a short title slug — `D-0174-dates-not-booleans`.
+///
+/// Purely cosmetic. The key is the only thing stored, cited or parsed; the slug rides
+/// beside it wherever a human reads the id, the way a Reddit URL carries the post title.
+/// Every `parse` drops the slug again, so a label pastes straight into any verb.
+pub fn label(id: &impl std::fmt::Display, title: &str) -> String {
+    format!("{id}-{}", short_slug(&slug(title)))
+}
+
+/// The longest `-`-bounded prefix of a slug within [`LABEL_SLUG_MAX`]; a single word
+/// longer than the budget is cut hard rather than dropped.
+fn short_slug(full: &str) -> &str {
+    if full.len() <= LABEL_SLUG_MAX {
+        return full;
+    }
+    // `slug` is ASCII, so byte indexing is char indexing.
+    match full[..=LABEL_SLUG_MAX].rfind('-') {
+        Some(i) if i > 0 => &full[..i],
+        _ => &full[..LABEL_SLUG_MAX],
+    }
+}
+
 /// `"Rate-limit login"` -> `"rate-limit-login"`, <= 40 chars, never leading/trailing `-`.
 pub fn slug(title: &str) -> String {
     let mut out = String::with_capacity(title.len().min(40));
@@ -384,6 +417,77 @@ mod tests {
         assert!(TicketId::parse("t-zzzz").is_err());
         assert_eq!(DecisionId::parse("D-8c1a").unwrap().as_str(), "D-8c1a");
         assert_eq!(CommentId::parse("cm-88f1").unwrap().as_str(), "cm-88f1");
+    }
+
+    #[test]
+    fn parse_ignores_a_cosmetic_slug_like_a_reddit_url() {
+        assert_eq!(
+            TicketId::parse("t-9c41-rate-limit-login").unwrap().as_str(),
+            "t-9c41"
+        );
+        assert_eq!(
+            TicketId::parse("9c41-rate-limit").unwrap().as_str(),
+            "t-9c41"
+        );
+        assert_eq!(TicketId::parse("t-9c41-").unwrap().as_str(), "t-9c41");
+        // a proposal DIRECTORY name is a valid proposal id
+        assert_eq!(
+            ProposalId::parse("p-8fdb-adopting-kanspec-on-an-existing-project")
+                .unwrap()
+                .as_str(),
+            "p-8fdb"
+        );
+        assert_eq!(
+            DecisionId::parse("D-0174-dates-not-booleans")
+                .unwrap()
+                .as_str(),
+            "D-0174"
+        );
+        // the slug never rescues a bad key
+        assert!(TicketId::parse("t-9c4-rate-limit").is_err());
+        assert!(TicketId::parse("q-11ba-some-quirk").is_err());
+        assert!(TicketId::parse("t--rate-limit").is_err());
+        // a wide id keeps its whole body
+        assert_eq!(TicketId::parse("t-9c41ab-title").unwrap().body(), "9c41ab");
+    }
+
+    #[test]
+    fn label_is_key_plus_a_short_word_bounded_slug_that_parse_accepts() {
+        let id = TicketId::parse("t-9c41").unwrap();
+        assert_eq!(
+            label(&id, "Rate-limit login endpoint"),
+            "t-9c41-rate-limit-login"
+        );
+        assert_eq!(
+            label(
+                &id,
+                "Readable ids: slug beside every key, accepted by every verb"
+            ),
+            "t-9c41-readable-ids-slug"
+        );
+        assert_eq!(label(&id, "Short"), "t-9c41-short");
+        assert_eq!(label(&id, ""), "t-9c41-untitled");
+        // exactly at the budget keeps the whole word; a single over-long word is cut hard
+        assert_eq!(
+            label(&id, "abcdefghi-abcdefghij"),
+            "t-9c41-abcdefghi-abcdefghij"
+        );
+        assert_eq!(label(&id, "abcdefghij-abcdefghij"), "t-9c41-abcdefghij");
+        assert_eq!(
+            label(&id, "abcdefghijklmnopqrstuvwxyz"),
+            "t-9c41-abcdefghijklmnopqrst"
+        );
+        let d = DecisionId::parse("D-0174").unwrap();
+        assert_eq!(
+            label(&d, "Dates, not booleans"),
+            "D-0174-dates-not-booleans"
+        );
+        // the label is a prefix of the branch slug and round-trips through parse
+        let full = slug("Readable ids: slug beside every key, accepted by every verb");
+        assert!(full.starts_with("readable-ids-slug"));
+        for title in ["Rate-limit login endpoint", "x", "Ünïcode — title!"] {
+            assert_eq!(TicketId::parse(&label(&id, title)).unwrap(), id, "{title}");
+        }
     }
 
     #[test]
