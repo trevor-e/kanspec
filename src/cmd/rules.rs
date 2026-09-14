@@ -16,7 +16,7 @@ use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::out::{Color, Render, Style};
 use crate::plan::{Op, Plan};
-use crate::rulesdoc::{self, AuditWarning, RulesDoc, Scope};
+use crate::rulesdoc::{self, AuditWarning, RulesDoc, Scope, SpecBudget};
 use crate::store::Store;
 
 #[derive(Debug, Serialize)]
@@ -26,6 +26,9 @@ pub struct RulesReport {
     pub scope: Vec<String>,
     pub warnings: Vec<AuditWarning>,
     pub adopted: Vec<String>,
+    /// `--budget <spec>`: what an agent will have to read before touching that capability
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<SpecBudget>,
     /// `--audit` prints only the warnings, so the default stdout stays the injection
     /// surface byte for byte. `--adopt` does the same with its own summary — invariant 3 is
     /// about the DEFAULT stdout, and both flags return before reaching `render_text`.
@@ -37,6 +40,9 @@ pub struct RulesReport {
 
 pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
     ctx.require_initialized()?;
+    if let Some(name) = &a.budget {
+        return budget(ctx, name);
+    }
     let scope = Scope::of(&a.paths)?;
 
     // Adoption is what a MIGRATED corpus needs: an imported rule has no proposal to point
@@ -93,9 +99,72 @@ pub fn rules(ctx: &Ctx, a: &RulesArgs) -> Result<RulesReport> {
         scope: a.paths.clone(),
         warnings,
         adopted,
+        budget: None,
         audit: a.audit,
         adopt: a.adopt,
     })
+}
+
+/// `rules --budget <spec>`: the figure `review` puts under every `[tN]` (p-67f0), for a
+/// human checking it. The surface is every tracked file under the spec's `code:` globs,
+/// listed by ONE `git ls-files` so git does the matching with the semantics the rest of
+/// the tool uses; the generator is then pointed at exactly those files, so `data` is what
+/// `rules --path <each of them>` would print with the budget lifted.
+fn budget(ctx: &Ctx, name: &str) -> Result<RulesReport> {
+    let snap = ctx.snapshot()?;
+    let name = crate::ids::SpecName::parse(name)?;
+    let files = spec_files(ctx, &snap, &name)?;
+    let figure = rulesdoc::spec_budget(&snap, &name, &files)?;
+    let data = if figure.scoped && !files.is_empty() {
+        rulesdoc::build_full(&snap, &Scope::of(&files)?)
+    } else {
+        // No surface to scope by: an empty scope would be the whole corpus, which is not
+        // what this spec's agent reads. Show the spec's own rules alone.
+        let mut d = rulesdoc::build_full(&snap, &Scope::none());
+        d.decisions.clear();
+        d.quirks.clear();
+        d.spec_rules.retain(|r| r.spec == name);
+        d.elided.clear();
+        d
+    };
+    Ok(RulesReport {
+        data,
+        scope: files,
+        warnings: Vec::new(),
+        adopted: Vec::new(),
+        budget: Some(figure),
+        audit: false,
+        adopt: false,
+    })
+}
+
+/// Every tracked file under the spec's `code:` globs, or none when it names no globs.
+pub fn spec_files(
+    ctx: &Ctx,
+    snap: &crate::model::Snapshot,
+    name: &crate::ids::SpecName,
+) -> Result<Vec<String>> {
+    let Some(spec) = snap.specs.get(name) else {
+        return Ok(Vec::new());
+    };
+    if spec.fm.code.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ps: Vec<crate::git::Pathspec> = spec
+        .fm
+        .code
+        .iter()
+        .map(|g| crate::git::Pathspec::glob(g))
+        .collect();
+    let out = ctx.git.run_ps(&["ls-files", "-z"], &ps).map_err(|e| {
+        crate::error::KsError::internal(anyhow::anyhow!("cannot list tracked files: {e}"))
+    })?;
+    Ok(out
+        .out
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect())
 }
 
 /// `spec [anchor]` for every adoptable bullet — the spelling the `--adopt` summary prints.
@@ -138,6 +207,57 @@ impl Render for RulesReport {
             for x in &self.warnings {
                 writeln!(w, " ⚠ {}: {}", x.subject, x.message)?;
             }
+            return Ok(());
+        }
+
+        if let Some(b) = &self.budget {
+            // One line, the shape `review` prints under a `[tN]`: what the agent reads,
+            // then the surface it was measured on.
+            let mut line = format!(
+                " {}  reads {} rule{} ({} tokens",
+                crate::out::paint(b.spec.as_str(), Color::Cyan, st.color),
+                b.rules,
+                if b.rules == 1 { "" } else { "s" },
+                rulesdoc::tokens_short(b.tokens),
+            );
+            if b.injected_tokens != b.tokens {
+                line.push_str(&format!(
+                    ", {} under the prime budget, {} spec{} named not shown",
+                    rulesdoc::tokens_short(b.injected_tokens),
+                    b.elided,
+                    if b.elided == 1 { "" } else { "s" }
+                ));
+            }
+            line.push(')');
+            if b.decisions > 0 {
+                line.push_str(&format!(
+                    " · {} decision{}",
+                    b.decisions,
+                    if b.decisions == 1 { "" } else { "s" }
+                ));
+            }
+            if b.quirks > 0 {
+                line.push_str(&format!(
+                    " · {} quirk{}",
+                    b.quirks,
+                    if b.quirks == 1 { "" } else { "s" }
+                ));
+            }
+            if !b.scoped {
+                line.push_str(" · surface unknown — spec names no code");
+            } else {
+                line.push_str(&format!(
+                    " · surface {} file{}",
+                    b.files,
+                    if b.files == 1 { "" } else { "s" }
+                ));
+            }
+            writeln!(w, "{line}")?;
+            writeln!(
+                w,
+                " {} what the agent reads before touching this capability — never an estimate of the work",
+                crate::out::paint("note", Color::Cyan, st.color)
+            )?;
             return Ok(());
         }
 

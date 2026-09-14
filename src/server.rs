@@ -325,6 +325,7 @@ async fn api_rules(State(st): State<AppState>) -> ApiResult<crate::cmd::rules::R
                 audit: false,
                 adopt: false,
                 full: false,
+                budget: None,
             },
         )
     })
