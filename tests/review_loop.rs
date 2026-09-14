@@ -133,7 +133,10 @@ fn propose_pre_mints_one_ticket_placeholder_per_capability() {
     let src = repo.read(&format!(".kanspec/proposals/{none}/proposal.md"));
     assert!(src.contains("## Tickets\n"), "{src}");
     assert!(src.contains("- [t1] \n"), "{src}");
-    assert!(!src.contains("- [t1] (spec:"), "no capability, no spec on the placeholder:\n{src}");
+    assert!(
+        !src.contains("- [t1] (spec:"),
+        "no capability, no spec on the placeholder:\n{src}"
+    );
     assert!(src.contains("One ticket is one PR is one session"), "{src}");
 }
 
@@ -748,6 +751,175 @@ fn sub_bullets_under_a_ticket_item_mint_as_its_steps() {
     ));
     let steps: Vec<&str> = t.lines().filter(|l| l.starts_with("- [ ] ")).collect();
     assert_eq!(steps, ["- [ ] first", "- [ ] second"]);
+}
+
+/// p-67f0 c2: an oversized cut is flagged with the cut named — by capability, by change,
+/// by subtree — on `review`, `approve`, the page and `--json`; a `[cN]` no ticket
+/// implements is flagged too; and nothing blocks, because approving over a flag is the
+/// recorded waiver.
+#[test]
+fn an_oversized_cut_is_flagged_with_the_cut_named_and_blocks_nothing() {
+    let repo = TestRepo::new();
+    repo.ks([
+        "spec",
+        "new",
+        "auth",
+        "--feature",
+        "Login",
+        "--code",
+        "src/auth/**",
+    ])
+    .ok();
+    repo.ks([
+        "spec",
+        "new",
+        "billing",
+        "--feature",
+        "Charges",
+        "--code",
+        "src/billing/**",
+    ])
+    .ok();
+    repo.write("src/auth/lockout/counter.rs", &"x\n".repeat(30));
+    repo.write("src/auth/session/mw.rs", &"x\n".repeat(30));
+    repo.commit("code");
+    // Thresholds low enough for a fixture to cross.
+    let cfg = repo.read(".kanspec/config.toml");
+    repo.write(
+        ".kanspec/config.toml",
+        &format!("{cfg}\n[review]\nsurface_lines_max = 50\nchanges_max = 2\n"),
+    );
+    repo.ks(["propose", "Wide", "--spec", "auth", "--spec", "billing"])
+        .ok();
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] auth: lockout\n- [c2] auth: session\n- [c3] billing: retries\n- [c4] auth: nobody implements this\n\n## Prescriptions\n\n## Tickets\n- [t1] (spec: auth) Everything · L · implements: c1, c2, c3\n- [t2] (spec: billing) Fine · S\n",
+    );
+
+    let out: serde_json::Value = repo.json(&["review", id]);
+    let t1 = &out["budgets"][0];
+    let kinds: Vec<&str> = t1["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        ["capabilities", "changes", "surface", "size"],
+        "{t1}"
+    );
+    let texts: Vec<String> = t1["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            format!(
+                "{} → {}",
+                f["why"].as_str().unwrap(),
+                f["cut"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(
+        texts[0].contains("c1, c2 (auth) and c3 (billing)"),
+        "{}",
+        texts[0]
+    );
+    assert!(
+        texts[0].contains("one ticket per capability: auth (c1, c2), billing (c3)"),
+        "{}",
+        texts[0]
+    );
+    assert!(
+        texts[1].contains(
+            "implements 3 changes, over changes_max 2 → one ticket per change: c1, c2, c3"
+        ),
+        "{}",
+        texts[1]
+    );
+    assert!(
+        texts[2].contains("surface 61 lines, over surface_lines_max 50"),
+        "{}",
+        texts[2]
+    );
+    assert!(
+        texts[2].contains("one ticket per subtree: src/auth/lockout/**, src/auth/session/**"),
+        "{}",
+        texts[2]
+    );
+    assert!(texts[3].contains("sized L → cut again"), "{}", texts[3]);
+    // t2 crossed nothing — billing has no tracked file and one change at most.
+    assert!(
+        out["budgets"][1]["flags"].as_array().unwrap().is_empty(),
+        "{}",
+        out["budgets"][1]
+    );
+    // c4 has no ticket behind it.
+    assert_eq!(out["unimplemented"].as_array().unwrap().len(), 1);
+    assert!(
+        out["unimplemented"][0]["why"]
+            .as_str()
+            .unwrap()
+            .starts_with("c4:"),
+        "{out}"
+    );
+
+    let human = repo.ks(["review", id]).ok().stdout;
+    assert!(human.contains("⚠ t1 implements"), "{human}");
+    assert!(human.contains("⚠ c4: no ticket implements it"), "{human}");
+
+    // The page: item flags on the ticket, the unimplemented flag on the change's own card.
+    let ctx = common::ctx_at(&repo.root);
+    let model = kanspec::cmd::proposal::page(&ctx, id).expect("the page assembles");
+    let t1 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 't' && i.id.n == 1)
+        .unwrap();
+    assert_eq!(t1.budget.as_ref().unwrap().flags.len(), 4);
+    let c4 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 'c' && i.id.n == 4)
+        .unwrap();
+    assert_eq!(c4.flags.len(), 1);
+    let c1 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 'c' && i.id.n == 1)
+        .unwrap();
+    assert!(c1.flags.is_empty());
+
+    // Nothing blocks: approve goes through and records what it was approved over.
+    let out: serde_json::Value = repo.json(&["approve", id]);
+    assert_eq!(out["status"], "approved");
+    assert_eq!(out["budgets"][0]["flags"].as_array().unwrap().len(), 4);
+    assert_eq!(out["unimplemented"].as_array().unwrap().len(), 1);
+
+    // A ticket within every threshold has no flags at all, so the quiet case is quiet.
+    repo.ks(["propose", "Narrow", "--spec", "auth"]).ok();
+    let dir = repo.root.join(".kanspec/proposals");
+    let narrow = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.contains("narrow"))
+        .unwrap();
+    body(
+        &repo,
+        &narrow,
+        "## Why\nwhy\n\n## Changes\n- [c1] auth: lockout in `src/auth/lockout`\n\n## Prescriptions\n\n## Tickets\n- [t1] (spec: auth) Lockout · S · implements: c1\n",
+    );
+    let out: serde_json::Value = repo.json(&["review", &narrow[..6]]);
+    assert!(
+        out["budgets"][0]["flags"].as_array().unwrap().is_empty(),
+        "{out}"
+    );
+    assert!(out["unimplemented"].as_array().unwrap().is_empty());
 }
 
 /// `abandon` makes no claim that anything was dispositioned, so it must never stamp a

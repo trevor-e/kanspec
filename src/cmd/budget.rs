@@ -48,6 +48,29 @@ pub struct ItemBudget {
     pub steps: usize,
     /// the one line every surface prints, so they cannot drift
     pub line: String,
+    /// why this cut is worth looking at again, each naming the cut kanspec can see —
+    /// empty when nothing crossed a `[review]` threshold (p-67f0 c2)
+    pub flags: Vec<Flag>,
+}
+
+/// One reason a `[tN]` is flagged, with the cut named. A flag is a threshold crossed on
+/// something the budget line already shows; it is never an estimate of the work and it
+/// blocks nothing.
+#[derive(Debug, Clone, Serialize)]
+pub struct Flag {
+    /// `capabilities` | `rules` | `surface` | `changes` | `size` | `unimplemented`
+    pub kind: &'static str,
+    /// what crossed the line, in the budget line's own words
+    pub why: String,
+    /// the cut, as a command-shaped suggestion
+    pub cut: String,
+}
+
+impl Flag {
+    /// `implements 4 changes, over changes_max 3 → one ticket per change: c1, c2, c3, c4`
+    pub fn text(&self) -> String {
+        format!("{} → {}", self.why, self.cut)
+    }
 }
 
 /// The budget line for every `[tN]` of `p`, in item order.
@@ -81,9 +104,213 @@ pub fn for_proposal(ctx: &Ctx, s: &Snapshot, p: &Proposal) -> Result<Vec<ItemBud
                 if b.steps == 1 { "" } else { "s" }
             ));
         }
+        b.flags = flags_for(&s.cfg.review, p, &bullet.changes, &b, &files_of(ctx, s, &b));
         out.push(b);
     }
     Ok(out)
+}
+
+/// The surface files again, for the subtree cut — listed once more rather than threaded
+/// through `for_item`, because only a flagged surface ever needs them.
+fn files_of(ctx: &Ctx, s: &Snapshot, b: &ItemBudget) -> Vec<String> {
+    match (&b.spec, &b.surface) {
+        (Some(name), Some(_)) => super::rules::spec_files(ctx, s, name).unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `[cN]` that no `[tN]` implements — a change with no work behind it. Reported beside
+/// the item flags by `review` and `approve` and as a badge on the change's own card.
+pub fn unimplemented(p: &Proposal) -> Vec<Flag> {
+    let implemented: Vec<String> = p
+        .items
+        .iter()
+        .filter(|i| i.id.kind == crate::ids::ItemKind::Ticket)
+        .flat_map(|i| super::proposal::split_ticket_bullet(&i.text).changes)
+        .collect();
+    p.items
+        .iter()
+        .filter(|i| i.id.kind == crate::ids::ItemKind::Change)
+        .map(|i| format!("{}{}", i.id.kind.letter(), i.id.n))
+        .filter(|tag| !implemented.contains(tag))
+        .map(|tag| Flag {
+            kind: "unimplemented",
+            why: format!("{tag}: no ticket implements it"),
+            cut: format!(
+                "add a [tN] · implements: {tag}, or say in the bullet why no ticket is needed"
+            ),
+        })
+        .collect()
+}
+
+/// Every threshold a `[tN]` crossed, each with the cut named (p-67f0 c2).
+fn flags_for(
+    cfg: &crate::config::ReviewCfg,
+    p: &Proposal,
+    changes: &[String],
+    b: &ItemBudget,
+    files: &[String],
+) -> Vec<Flag> {
+    let mut out = Vec::new();
+
+    // By capability: the changes this ticket implements live under more than one spec.
+    let groups = changes_by_spec(p, changes);
+    if groups.len() > 1 {
+        out.push(Flag {
+            kind: "capabilities",
+            why: format!(
+                "{} implements {}",
+                b.item,
+                groups
+                    .iter()
+                    .map(|(spec, cs)| format!("{} ({spec})", cs.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+            cut: format!(
+                "one ticket per capability: {}",
+                groups
+                    .iter()
+                    .map(|(spec, cs)| format!("{spec} ({})", cs.join(", ")))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+    }
+
+    // By change: more changes than one ticket should carry.
+    if cfg.changes_max > 0 && changes.len() > cfg.changes_max {
+        out.push(Flag {
+            kind: "changes",
+            why: format!(
+                "implements {} changes, over changes_max {}",
+                changes.len(),
+                cfg.changes_max
+            ),
+            cut: format!("one ticket per change: {}", changes.join(", ")),
+        });
+    }
+
+    // The reading list: more rules than the prime budget would even show.
+    if let Some(r) = &b.reads {
+        if cfg.rules_tokens_max > 0 && r.tokens > cfg.rules_tokens_max {
+            out.push(Flag {
+                kind: "rules",
+                why: format!(
+                    "reads {} tokens of rules, over rules_tokens_max {}",
+                    rulesdoc::tokens_short(r.tokens),
+                    cfg.rules_tokens_max
+                ),
+                cut: if changes.len() > 1 {
+                    format!("one ticket per change: {}", changes.join(", "))
+                } else {
+                    "name the paths the change touches in backticks, so the surface and its specs narrow".to_string()
+                },
+            });
+        }
+    }
+
+    // The surface: by glob subtree when the spec's files split cleanly, else by path.
+    if let Some(sf) = &b.surface {
+        if cfg.surface_lines_max > 0 && sf.lines > cfg.surface_lines_max {
+            let subtrees = subtrees(files);
+            out.push(Flag {
+                kind: "surface",
+                why: format!(
+                    "surface {} lines, over surface_lines_max {}",
+                    lines_short(sf.lines),
+                    cfg.surface_lines_max
+                ),
+                cut: if !subtrees.is_empty() {
+                    format!("one ticket per subtree: {}", subtrees.join(", "))
+                } else if b.narrowed_to.is_empty() {
+                    "name the paths the change touches in backticks, so the surface narrows to them"
+                        .to_string()
+                } else {
+                    "cut the named paths into more than one ticket".to_string()
+                },
+            });
+        }
+    }
+
+    // The author's own word for it.
+    if matches!(b.size.as_deref(), Some("L") | Some("XL")) {
+        out.push(Flag {
+            kind: "size",
+            why: format!("sized {}", b.size.as_deref().unwrap_or("L")),
+            cut: "cut again — an L is more than one session".to_string(),
+        });
+    }
+    out
+}
+
+/// The ticket's changes grouped by the spec each one opens with (`- [c1] auth: …`), in
+/// first-seen order; a change naming no spec of the proposal's counts under `?`.
+pub fn changes_by_spec(p: &Proposal, changes: &[String]) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for tag in changes {
+        let spec = p
+            .items
+            .iter()
+            .find(|i| format!("{}{}", i.id.kind.letter(), i.id.n) == *tag)
+            .and_then(|c| c.text.split_once(':').map(|(h, _)| h.trim().to_string()))
+            .filter(|h| p.fm.specs.iter().any(|s| s.as_str() == h))
+            .unwrap_or_else(|| "?".to_string());
+        match groups.iter_mut().find(|(s, _)| *s == spec) {
+            Some((_, cs)) => cs.push(tag.clone()),
+            None => groups.push((spec, vec![tag.clone()])),
+        }
+    }
+    groups
+}
+
+/// The subtrees a surface splits into: the deepest directory prefix all files share,
+/// then one glob per child DIRECTORY under it — `src/auth/lockout/**, src/auth/session/**`.
+/// Loose files at that level are not subtrees and are not listed; fewer than two globs is
+/// no clean split at all, and the cut is then to name paths rather than to split.
+pub fn subtrees(files: &[String]) -> Vec<String> {
+    if files.len() < 2 {
+        return Vec::new();
+    }
+    let split: Vec<Vec<&str>> = files.iter().map(|f| f.split('/').collect()).collect();
+    let mut common = 0usize;
+    loop {
+        let Some(seg) = split[0].get(common) else {
+            break;
+        };
+        // A prefix must be a directory of every file, never a file's own name.
+        if split
+            .iter()
+            .all(|p| p.len() > common + 1 && p[common] == *seg)
+        {
+            common += 1;
+        } else {
+            break;
+        }
+    }
+    let prefix = split[0][..common].join("/");
+    let mut out: Vec<String> = Vec::new();
+    for p in &split {
+        if p.len() <= common + 1 {
+            continue;
+        }
+        let entry = format!(
+            "{}{}/**",
+            if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}/")
+            },
+            p[common]
+        );
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    if out.len() < 2 {
+        out.clear();
+    }
+    out
 }
 
 fn for_item(
@@ -103,6 +330,7 @@ fn for_item(
             narrowed_to: Vec::new(),
             size: None,
             steps: 0,
+            flags: Vec::new(),
         });
     };
     if !s.specs.contains_key(&name) {
@@ -115,6 +343,7 @@ fn for_item(
             narrowed_to: Vec::new(),
             size: None,
             steps: 0,
+            flags: Vec::new(),
         });
     }
     let files = super::rules::spec_files(ctx, s, &name)?;
@@ -155,6 +384,7 @@ fn for_item(
         narrowed_to,
         size: None,
         steps: 0,
+        flags: Vec::new(),
         line,
     })
 }
@@ -299,6 +529,37 @@ mod tests {
         let (c, n) = narrow(&files(), &[]);
         assert_eq!(c, files());
         assert!(n.is_empty());
+    }
+
+    #[test]
+    fn a_surface_splits_into_subtrees_under_its_common_directory() {
+        let files: Vec<String> = [
+            "src/auth/lockout/counter.rs",
+            "src/auth/lockout/window.rs",
+            "src/auth/session/mw.rs",
+            "src/auth/mod.rs",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            subtrees(&files),
+            ["src/auth/lockout/**", "src/auth/session/**"],
+            "loose files are not subtrees"
+        );
+        // Everything in one directory: no clean split, so no cut by subtree.
+        let flat: Vec<String> = ["src/a.rs", "src/b.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(subtrees(&flat).is_empty());
+        // One directory and a loose file: one glob is not a split either.
+        let one: Vec<String> = ["src/cmd/a.rs", "src/cmd/b.rs", "src/x.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(subtrees(&one).is_empty());
+        assert!(subtrees(&files[..1]).is_empty());
     }
 
     #[test]
