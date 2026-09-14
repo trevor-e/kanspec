@@ -314,9 +314,25 @@ fn parse_rules(body: &str) -> Vec<Rule> {
 /// Every prescription is typed; an untyped one is a `doctor` warning and a close blocker,
 /// which is why [`Prescription::Untyped`] is a value rather than a parse failure.
 fn parse_items(pid: &ProposalId, body: &str) -> Vec<Item> {
-    let mut out = Vec::new();
+    let mut out: Vec<Item> = Vec::new();
+    // An item's sub-bullets are the INDENTED `- ` lines directly under it; the first
+    // unindented line ends them, so prose between items never reads as a step.
+    let mut open = false;
     for raw in body.lines() {
         let t = raw.trim();
+        let indented = raw.starts_with(' ') || raw.starts_with('\t');
+        if open && indented {
+            if let Some(step) = t.strip_prefix("- ") {
+                let step = step.trim();
+                if !step.is_empty() && !step.starts_with('[') {
+                    if let Some(last) = out.last_mut() {
+                        last.steps.push(step.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        open = false;
         let Some(rest) = t.strip_prefix("- [") else {
             continue;
         };
@@ -333,7 +349,9 @@ fn parse_items(pid: &ProposalId, body: &str) -> Vec<Item> {
             id,
             text,
             prescription,
+            steps: Vec::new(),
         });
+        open = true;
     }
     out
 }
@@ -1074,6 +1092,45 @@ mod tests {
         assert!(matches!(items[4].prescription, Some(Prescription::Untyped)));
         // A change item is not a prescription at all.
         assert!(items[0].prescription.is_none());
+    }
+
+    /// p-67f0 c4: the indented `- ` lines directly under an item are its sub-bullets — a
+    /// `[tN]`'s steps-to-be. Prose between items, a blank line, or an unindented bullet
+    /// ends them, so nothing an author wrote as commentary reads as a step.
+    #[test]
+    fn indented_sub_bullets_under_an_item_are_its_steps() {
+        let pid = ProposalId::parse("p-7de2").unwrap();
+        let body = "## Changes
+- [c1] auth: lockout
+  - not a step of a change? it is still parsed, the minter just ignores it
+
+## Tickets
+- [t1] Rate-limit login endpoint · S · implements: c1
+  - lockout counter in Redis
+    - a deeper bullet is one step, not a nested one
+  - 429 + Retry-After on lock
+  - [ ] a checkbox someone typed is still a step
+- [t2] A ticket with none
+t3 lands after t1.
+- [t3] Another
+  - its only step
+";
+        let items = parse_items(&pid, body);
+        assert_eq!(
+            items[0].steps,
+            ["not a step of a change? it is still parsed, the minter just ignores it"]
+        );
+        assert_eq!(
+            items[1].steps,
+            [
+                "lockout counter in Redis",
+                "a deeper bullet is one step, not a nested one",
+                "429 + Retry-After on lock",
+            ],
+            "a `- [ ]` sub-bullet is skipped: its bracket would read as an anchor"
+        );
+        assert!(items[2].steps.is_empty(), "prose after it is not a step");
+        assert_eq!(items[3].steps, ["its only step"]);
     }
 
     #[test]

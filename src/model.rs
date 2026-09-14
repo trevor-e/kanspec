@@ -275,6 +275,10 @@ pub struct Item {
     pub id: ItemRef,
     pub text: String,
     pub prescription: Option<Prescription>,
+    /// the indented `- ` sub-bullets under the item, in file order — for a `[tN]` these
+    /// are minted as the ticket's `## Steps` at approve (p-67f0 c4)
+    #[serde(default)]
+    pub steps: Vec<String>,
 }
 
 /// Every prescription is typed: `(temp until t-x)` dies when its guard ticket lands;

@@ -433,14 +433,22 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     // title; the rest is the DESIGN.md `· S · deps: t-31aa` tail, which `new` already
     // knows how to take as flags. The spec is the bullet's own `(spec: x)`, else the spec
     // of the `[cN]` it names, else the proposal's first (t-85de).
-    let wanted: Vec<(ItemRef, String, Vec<String>, Option<String>)> = p
+    let wanted: Vec<(ItemRef, String, Vec<String>, Option<String>, Vec<String>)> = p
         .items
         .iter()
         .filter(|i| i.id.kind == crate::ids::ItemKind::Ticket)
         .map(|i| {
             let bullet = split_ticket_bullet(&i.text);
             let spec = ticket_spec(p, &bullet);
-            (i.id.clone(), bullet.title, bullet.deps, spec)
+            // The sub-bullets under the item are the ticket's steps (p-67f0 c4): the
+            // list `done` later triages, written by the author who cut the ticket.
+            (
+                i.id.clone(),
+                bullet.title,
+                bullet.deps,
+                spec,
+                i.steps.clone(),
+            )
         })
         .collect();
 
@@ -474,7 +482,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
             let f = ctx.facts();
-            for (anchor, title, deps, spec) in &wanted {
+            for (anchor, title, deps, spec, steps) in &wanted {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
                     spec: spec.clone(),
@@ -485,6 +493,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
                     // An approval is not a session standing on a ticket, so there is no
                     // `discovered_in` to stamp — these tickets come from the proposal.
                     no_link: true,
+                    steps: steps.clone(),
                 };
                 let sub = crate::cmd::ticket::plan_new(sn, &f, &args, m, None)?;
                 absorb(&mut plan, sub, &mut ledger, anchor, "minted");
@@ -537,6 +546,9 @@ pub(crate) struct TicketBullet {
     pub(crate) spec: Option<String>,
     /// the `[cN]` tags the bullet says it implements: `· implements: c1, c2` or `· c1`
     pub(crate) changes: Vec<String>,
+    /// the `· S ·` estimate segment, upper-cased: XS, S, M, L or XL — read for the budget
+    /// line and its flags, never stored on the ticket (p-67f0 c4)
+    pub(crate) size: Option<String>,
 }
 
 /// `(spec: playbooks) Rate-limit login endpoint · S · deps: t-31aa · implements: c1`
@@ -575,12 +587,22 @@ pub(crate) fn split_ticket_bullet(text: &str) -> TicketBullet {
                 let items = list(seg);
                 if !items.is_empty() && items.iter().all(|i| is_change_tag(i)) {
                     b.changes.extend(items);
+                } else if is_size(seg) {
+                    b.size = Some(seg.to_ascii_uppercase());
                 }
             }
         }
     }
     b.title = title.to_string();
     b
+}
+
+/// `S`, `xl` — a t-shirt estimate segment.
+fn is_size(s: &str) -> bool {
+    matches!(
+        s.to_ascii_uppercase().as_str(),
+        "XS" | "S" | "M" | "L" | "XL"
+    )
 }
 
 /// `c1`, `c12` — a change anchor's tag, without its proposal.
@@ -936,6 +958,7 @@ pub fn close(ctx: &Ctx, a: &CloseArgs) -> Result<CloseReport> {
                 followup_of: None,
                 from: None,
                 no_link: true,
+                steps: Vec::new(),
             };
             let sub = crate::cmd::ticket::plan_new(sn, &f, &args, m, None)?;
             absorb(&mut plan, sub, &mut ledger, item, "followup");
@@ -1148,6 +1171,8 @@ pub struct PageItem {
     /// a `[tN]` item's context budget — what the ticket will have to read (p-67f0)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub budget: Option<crate::cmd::budget::ItemBudget>,
+    /// the item's indented sub-bullets — a `[tN]`'s steps-to-be
+    pub steps: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1220,6 +1245,7 @@ pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
                 ticket: ticket_of(&i.id),
                 dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
                 budget,
+                steps: i.steps.clone(),
                 id: i.id.clone(),
             }
         })

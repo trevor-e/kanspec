@@ -154,6 +154,7 @@ pub fn plan_new(
         discovered_in,
         created: f.at,
         genesis: &genesis,
+        steps: &a.steps,
     });
 
     let mut plan = Plan::empty();
@@ -178,6 +179,8 @@ pub(crate) struct TicketScaffold<'a> {
     pub discovered_in: Option<&'a TicketId>,
     pub created: DateTime<Utc>,
     pub genesis: &'a LogEntry,
+    /// unchecked `- [ ]` lines under `## Steps`, in order
+    pub steps: &'a [String],
 }
 
 /// The DESIGN.md ticket, in `keys::TICKET_ORDER`, with every value emitted by `fm::emit` so
@@ -219,8 +222,15 @@ pub(crate) fn scaffold(t: &TicketScaffold<'_>) -> String {
         Yv::s(t.created.to_rfc3339_opts(SecondsFormat::Secs, true)),
     );
 
+    let mut steps = String::new();
+    for s in t.steps {
+        let s = s.trim();
+        if !s.is_empty() {
+            steps.push_str(&format!("- [ ] {s}\n"));
+        }
+    }
     format!(
-        "---\n{fm}---\n{title}\n\n{STEPS_HEADING}\n\n{LOG_HEADING}\n{log}\n",
+        "---\n{fm}---\n{title}\n\n{STEPS_HEADING}\n{steps}\n{LOG_HEADING}\n{log}\n",
         title = t.title,
         log = t.genesis.format(),
     )
