@@ -487,6 +487,127 @@ fn the_review_page_carries_the_threads_the_badges_and_the_spec_as_it_stands() {
         .any(|r| r.anchor == "auth.jwt"));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The context budget under every [tN] (p-67f0 c1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every `[tN]` carries what it will have to read — rules in scope and the code under its
+/// spec's globs — derived at read time, on `review`, `approve`, the page and `--json`;
+/// a `[cN]` that names a path in backticks narrows the surface to it; a spec with no
+/// `code:` says the surface is unknown rather than guessing.
+#[test]
+fn every_ticket_item_shows_what_it_will_have_to_read() {
+    let repo = TestRepo::new();
+    repo.ks([
+        "spec",
+        "new",
+        "auth",
+        "--feature",
+        "Login",
+        "--code",
+        "src/auth/**",
+    ])
+    .ok();
+    repo.ks(["spec", "new", "docs", "--feature", "The handbook"])
+        .ok();
+    let spec = repo.read(".kanspec/specs/auth.md");
+    repo.write(
+        ".kanspec/specs/auth.md",
+        &format!("{spec}- [auth.jwt] Login issues a JWT valid 24h. {{p-0001}}\n"),
+    );
+    repo.write("src/auth/lockout.rs", "a\nb\nc\n");
+    repo.write("src/auth/session.rs", "a\nb\n");
+    repo.commit("auth code");
+    repo.ks([
+        "propose",
+        "Login rate limiting",
+        "--spec",
+        "auth",
+        "--spec",
+        "docs",
+    ])
+    .ok();
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] auth: lockout counter in `src/auth/lockout.rs`\n- [c2] auth: the session middleware\n- [c3] docs: the handbook page\n\n## Prescriptions\n\n## Tickets\n- [t1] (spec: auth) The lockout · S · implements: c1\n- [t2] (spec: auth) The middleware · M · implements: c2\n- [t3] (spec: docs) The handbook · S · implements: c3\n",
+    );
+
+    let out: serde_json::Value = repo.json(&["review", id]);
+    let b = out["budgets"].as_array().expect("one budget per [tN]");
+    assert_eq!(b.len(), 3);
+
+    // t1: its change names a file, so the surface is that file alone — and the reading
+    // list is still the whole capability's, because rules are per spec, not per file.
+    assert_eq!(b[0]["item"], "t1");
+    assert_eq!(b[0]["spec"], "auth");
+    assert_eq!(b[0]["reads"]["rules"], 1);
+    assert_eq!(b[0]["surface"]["files"], 1);
+    assert_eq!(b[0]["surface"]["lines"], 3);
+    assert_eq!(b[0]["narrowed_to"][0], "src/auth/lockout.rs");
+    let line = b[0]["line"].as_str().unwrap();
+    assert!(line.contains("reads 1 rule"), "{line}");
+    assert!(
+        line.contains("surface 1 file, 3 lines under src/auth/lockout.rs"),
+        "{line}"
+    );
+
+    // t2: nothing named, so the whole spec surface — the template's own
+    // `src/auth/login.ts` included, because the surface is what is TRACKED under the globs.
+    let template_lines = repo.read("src/auth/login.ts").matches('\n').count();
+    assert_eq!(b[1]["surface"]["files"], 3);
+    assert_eq!(b[1]["surface"]["lines"], 5 + template_lines as u64);
+    assert!(b[1]["narrowed_to"].as_array().unwrap().is_empty());
+
+    // t3: a spec with no code globs has no surface to measure, and the line says so
+    // instead of guessing.
+    assert_eq!(b[2]["spec"], "docs");
+    assert!(b[2].get("surface").is_none(), "{}", b[2]);
+    assert!(
+        b[2]["line"].as_str().unwrap().contains("surface unknown"),
+        "{}",
+        b[2]
+    );
+
+    // The human rendering carries the same lines, one per item.
+    let human = repo.ks(["review", id]).ok().stdout;
+    assert!(
+        human.contains("[t1]") && human.contains("reads 1 rule"),
+        "{human}"
+    );
+    assert!(
+        human.contains("[t3]") && human.contains("surface unknown"),
+        "{human}"
+    );
+
+    // The page carries it on the item, and nowhere else.
+    let ctx = common::ctx_at(&repo.root);
+    let model = kanspec::cmd::proposal::page(&ctx, id).expect("the page assembles");
+    let t1 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 't' && i.id.n == 1)
+        .unwrap();
+    assert_eq!(t1.budget.as_ref().unwrap().line, line);
+    assert!(model
+        .items
+        .iter()
+        .filter(|i| i.kind == 'c')
+        .all(|i| i.budget.is_none()));
+
+    // `approve` reports what the human approved over, then mints as before.
+    let out: serde_json::Value = repo.json(&["approve", id]);
+    assert_eq!(out["budgets"].as_array().unwrap().len(), 3);
+    assert_eq!(out["budgets"][0]["line"], line);
+    assert_eq!(out["minted"].as_array().unwrap().len(), 3);
+
+    // Nothing was written into the proposal: the budget is derived, never stored.
+    let src = repo.read(&format!(".kanspec/proposals/{p}/proposal.md"));
+    assert!(!src.contains("reads 1 rule"), "{src}");
+}
+
 /// `abandon` makes no claim that anything was dispositioned, so it must never stamp a
 /// ledger or move the directory — only `close` earns those.
 #[test]
