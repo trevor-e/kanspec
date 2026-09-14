@@ -433,22 +433,22 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     // title; the rest is the DESIGN.md `· S · deps: t-31aa` tail, which `new` already
     // knows how to take as flags. The spec is the bullet's own `(spec: x)`, else the spec
     // of the `[cN]` it names, else the proposal's first (t-85de).
-    let wanted: Vec<(ItemRef, String, Vec<String>, Option<String>, Vec<String>)> = p
+    let wanted: Vec<Wanted> = p
         .items
         .iter()
         .filter(|i| i.id.kind == crate::ids::ItemKind::Ticket)
         .map(|i| {
             let bullet = split_ticket_bullet(&i.text);
             let spec = ticket_spec(p, &bullet);
-            // The sub-bullets under the item are the ticket's steps (p-67f0 c4): the
-            // list `done` later triages, written by the author who cut the ticket.
-            (
-                i.id.clone(),
-                bullet.title,
-                bullet.deps,
+            Wanted {
+                anchor: i.id.clone(),
+                title: bullet.title,
+                deps: bullet.deps,
                 spec,
-                i.steps.clone(),
-            )
+                // The sub-bullets under the item are the ticket's steps (p-67f0 c4): the
+                // list `done` later triages, written by the author who cut the ticket.
+                steps: i.steps.clone(),
+            }
         })
         .collect();
 
@@ -482,7 +482,14 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         let mut ledger = p.fm.ledger.clone();
         if already == 0 {
             let f = ctx.facts();
-            for (anchor, title, deps, spec, steps) in &wanted {
+            for Wanted {
+                anchor,
+                title,
+                deps,
+                spec,
+                steps,
+            } in &wanted
+            {
                 let args = crate::cli::NewArgs {
                     title: title.clone(),
                     spec: spec.clone(),
@@ -528,6 +535,15 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         budgets,
         id,
     })
+}
+
+/// A `[tN]` as `approve` mints it: the anchor for the ledger and the `new` it becomes.
+struct Wanted {
+    anchor: ItemRef,
+    title: String,
+    deps: Vec<String>,
+    spec: Option<String>,
+    steps: Vec<String>,
 }
 
 fn stamp_tail(p: &Proposal) -> String {
