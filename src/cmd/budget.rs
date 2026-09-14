@@ -274,19 +274,15 @@ pub fn subtrees(files: &[String]) -> Vec<String> {
     }
     let split: Vec<Vec<&str>> = files.iter().map(|f| f.split('/').collect()).collect();
     let mut common = 0usize;
-    loop {
-        let Some(seg) = split[0].get(common) else {
-            break;
-        };
-        // A prefix must be a directory of every file, never a file's own name.
-        if split
+    // A prefix must be a directory of every file, never a file's own name.
+    while let Some(seg) = split[0].get(common) {
+        if !split
             .iter()
             .all(|p| p.len() > common + 1 && p[common] == *seg)
         {
-            common += 1;
-        } else {
             break;
         }
+        common += 1;
     }
     let prefix = split[0][..common].join("/");
     let mut out: Vec<String> = Vec::new();
