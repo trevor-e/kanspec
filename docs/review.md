@@ -23,6 +23,56 @@ The bracket ids are **visible text on purpose**. They are the comment anchors, t
 disposition keys at close, and the merge keys when two people edit the same page — an
 invisible HTML comment an LLM has to remember to preserve is not any of those things.
 
+## Cutting the tickets
+
+**One ticket is one PR is one session:** one capability, a handful of steps, sized S or M.
+An L is a ticket to cut again. The scaffold already cuts along the capability — one
+`[tN] (spec: x)` placeholder per `--spec` — because the capability is the unit whose rules
+`prime` injects and whose `code:` globs the diff maps to, so a one-capability ticket pays
+for one spec's rules and no other's.
+
+```
+- [t1] (spec: auth) Rate-limit login endpoint · S · implements: c1
+  - lockout counter in Redis, sliding window
+  - 429 + Retry-After on lock
+  - test: two concurrent requests, same key
+```
+
+The indented sub-bullets are the ticket's steps: `approve` mints them as its unchecked
+`## Steps`, the list `done` later triages. The `· S ·` estimate is read for the review
+line and never stored. A bare `[tN] title` is still a valid item.
+
+**kanspec annotates the cut; you write nothing extra.** `review` and `approve` print one
+line under every `[tN]`, and the page shows the same line on the card:
+
+```
+[t1] auth · reads 12 rules (~0.9k tokens) · 1 decision · surface 9 files, 1.8k lines under src/auth/lockout.rs · 3 steps
+```
+
+That is what the ticket will have to **read** before writing a line — the standing rules
+in scope for its capability, from the same generator `prime` spends, and the code under
+the spec's globs, narrowed to the paths its `[cN]` bullets name in backticks. It is derived
+from the store and the tree at read time and never written into the proposal. It is **not**
+an estimate of the work: kanspec never guesses how many tokens a ticket will take, and a
+spec that names no `code:` gets `surface unknown` rather than a number.
+
+A cut worth looking at again is **flagged, with the cut named**, and nothing blocks:
+
+```
+[t1] auth · reads 6 rules (~455 tokens) · surface 8 files, 8.9k lines · size L
+     ⚠ t1 implements c1, c2 (auth) and c3 (billing) → one ticket per capability: auth (c1, c2), billing (c3)
+     ⚠ surface 8.9k lines, over surface_lines_max 4000 → one ticket per subtree: src/auth/lockout/**, src/auth/session/**
+     ⚠ sized L → cut again — an L is more than one session
+⚠ c4: no ticket implements it → add a [tN] · implements: c4, or say in the bullet why no ticket is needed
+```
+
+The thresholds are `[review] rules_tokens_max`, `surface_lines_max` and `changes_max` in
+`config.toml`; a change spanning capabilities, an `L`, and a `[cN]` no ticket implements
+are flagged regardless. The human approving over a flag is the recorded waiver, exactly as
+resolving a thread themselves is — the flag is advice with evidence, not a gate. To make a
+surface flag go quiet, name the paths the change touches in backticks: the surface narrows
+to them, and so does the flag.
+
 ## Prescriptions are the rules this proposal leaves behind
 
 A closed proposal binds nothing (Rule 1). So anything that should keep steering agents

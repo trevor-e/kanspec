@@ -122,6 +122,23 @@ Every spec past it is **named**, with its rule count and the command that shows 
 Tokens are estimated at four bytes each. `0` lifts the budget; so does `kanspec rules
 --full`, for a human checking what was named but not shown. `prime` has no such flag.
 
+## `[review]` — when a ticket cut is flagged
+
+```toml
+[review]
+rules_tokens_max  = 2000   # a [tN] whose capability reads more than this is flagged
+surface_lines_max = 4000   # ... or whose code surface is longer than this, in lines
+changes_max       = 3      # ... or that implements more [cN] than this
+```
+
+`review` and `approve` print a budget line under every `[tN]` — the rules in scope for its
+capability in tokens, and the code under its spec's globs in files and lines — and flag a
+ticket that crosses one of these, naming the cut (by capability, by change, by subtree, or
+by naming paths so the surface narrows). A ticket sized `L`, one whose changes span two
+capabilities, and a `[cN]` no ticket implements are flagged at any threshold. `0` disables
+a threshold. Nothing blocks: approving over a flag is the recorded waiver. See
+`kanspec instructions review`.
+
 ## `[hooks]`
 
 ```toml
