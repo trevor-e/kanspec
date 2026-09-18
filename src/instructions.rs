@@ -116,8 +116,10 @@ const AGENT_SNIPPET: &str = r#"## kanspec
 This repo tracks work, specs, and standing rules with kanspec. `kanspec prime` is auto-injected
 at session start; run it yourself if context feels missing.
 - Find work: `kanspec ready --json`. Claim before coding: `kanspec start <id>` (creates branch/worktree).
-- Diff ready: `kanspec ship <id> --pr <n>`. Finish: `kanspec done <id>` — it will gate you; answer its flags.
-- Never state whether something is merged. Merge state is git-detected; report `kanspec show <id>` output.
+- Diff ready: `kanspec ship <id> --pr <n>`. Finish ON THE BRANCH, before the PR merges: `kanspec done <id>`
+  records the close-out (answer its flags) and rides in the PR; landed is detected by git afterwards.
+- Never state whether something is merged: git detects it; report `kanspec show <id>` output. Name every id to a
+  human by its LABEL (`t-9c41-rate-limit-login`, never bare `t-9c41`); `kanspec show <id>` prints one for t-/p-/D-/q-.
 - Unsure what you owe, or whether you are stuck: `kanspec status` — every line names its own fix.
 - Review feedback is work, not scrollback: `kanspec comments --unresolved --json` gives
   {target, quote, body}; answer with `kanspec comment reply <cm-id> --body "..."` and close it

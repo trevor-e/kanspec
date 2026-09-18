@@ -261,7 +261,7 @@ fn a_forged_cache_claiming_a_merge_does_not_move_the_gate() {
     let ctx = ctx_at(&repo.root);
     let snap = ctx.snapshot().unwrap();
     let t = snap.ticket(&TicketId::parse(id).unwrap()).unwrap();
-    let err = scan::proof_for_done(&ctx, t)
+    let err = scan::prove_landed(&ctx, t)
         .expect_err("a forged cache row must not be able to close a ticket");
     assert_eq!(err.code(), Some("not_landed"));
 
@@ -296,7 +296,7 @@ fn a_merged_key_typed_into_a_ticket_reaches_nothing_that_decides() {
         "an unknown key is parked in `extra`, never merged into the model"
     );
     assert_eq!(
-        scan::proof_for_done(&ctx, t).err().and_then(|e| e.code()),
+        scan::prove_landed(&ctx, t).err().and_then(|e| e.code()),
         Some("not_landed"),
         "a ticket cannot assert its own merge state"
     );

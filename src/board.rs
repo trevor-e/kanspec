@@ -98,6 +98,9 @@ pub struct Card {
     /// `Badge::text(snap.now)` baked at build time — `Render` has no clock.
     pub badge_text: String,
     pub stalled_secs: Option<u64>,
+    /// `done` recorded on the branch and not yet detected on main (p-97d6): the card sits
+    /// in REVIEW wearing `closed out · awaiting merge` until a scan places it
+    pub awaiting_merge: bool,
     pub discovered_in: Option<TicketId>,
     /// `discovered_in` as a human reads it
     pub discovered_in_label: Option<String>,
@@ -297,6 +300,7 @@ fn card(snap: &Snapshot, t: &Ticket) -> Card {
             .unwrap_or(0),
         badge,
         stalled_secs: derive::stalled(snap, t).map(|d| d.as_secs()),
+        awaiting_merge: derive::awaiting_merge(snap, t),
         discovered_in_label: t.fm.discovered_in.as_ref().map(|d| snap.label(d)),
         discovered_in: t.fm.discovered_in.clone(),
         deps: t.fm.deps.clone(),
@@ -320,6 +324,9 @@ fn card_fix(snap: &Snapshot, t: &Ticket, blocked_by: &[TicketId]) -> Option<Stri
         }
         State::Doing => Some(format!("kanspec ship {id}")),
         State::Review => Some(format!("kanspec scan {id}")),
+        State::Done if derive::awaiting_merge(snap, t) => {
+            Some(format!("kanspec scan --explain {id}"))
+        }
         State::Done | State::Dropped => None,
     }
 }
@@ -970,6 +977,10 @@ pub fn render_terminal(
     Ok(())
 }
 
+/// The one wording of the p-97d6 chip, shared with the SPA (`assets/app.js` spells it
+/// identically; `tests/board.rs` pins both).
+pub const AWAITING_MERGE: &str = "closed out · awaiting merge";
+
 /// The IN-MAIN overlay outranks the stored glyph: a review ticket git says has landed is
 /// `⇂`, which is the whole point of the column it is sitting in.
 fn card_glyph(c: &Card) -> char {
@@ -1006,6 +1017,9 @@ fn card_detail(c: &Card) -> String {
     }
     if c.unresolved > 0 {
         parts.push(format!("{} threads open", c.unresolved));
+    }
+    if c.awaiting_merge {
+        parts.push(AWAITING_MERGE.to_string());
     }
     if !c.blocked_by.is_empty() {
         parts.push(format!(
@@ -1107,6 +1121,7 @@ mod tests {
             badge: Badge::Unpushed,
             badge_text: "unpushed".into(),
             stalled_secs: None,
+            awaiting_merge: false,
             discovered_in: None,
             discovered_in_label: None,
             deps: vec![],

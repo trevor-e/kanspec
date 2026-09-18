@@ -69,5 +69,16 @@ prompt, not a punishment: park it or push something.
 ## When the diff is ready
 
 `kanspec ship t-9c41 --pr 142` moves `doing -> review` and records the branch tip SHA
-**read from git**. You never type a SHA and you never claim a merge; see
-`kanspec instructions done`.
+**read from git**. You never type a SHA and you never claim a merge.
+
+Then close out **on the branch**, before the PR merges: `kanspec done t-9c41` records the
+close-out (answer its triage and knowledge flags) and the record rides in the PR. Landing
+is detected by git afterwards — the card waits in Review as `closed out · awaiting merge`
+until a scan places it. See `kanspec instructions done`.
+
+## Naming things to a human
+
+Every listing prints a **label** — the key plus a slug of the title, `t-9c41-rate-limit-login`
+— and every verb accepts one. When you name a ticket, proposal, decision or quirk to a
+person, use the label, never the bare key: `kanspec show p-7de2` prints it for any of the
+four kinds.

@@ -266,7 +266,8 @@ TICKETS
   kanspec ready [--json]              claimable queue: todo + all deps done (derived)
   kanspec start <id> [--worktree]     atomic claim -> doing; creates branch ks/<id>-slug (+ worktree), logs it
   kanspec ship <id> [--pr N]          doing -> review; records head SHA from git + PR number
-  kanspec done <id>                   close-out gate: requires git-detected merge (see lifecycle)
+  kanspec done <id>                   close-out gate: records `done` ON THE BRANCH (head from git); landed is
+                                      derived by scan, never asserted (see lifecycle)
   kanspec park <id> --why "..."       doing -> todo; explicit unclaim so nothing rots silently
   kanspec drop <id> --why "..."       any -> dropped
   kanspec show <id> | kanspec log <id> | kanspec where     (`where` = which ticket owns this branch/worktree)
@@ -350,7 +351,7 @@ Leftover triage — 1 unchecked step:
   ✓ spawned t-c412 "test concurrent same-key requests" (followup_of t-9c41)
 Knowledge check — branch touched src/auth/** (spec: auth): spec edited on this branch ✓
 Quirks discovered? [enter = none]:
-● t-9c41-rate-limit-login  done · p-7de2-rate-limiting is settling (last ticket landed) → kanspec close p-7de2
+● t-9c41-rate-limit-login  done · p-7de2-rate-limiting is settling (last ticket closed out) → kanspec close p-7de2
 ```
 
 Non-interactive/agent form (required flags, no silent defaults): `kanspec done t-9c41 --json --spawn "test concurrent same-key requests" --no-quirks` — and `--no-followups` must be passed explicitly when there are none, so "no leftover work" is a recorded claim, never an omission.
@@ -368,8 +369,10 @@ Non-interactive/agent form (required flags, no silent defaults): `kanspec done t
 This repo tracks work, specs, and standing rules with kanspec. `kanspec prime` is auto-injected
 at session start; run it yourself if context feels missing.
 - Find work: `kanspec ready --json`. Claim before coding: `kanspec start <id>` (creates branch/worktree).
-- Diff ready: `kanspec ship <id> --pr <n>`. Finish: `kanspec done <id>` — it will gate you; answer its flags.
-- Never state whether something is merged. Merge state is git-detected; report `kanspec show <id>` output.
+- Diff ready: `kanspec ship <id> --pr <n>`. Finish ON THE BRANCH, before the PR merges: `kanspec done <id>`
+  records the close-out (answer its flags) and rides in the PR; landed is detected by git afterwards.
+- Never state whether something is merged: git detects it; report `kanspec show <id>` output. Name every id to a
+  human by its LABEL (`t-9c41-rate-limit-login`, never bare `t-9c41`); `kanspec show <id>` prints one for t-/p-/D-/q-.
 - Unsure what you owe, or whether you are stuck: `kanspec status` — every line names its own fix.
 - Standing rules are `kanspec rules` output ONLY. Closed proposals bind nothing — never read
   .kanspec/proposals/closed/. Never edit an accepted decision; propose one with `kanspec decide`.
@@ -396,6 +399,7 @@ at session start; run it yourself if context feels missing.
 | `PostToolUse` (Edit/Write) | `kanspec quirks --touch <file>` | if the written file matches an active quirk's paths and it wasn't yet surfaced this session, emit a one-line warning — the landmine warning fires at the moment of touching the landmine |
 | `Stop` (installed, config-gated) | `kanspec landcheck` | exit 2 with the exact verb to run if: committed diff exists but the claimed ticket had no update this session; unresolved comments target a proposal this session edited; or `done` skipped the knowledge check. Exit 0 once clean — no loops |
 | git `post-merge` / `post-checkout` | `kanspec scan --quiet` | merge badges stay fresh with zero agent involvement |
+| git `post-merge` (first) + `pre-commit` (while `MERGE_HEAD` exists) | `kanspec regenerate --stage [--amend-merge]` | a merge commit carries `KANSPEC-*.md` regenerated from the MERGED store; paired with the `merge=kanspec` driver, so two PRs that each closed a ticket never hand a human a table to resolve |
 | git `prepare-commit-msg` + `commit-msg` (dispatching on `branch.<name>.kanspec-ticket`, set by `start`) | append `Kanspec: t-9c41` trailer | a squash-surviving merge-detection signal. **Both, not one:** `prepare-commit-msg` runs before the editor, so on an interactive commit the message is still empty and stamping it would make it non-empty — destroying git's "an empty message aborts the commit". `prepare-commit-msg` stamps only a message that already has content (`-m`/`-F`/`-t`); `commit-msg`, which runs after the editor, stamps the rest. Neither stamps twice, a merge or a squash, or below a `git commit -v` scissors line |
 
 **`kanspec prime` payload (~1.5k tokens):** (1) the standing-rules section — **byte-identical to `kanspec rules`**: accepted decisions with scope matching the branch's touched paths in full text, others as one-liners; active quirks matching those paths; the spec rules for touched capabilities, **ranked and budgeted** — the spec whose glob names the file first, then the one covering most of the touched paths, shown in that order while `[prime] spec_budget_tokens` (default 2 000) is unspent and *named* past it (`assets — 19 rules not shown … → kanspec spec show assets`), so a wide branch on a 666-rule corpus injects ~2.5k tokens instead of ~14k and nothing is hidden silently; (2) the live slice: my claimed ticket + unresolved comment count, ready-queue top 5, and the `kanspec status` anomaly lines. Path-scoped injection is the context-economy answer: an agent in `src/auth/` never pays for the billing quirks. The budget lives in the generator, so `rules --path` elides identically; `rules --full` lifts it for the human checking.
@@ -427,7 +431,7 @@ t-31aa         auth           auth · p-7de2      auth               auth
                               14m ago            STALLED 3h
 ```
 
-- **Backlog/Ready** are derived from the dependency graph (todo with/without open deps). **In main** is a derived overlay: doing/review tickets whose commits are detected on `origin/main` — awaiting `kanspec done`. **Done** means closed out *and* verified landed (or an explicit recorded `--no-code`).
+- **Backlog/Ready** are derived from the dependency graph (todo with/without open deps). **In main** is a derived overlay: doing/review tickets whose commits are detected on `origin/main` — awaiting `kanspec done`. **Done** is derived too: `state: done` *and* the ladder says landed (or a recorded `--no-code` waiver, or a `repair` attestation). A `done` ticket the scan has not detected sits in **Review** wearing `closed out · awaiting merge` — the mirror of the In-main overlay — and moves to Done the moment git says so. Wiping the cache moves such cards back to the chip, never to a wrong column.
 - **Every card:** id, title, spec chip, proposal chip, `⎇ branch`, `⌂ worktree` path, claiming agent, minutes since last update, unresolved-comment count, and the merge badge — always one of `unpushed / pushed / PR #142 open / IN MAIN (method · checked_at) / unknown (why)`. Never a guess.
 - **STALLED** renders automatically on abandoned doing cards.
 - **Tabs:** **All tasks** · **By spec** (swimlane per capability plus an "unspecced" shame lane) · **Worktrees** (one row per active branch/worktree: agent, ticket, last commit age, ahead/behind main, merge state — the many-agents-at-a-glance view) · **Review queue** (proposals in review + tickets in review, unresolved counts) · **Rules** (the `kanspec rules` page with revoke/supersede buttons) · **Proposals**.
@@ -556,7 +560,8 @@ stateDiagram-v2
     doing --> todo: park --why
     doing --> review: ship (head SHA + PR recorded from git)
     review --> doing: start (rework)
-    review --> done: done — REQUIRES git-detected merge
+    review --> done: done — records the close-out (head from git); landed is derived
+    doing --> done: done — same record, before the PR even opens
     doing --> done: done --no-code --why (chore/docs; recorded)
     todo --> dropped: drop --why
     doing --> dropped: drop --why
@@ -567,7 +572,9 @@ stateDiagram-v2
     note right of review
       scan overlays IN MAIN when commits are
       detected on origin/main (cache-only fact,
-      single writer, never stored in the ticket)
+      single writer, never stored in the ticket).
+      A `done` the scan has not placed stays in
+      the Review column: closed out · awaiting merge
     end note
 
     note left of todo
@@ -590,13 +597,15 @@ Stored states: `todo · doing · review · done · dropped`. Derived: **ready** 
 
 If signals conflict or all fail, the result is **`unknown`**, rendered as such with the reason ("squash suspected, no gh") — plus method and `checked_at` on every badge. `kanspec scan --explain t-9c41` shows the ladder's reasoning; `kanspec scan --confirm t-9c41` is the recorded human override for the genuinely ambiguous case.
 
-**What detection drives:** the In-main column and per-card badges; eligibility of `(temp until ...)` prescriptions for auto-expire; dependency satisfaction in `ready`; the `done` gate; the settling flag on proposals; and `status` anomalies (in-main-but-not-closed, done-but... cannot exist except via recorded `--no-code`).
+**What detection drives:** the In-main column and per-card badges; the **Done column** (a `done` ticket is placed there only once the ladder sees it in main — see *Close-out rides in the PR* below); eligibility of `(temp until ...)` prescriptions for auto-expire; dependency satisfaction in `ready` (a closed-out dep unblocks nothing until it lands); the settling flag on proposals; and `status` anomalies (in-main-but-not-closed → `kanspec done`; closed-out-but-not-landed past `[windows] landing_dwell_secs` → `kanspec scan --explain`).
+
+**Close-out rides in the PR (p-97d6).** `done` used to refuse until it could prove the merge, so the record it wrote could only exist *after* the merge — as a separate `kanspec: sync` commit on main that a squash-merge team requiring a PR for every commit could never land. Now `done` records the **close-out**, not the landing: it runs on the branch, before or during review, writes `state: done` with `head:` read from git and a `closed out <sha> on <branch>` log line, and the record rides in the PR that did the work. Whether that work is on main is **never stored in the ticket**; every later scan derives it, exactly as the In-main overlay always was. `scan --confirm` remains the recorded human override for a close-out git can no longer see, and `done --no-code` is unchanged.
 
 **Close-out (`kanspec done`)** — the anti-stuck ritual, four cheap steps, `--json` mode with per-item flags for agents:
-1. **Verify merged** (refuse otherwise; `--no-code --why` recorded escape for docs/chores).
+1. **Record the head** — the branch tip, read from git (refused when the branch carries nothing main lacks and no trailer on main names the ticket; `--no-code --why` is the recorded escape for docs/chores). No ladder runs here: landed is derived afterwards.
 2. **Leftover triage:** every unchecked Step must be spawned (`--spawn "..."` → linked `followup_of` ticket), dropped with a logged reason, or marked actually-done — no fourth option; non-interactive mode *requires* `--followup`/`--no-followups`, so "nothing left" is always a recorded claim.
 3. **Knowledge checkpoint:** spec edited on branch, or recorded `--spec-unchanged "<spec>:<reason>"` per spec; one-key quirk and decision prompts.
-4. Log the transition; if this was the proposal's last live ticket, flag it settling and print `→ kanspec close p-x`.
+4. Log the transition; if this was the proposal's last live ticket, flag it settling and print `→ kanspec close p-x`. Under `sync = "batch"` the record is dirty in the tree, and the next command printed is the commit that carries it into the PR — never a post-merge `kanspec: sync` commit.
 
 **Repairing a broken trail (`kanspec repair <id> --why "..."`) — the one place a human overrides the log.** Invariant 10 makes the `## Log` the proof of every state, and `Store::transact` re-proves it on the way *in*: a ticket whose log no longer replays cannot be written by any verb. That is the right default and a trap at the edges — an imported tracker, a union-merged log with two `start` lines, a `sed` someone ran last month — because it turns a broken file into a permanently unwritable one. `repair` is the escape: it appends an attributed, timestamped, human-signed `repair` line whose recorded state is **authoritative**, so replay restarts from it and the ticket becomes writable again. It never lets anyone *choose* a state — the state it attests is the one already in the frontmatter — and it refuses without a `--why`, and refuses on a ticket that already replays cleanly.
 
@@ -685,7 +694,7 @@ api = "http://127.0.0.1:4123"
 **Tickets stay file-per-entity — resist the shared JSONL.** One JSONL for all tasks is the hottest file in the repo: every state change by every agent on every machine touches it, concurrent pushes conflict constantly, and union-merging can garble state (two surviving lines asserting different states for the same ticket). This is why beads ships a custom merge driver plus dedupe machinery, and why a fresh clone without per-clone setup produces raw conflicts there. Per-ticket markdown files are exactly as "checked into the repo," and git's file-granularity merging means two people editing *different* tickets can never conflict. The one genuinely interleaving stream (per-proposal `comments.jsonl`) already uses built-in `merge=union` + id-dedupe. Same shareability, none of the machinery.
 
 **Sync modes** (`config.toml`, per repo):
-- `sync = "batch"` (default, solo): mutations dirty the working tree; commit when you commit; `status` reminds when N tracker changes are pending. Matches "local tasks don't need syncing."
+- `sync = "batch"` (default, solo): mutations dirty the working tree; commit when you commit — a claim, a ship or a close-out written on the ticket branch rides the next code commit and lands in the PR with it; `status` reminds when N tracker changes are pending. Matches "local tasks don't need syncing."
 - `sync = "commit"`: every verb auto-commits (`kanspec: start t-9c41`) to the current branch — full audit trail in history, noisier log.
 - `sync = "branch"` (team mode, v0.4): ticket + claim state auto-commits to a dedicated `kanspec/state` branch that the CLI pushes/pulls around each verb. Feature branches and PRs stay free of tracker churn; every machine's board converges on fetch. Knowledge records stay in the normal tree where PR review lives.
 

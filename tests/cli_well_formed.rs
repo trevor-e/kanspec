@@ -57,7 +57,7 @@ fn every_built_verb_is_visible_and_only_the_two_hidden_arms_are_hidden() {
         .filter(|s| s.is_hide_set())
         .map(|s| s.get_name())
         .collect();
-    // Exactly two arms are hidden, for two different reasons. The review-loop verbs
+    // Exactly four arms are hidden, each for a stated reason. The review-loop verbs
     // (`propose`/`review`/`comments`/`comment`/`approve`/`close`/`abandon`/`promote`/
     // `expire`) ship and are asserted VISIBLE below.
     for hidden_arm in [
@@ -66,6 +66,11 @@ fn every_built_verb_is_visible_and_only_the_two_hidden_arms_are_hidden() {
         // genuinely partial: bare `ci` reports the provider, but the per-ticket reader
         // (homerunner journal + SSE, gh fallback) is unbuilt, so `ci why` still refuses
         "ci",
+        // the `pre-merge-commit` hook's entry point (p-97d6 c5): every verb that changes a
+        // projection's sources already regenerates it, so a human rarely needs this
+        "regenerate",
+        // `merge.kanspec.driver` — git is its only caller, and it prints nothing
+        "merge-driver",
     ] {
         assert!(
             hidden.contains(&hidden_arm),
@@ -74,7 +79,7 @@ fn every_built_verb_is_visible_and_only_the_two_hidden_arms_are_hidden() {
     }
     assert_eq!(
         hidden.len(),
-        2,
+        4,
         "the hidden set grew without a stated reason: {hidden:?}"
     );
     for v01 in [
@@ -181,7 +186,7 @@ fn the_dispatch_arms_and_the_clap_tree_agree() {
     // between waves as a request to F.
     let n = Cli::command().get_subcommands().count();
     assert_eq!(
-        n, 44,
+        n, 46,
         "the CLI surface changed — update `dispatch` and this count together"
     );
     let _ = std::mem::size_of::<Command>();

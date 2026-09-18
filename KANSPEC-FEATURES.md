@@ -3,11 +3,11 @@
 
 | Feature | Spec | Code | Last shipped change |
 |---|---|---|---|
-| The board and review page served by kanspec up, and the terminal and markdown boards | board | src/board.rs, src/server.rs, src/cmd/board.rs, src/cmd/up.rs, assets/** | — |
-| Merge detection: the four-rung ladder that answers 'did this land?' and never guesses | ladder | src/scan.rs, src/git.rs, src/gh.rs, src/cache.rs, src/cmd/scan.rs, src/cmd/repair.rs | — |
-| Proposals and the review loop: propose, review, comments, approve, close, promote and expire | review | src/cmd/proposal.rs, src/cmd/comment.rs, src/cmd/decision.rs, docs/review.md, docs/close.md | — |
-| Standing rules: what prime injects — accepted decisions, active quirks, ranked and budgeted spec rules | rules | src/rulesdoc.rs, src/cmd/prime.rs, src/cmd/rules.rs, src/cmd/spec.rs, src/cmd/quirk.rs, src/cmd/features.rs, src/hooks.rs, src/instructions.rs | — |
-| The single write path: lock, fresh snapshot, pure planner, atomic files, projections republished | store | src/store.rs, src/fm.rs, src/lock.rs, src/plan.rs, src/keys.rs, src/project.rs, src/model.rs, src/logentry.rs, src/doctor.rs | — |
-| Ticket verbs: new, start, ship, done, park, drop, status and the close-out gate | verbs | src/cmd/ticket.rs, src/cmd/flow.rs, src/cmd/done.rs, src/triage.rs, src/transitions.rs, src/cmd/status.rs, src/derive.rs, src/error.rs | — |
+| The board and review page served by kanspec up, and the terminal and markdown boards | board | src/board.rs, src/server.rs, src/cmd/board.rs, src/cmd/up.rs, assets/** | p-97d6 |
+| Merge detection: the four-rung ladder that answers 'did this land?' and never guesses | ladder | src/scan.rs, src/git.rs, src/gh.rs, src/cache.rs, src/cmd/scan.rs, src/cmd/repair.rs | p-97d6 |
+| Proposals and the review loop: propose, review, comments, approve, close, promote and expire | review | src/cmd/proposal.rs, src/cmd/comment.rs, src/cmd/decision.rs, docs/review.md, docs/close.md | p-67f0 |
+| Standing rules: what prime injects — accepted decisions, active quirks, ranked and budgeted spec rules | rules | src/rulesdoc.rs, src/cmd/prime.rs, src/cmd/rules.rs, src/cmd/spec.rs, src/cmd/quirk.rs, src/cmd/features.rs, src/hooks.rs, src/instructions.rs | p-97d6 |
+| The single write path: lock, fresh snapshot, pure planner, atomic files, projections republished | store | src/store.rs, src/fm.rs, src/lock.rs, src/plan.rs, src/keys.rs, src/project.rs, src/model.rs, src/logentry.rs, src/doctor.rs, src/cmd/regen.rs, src/cmd/init.rs | p-97d6 |
+| Ticket verbs: new, start, ship, done, park, drop, status and the close-out gate | verbs | src/cmd/ticket.rs, src/cmd/flow.rs, src/cmd/done.rs, src/triage.rs, src/transitions.rs, src/cmd/status.rs, src/derive.rs, src/error.rs | p-97d6 |
 
 Staleness is computed from git at read time, not stored here: `kanspec features --stale`.

@@ -3,3 +3,5 @@
 *.rs text eol=lf
 # These byte-preservation fixtures intentionally mix LF, CRLF, BOMs and no EOF newline.
 tests/fixtures/frontmatter/** -text
+/KANSPEC-FEATURES.md merge=kanspec
+/KANSPEC-ARCHITECTURE.md merge=kanspec

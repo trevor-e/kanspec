@@ -19,10 +19,14 @@
 //! # The two storage tiers, and why they differ
 //!
 //! The ladder's result goes to `cache/gitstate.json` as a plain [`crate::cache::MergeFact`]
-//! — **badge-grade**, forgeable by a text editor, and disposable. The `done` gate never
-//! reads it: [`proof_for_done`] re-runs the ladder and mints a fresh, sealed
-//! [`MergedProof`] — **proof-grade**. That split is J-8, and [`Detection::to_fact`] is
-//! deliberately one-way.
+//! — **badge-grade**, forgeable by a text editor, and disposable. [`prove_landed`] re-runs
+//! the ladder and mints a fresh, sealed [`MergedProof`] — **proof-grade**. That split is
+//! J-8, and [`Detection::to_fact`] is deliberately one-way.
+//!
+//! Since p-97d6 the `done` gate consults neither: `done` records the **close-out** on the
+//! branch, inside the PR, with a [`RecordedHead`] read from git, and "landed" is derived
+//! by every later scan. The proof-grade value remains the one thing a human attestation
+//! (`scan --confirm`) and the cache projection are built from.
 //!
 //! The one human input is [`plan_confirm`], and it is stored in the third place: the
 //! **ticket's own `## Log`** (D-11). An attestation is an asserted act with an actor, so it
@@ -217,12 +221,98 @@ impl NoCodeWaiver {
     }
 }
 
-/// What `plan_done` accepts. Two constructors, two very different stories, one gate.
+/// The branch tip a close-out records, resolved **through git** (p-97d6). `done` no longer
+/// asks whether the work landed — landed is derived by the ladder and never stored — but
+/// it still refuses to write a `head:` an agent typed: the only constructor is
+/// [`head_for_done`], which runs `rev-parse` and the zero-commit guard.
+#[derive(Clone, Debug, Serialize)]
+pub struct RecordedHead {
+    sha: Sha,
+    /// the rev the SHA was read from — the recorded `head:` or the branch name
+    rev: String,
+}
+
+impl RecordedHead {
+    pub fn sha(&self) -> &Sha {
+        &self.sha
+    }
+    pub fn rev(&self) -> &str {
+        &self.rev
+    }
+}
+
+/// What `plan_done` accepts. Two constructors, two very different stories, one gate: a
+/// close-out records the head it closes out at, or the recorded reason there was no code.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "how", rename_all = "snake_case")]
-pub enum Landed {
-    Proof(MergedProof),
+pub enum CloseOut {
+    Recorded(RecordedHead),
     NoCode(NoCodeWaiver),
+}
+
+/// The head a close-out records — DESIGN.md's "head-or-tip", resolved through git so the
+/// `head:` field can never hold something an agent typed. Refuses a branch with nothing on
+/// it: a `done` whose branch carries no commit main lacks, and whose ticket nothing on main
+/// names, has nothing to close out — `--no-code` is the recorded answer for that.
+///
+/// The guard mirrors `ship`'s: a measured zero is a refusal only when the trailer rung also
+/// comes up empty, because a branch whose every commit has already landed reads as zero
+/// too, and refusing it would leave the ticket unclosable forever (t-174c).
+pub fn head_for_done(ctx: &Ctx, t: &Ticket) -> Result<RecordedHead> {
+    let id = &t.fm.id;
+    let Some((recorded, _)) = ticket_rev(t) else {
+        return Err(KsError::gate(
+            GateCode::NoHeadToRecord,
+            format!("{id} records neither a `head:` SHA nor a branch to close out"),
+            fixes![
+                fix!("kanspec done {id} --no-code --why \"...\""),
+                fix!("kanspec show {id}"),
+            ],
+        ));
+    };
+    // The BRANCH tip when the branch is still here — a close-out written after `ship`
+    // closes out the commits made since, not the tip `ship` saw — and the recorded `head:`
+    // once the branch is gone (`ticket_rev` orders them the other way, for the ladder).
+    let rev = match t
+        .fm
+        .branch
+        .as_deref()
+        .filter(|b| ctx.git.head_sha(b).is_ok())
+    {
+        Some(b) => b.to_string(),
+        None => recorded,
+    };
+    let head = ctx.git.head_sha(&rev).map_err(|e| {
+        KsError::gate(
+            GateCode::NoHeadToRecord,
+            format!("{id}: cannot read a head SHA from `{rev}` — {e}"),
+            fixes![
+                fix!("kanspec show {id}"),
+                fix!("kanspec done {id} --no-code --why \"...\""),
+            ],
+        )
+    })?;
+    if let Ok(base) = ctx.git.resolve_main(&ctx.cfg.main) {
+        let landed = matches!(
+            ctx.git.grep_trailer(&base, id),
+            Tri::Yes(ref shas) if !shas.is_empty()
+        );
+        if !landed && matches!(ctx.git.commits_ahead(&base, head.sha()), Tri::Yes(0)) {
+            return Err(KsError::gate(
+                GateCode::NothingToClose,
+                format!("{id}: `{rev}` carries no commits that {base} does not already have"),
+                fixes![
+                    fix!("git commit -m \"...\""),
+                    fix!("kanspec done {id} --no-code --why \"docs only\""),
+                    fix!("kanspec park {id} --why \"not started yet\""),
+                ],
+            ));
+        }
+    }
+    Ok(RecordedHead {
+        sha: head.sha().clone(),
+        rev,
+    })
 }
 
 /// Minted ONLY by [`scan_all`]; required by `Op::WriteGitState`. That is what makes
@@ -655,13 +745,16 @@ pub fn ladder(
     }
 }
 
-/// The `done` gate. **RE-RUNS the ladder** rather than trusting the cache — "a 60s-old
-/// merged is not a gate".
+/// The proof-grade question: **RE-RUNS the ladder** rather than trusting the cache — "a
+/// 60s-old merged is not a proof". Nothing gates on it since p-97d6 (`done` records a
+/// close-out and landed is derived), but it is still the only way to hold a sealed
+/// [`MergedProof`] for a ticket, and `tests/proof_is_sealed.rs` pins that a forged cache
+/// cannot mint one.
 ///
 /// The recorded human override ([`confirmed_proof`]) is consulted only *after* the ladder
 /// declines, so a confirmation can never overrule fresh git truth — it can only speak where
 /// git has nothing to say.
-pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
+pub fn prove_landed(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
     let main = ctx.git.resolve_main(&ctx.cfg.main)?;
     let d = ladder(&ctx.git, &ctx.gh, t, &main, ctx.git.fetch_age(), ctx.now);
     if let Some(p) = MergedProof::from_detection(&t.fm.id, &d) {
@@ -687,7 +780,6 @@ pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof> {
         fixes![
             fix!("kanspec scan --explain {id}"),
             fix!("kanspec scan --confirm {id} --why \"...\""),
-            fix!("kanspec done {id} --no-code --why \"...\""),
         ],
     ))
 }
@@ -751,9 +843,32 @@ pub fn scan_all_detailed(ctx: &Ctx, snap: &Snapshot, opts: ScanOpts) -> Result<S
     for t in snap.tickets.values() {
         match &opts.only {
             Some(id) if *id != t.fm.id => continue,
-            // A terminal ticket has nowhere left to go: `derive` reads its state, not its
-            // merge fact, and re-asking git about it every scan costs four subprocesses.
-            None if t.fm.state.terminal() => continue,
+            // A dropped ticket has nowhere left to go, and neither has a `done` one whose
+            // landing is already recorded in the file (a `--no-code` waiver, a `repair`
+            // attestation) — re-asking git about those every scan costs four subprocesses.
+            None if t.fm.state == crate::transitions::State::Dropped => continue,
+            None if t.fm.state.terminal()
+                && matches!(
+                    crate::derive::landed(snap, t),
+                    Some(crate::derive::Landing::NoCode | crate::derive::Landing::Attested)
+                ) =>
+            {
+                continue
+            }
+            // A `done` ticket the ladder has already placed on main stays placed: a merge
+            // is permanent, so the fact carries over and the ticket costs nothing further
+            // (p-97d6 c2). A wiped cache re-asks once, which is the honest price of a wipe.
+            None if t.fm.state.terminal() && snap.git.main == main => {
+                if let Some(f) = snap
+                    .git
+                    .tickets
+                    .get(&t.fm.id)
+                    .filter(|f| f.status == MergeStatus::Merged)
+                {
+                    state.tickets.insert(t.fm.id.clone(), f.clone());
+                    continue;
+                }
+            }
             _ => {}
         }
 

@@ -79,6 +79,9 @@ pub fn init(ctx: &Ctx, a: &InitArgs) -> Result<InitReport> {
     let (mut edits, mut hooks) = crate::hooks::plan_install(ctx, a.refresh_hooks)?;
     edits.extend(scaffold.edits.iter().cloned());
     apply(&edits)?;
+    // The merge driver is git config, not a file edit, so it goes in after the hooks it
+    // belongs beside — and after `apply`, so a hooks-path failure above still aborts first.
+    hooks.push(crate::hooks::install_merge_driver(ctx)?);
 
     let root = ctx.repo.primary_root().to_path_buf();
     for h in &mut hooks {
@@ -211,7 +214,17 @@ fn plan_scaffold(ctx: &Ctx, a: &InitArgs) -> Scaffold {
     // projection's parent, which stopped being the repo root the moment `[paths] features`
     // named a subdirectory. `Layout` now carries the root explicitly (round-A fix in
     // paths.rs), so this goes back through the one type allowed to name a path.
-    s.append_line(&root, ctx.layout.gitattributes(), GITATTRIBUTES_LINE);
+    // p-97d6 c5: the two generated projections merge through `kanspec merge-driver`, so two
+    // PRs that each closed a ticket never hand a human a table to resolve. The attribute
+    // travels with the repo; the driver itself is per-clone config, written by `init`
+    // beside the hooks.
+    let features = crate::hooks::merge_attribute_line(&ctx.cfg.paths.features);
+    let architecture = crate::hooks::merge_attribute_line(&ctx.cfg.paths.architecture);
+    s.append_lines(
+        &root,
+        ctx.layout.gitattributes(),
+        &[GITATTRIBUTES_LINE, &features, &architecture],
+    );
     s
 }
 
@@ -234,8 +247,21 @@ impl Scaffold {
     /// Append one line to a file that may or may not exist and may or may not already
     /// contain it — `.gitattributes` and the store's `.gitignore` both belong to the user.
     fn append_line(&mut self, root: &Path, path: PathBuf, line: &str) {
+        self.append_lines(root, path, &[line]);
+    }
+
+    /// [`Scaffold::append_line`] for several lines into ONE file, as one edit. Two
+    /// successive `append_line`s each planned a `Write` from the same on-disk bytes, so the
+    /// second silently dropped the first's line — found the moment `.gitattributes` gained
+    /// its `merge=kanspec` lines beside `merge=union`.
+    fn append_lines(&mut self, root: &Path, path: PathBuf, lines: &[&str]) {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
-        if existing.lines().any(|l| l.trim() == line) {
+        let missing: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|line| !existing.lines().any(|l| l.trim() == *line))
+            .collect();
+        if missing.is_empty() {
             self.already_present.push(rel(root, &path));
             return;
         }
@@ -243,8 +269,10 @@ impl Scaffold {
         if !next.is_empty() && !next.ends_with('\n') {
             next.push('\n');
         }
-        next.push_str(line);
-        next.push('\n');
+        for line in missing {
+            next.push_str(line);
+            next.push('\n');
+        }
         self.created.push(rel(root, &path));
         self.edits.push(Edit::Write {
             path,

@@ -130,11 +130,19 @@ fn live_slice(
         s.git.freshness(s.now),
     ));
 
+    // Every id below wears its label. An agent reads this slice and nothing else about the
+    // board, so if the label is not HERE the agent never meets it and answers a human with
+    // the bare key (found on a dogfood session that asked "what is p-97d6?").
+    o.push_str(
+        " NAMING   say every id by its label (t-9c41-rate-limit-login), never the bare key; \
+         `kanspec show <id>` prints it for tickets, proposals, decisions and quirks\n",
+    );
+
     match claimed {
         Some(t) => {
             o.push_str(&format!(
                 " CLAIMED  {}  {} · {}{}{}\n",
-                t.fm.id,
+                s.label(&t.fm.id),
                 t.fm.title,
                 t.fm.state,
                 t.fm.spec
@@ -168,7 +176,7 @@ fn live_slice(
             .and_then(|t| t.fm.spec.as_ref())
             .map(|sp| format!(" · {sp}"))
             .unwrap_or_default();
-        o.push_str(&format!("  {id}  {title}{spec}\n"));
+        o.push_str(&format!("  {}  {title}{spec}\n", s.label(id)));
     }
 
     let anomalies: Vec<&Attention> = dv.attention.iter().take(ANOMALY_TOP).collect();
@@ -183,7 +191,11 @@ fn live_slice(
         o.push_str(&format!(
             "  {} {}  {}{}\n",
             owner_tag(x.owner),
-            x.subject,
+            if x.label.is_empty() {
+                &x.subject
+            } else {
+                &x.label
+            },
             x.line,
             if x.fix.is_empty() {
                 String::new()

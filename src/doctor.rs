@@ -329,12 +329,16 @@ fn check_attested_state(s: &Snapshot) -> Vec<Finding> {
 /// claims, no `repair` verb appears — and until this check the repo answered
 /// `13 checks passed`, exit 0, with a provably unmerged ticket closed inside it.
 ///
-/// What a fabricated line cannot write is corroboration. Every close the gate grants
-/// records the commit it was granted against, or the durable `--no-code` waiver; a
-/// `scan --confirm` records a commit too; an attestation is badged everywhere. A `done`
-/// carrying none of those, on a ticket that names a branch, a head or a PR, was not
-/// written by this tool's gate — and that is a claim, not a proof, so it is an Error and
-/// `cmd::status` promotes it to a YOU line.
+/// What a fabricated line cannot write is corroboration. Every close-out the gate writes
+/// records the head it was written at (`closed out <sha> on <branch>`, p-97d6), or the
+/// durable `--no-code` waiver; a `scan --confirm` records a commit too; an attestation is
+/// badged everywhere. A `done` carrying none of those, on a ticket that names a branch, a
+/// head or a PR, was not written by this tool's gate — and that is a claim, not a proof,
+/// so it is an Error and `cmd::status` promotes it to a YOU line.
+///
+/// Note what this does NOT ask since p-97d6: whether the work landed. `done` no longer
+/// claims that, so an undetected close-out is the `awaiting merge` chip and, after
+/// `[windows] landing_dwell_secs`, a WATCHING line — never a doctor error.
 ///
 /// **Three deliberate silences, so this never cries wolf:**
 /// - `dropped` — a drop is an act, not a merge; `--why` is the whole of its evidence.
@@ -361,13 +365,14 @@ fn check_unproven_close(s: &Snapshot) -> Vec<Finding> {
             Severity::Error,
             id,
             format!(
-                "is `done` with nothing outside its own ## Log behind the close: no commit \
-                 recorded by the gate, no `--no-code` waiver, no attestation, and no ladder run \
-                 that ever saw it in main. A ## Log is plain text, so a `done` line proves a \
-                 `done` line was written — only git can corroborate that the work landed. If it \
-                 did land, `kanspec scan --confirm {id} --why \"...\"` records the commit; if \
-                 there was never any code, the close needed `--no-code --why`; if it never \
-                 landed, put `state:` back to the state the log reached"
+                "is `done` with nothing outside its own ## Log behind the close: no head \
+                 recorded by the gate (`closed out <sha>`), no `--no-code` waiver, no \
+                 attestation, and no ladder run that ever saw it in main. A ## Log is plain \
+                 text, so a `done` line proves a `done` line was written — the gate always \
+                 records the commit it closed out at. If the work landed, `kanspec scan \
+                 --confirm {id} --why \"...\"` records the commit; if there was never any \
+                 code, the close needed `--no-code --why`; otherwise put `state:` back to the \
+                 state the log reached"
             ),
             // Ask GIT first. A TARGETED scan re-runs the ladder even on a terminal ticket,
             // so this is the diagnostic AND — when the work really did land — the repair,

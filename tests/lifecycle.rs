@@ -381,10 +381,33 @@ fn the_walking_skeleton_runs_end_to_end_from_a_linked_worktree() {
         ],
     );
     assert_eq!(done["state"], "done");
-    assert_eq!(
-        done["method"], "trailer",
-        "a multi-commit squash is invisible to ancestry and to patch-id: {done}"
+    assert!(
+        done["sha"].is_string(),
+        "the close-out records the head it was written at: {done}"
     );
+    // Landed is DERIVED (p-97d6): the record above claims nothing about main. The scan
+    // does — and a multi-commit squash is invisible to ancestry and to patch-id, so only
+    // the trailer rung can place this one in the Done column.
+    repo.ks_in(&ticket_wt, ["scan"]).ok();
+    let shown = json_in(&repo, &ticket_wt, &["show", &id]);
+    assert_eq!(shown["column"], "done", "{shown}");
+    assert!(
+        shown["badge_text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("in main (trailer"),
+        "{shown}"
+    );
+    // The cache is disposable and the column is derived from it: a wipe degrades the card
+    // to `closed out · awaiting merge` in REVIEW — never to a wrong column — and the next
+    // scan (which covers `done` tickets until they land) puts it back.
+    std::fs::remove_dir_all(repo.root.join(".kanspec/cache")).unwrap();
+    let wiped = json_in(&repo, &ticket_wt, &["show", &id]);
+    assert_eq!(wiped["state"], "done", "{wiped}");
+    assert_eq!(wiped["column"], "review", "{wiped}");
+    repo.ks_in(&ticket_wt, ["scan"]).ok();
+    let back = json_in(&repo, &ticket_wt, &["show", &id]);
+    assert_eq!(back["column"], "done", "{back}");
     assert_eq!(
         done["spec_check"]["spec_check"], "edited_on_branch",
         "the branch touched src/auth/** AND moved the spec with it: {done}"
@@ -460,10 +483,12 @@ fn the_walking_skeleton_runs_end_to_end_from_a_linked_worktree() {
     );
 }
 
-/// The slice's other half: `done` cannot be talked into closing an unmerged ticket. Not by
-/// asking again, and not by reaching for the chore/docs escape on work that has a branch.
+/// The slice's other half, as p-97d6 reads it: `done` RECORDS a close-out on the branch
+/// and asserts nothing about main. An unmerged ticket closes out fine — and then nothing
+/// in the product calls it landed: not the column, not the badge, not a scan, not the
+/// chore/docs escape reached for on work that has a branch.
 #[test]
-fn done_cannot_be_talked_into_closing_an_unmerged_ticket() {
+fn a_close_out_on_an_unmerged_branch_is_recorded_and_waits_in_review() {
     let repo = TestRepo::new();
     seed_knowledge(&repo);
     let agent = repo.worktree("agent");
@@ -487,24 +512,8 @@ fn done_cannot_be_talked_into_closing_an_unmerged_ticket() {
     );
     json_in(&repo, &wt, &["ship", &id, "--pr", "999"]);
 
-    // 1. The gate refuses, and the refusal carries the whole ladder trace — the
-    //    `--explain`-grade output that makes it arguable rather than arbitrary.
-    let e = refusal(&repo, &wt, &["done", &id, "--no-followups", "--no-quirks"]);
-    assert_eq!(e["code"], "not_landed", "{e}");
-    let trace = e["detail"]["trace"].as_array().expect("a ladder trace");
-    assert!(!trace.is_empty(), "{e}");
-    let methods: Vec<&str> = trace.iter().map(|t| str_at(t, "method")).collect();
-    assert!(
-        methods.contains(&"ancestry"),
-        "rung 1 must have actually run: {e}"
-    );
-
-    // 2. Asking twice does not help.
-    let again = refusal(&repo, &wt, &["done", &id, "--no-followups", "--no-quirks"]);
-    assert_eq!(again["code"], "not_landed");
-
-    // 3. And the chore/docs escape provably cannot launder a ticket that was shipped for
-    //    review: `--no-code` is legal from `doing`, and only from `doing`.
+    // 1. The chore/docs escape provably cannot launder a ticket that was shipped for
+    //    review: `--no-code` is legal from `doing`, and only from `doing` (c4).
     let e = refusal(
         &repo,
         &wt,
@@ -519,10 +528,83 @@ fn done_cannot_be_talked_into_closing_an_unmerged_ticket() {
         ],
     );
     assert_eq!(e["code"], "no_code_from_review", "{e}");
-
-    // The ticket did not move.
     let show = json_in(&repo, &wt, &["show", &id]);
-    assert_eq!(show["state"], "review");
+    assert_eq!(show["state"], "review", "the refusal moved nothing");
+
+    // 2. The close-out is recorded — on the branch, inside what the PR will carry — with
+    //    the head read from git and the spec waiver the knowledge checkpoint demanded.
+    let done = json_in(
+        &repo,
+        &wt,
+        &[
+            "done",
+            &id,
+            "--no-followups",
+            "--no-quirks",
+            "--spec-unchanged",
+            "auth:never lands",
+        ],
+    );
+    assert_eq!(done["state"], "done", "{done}");
+    assert!(done["sha"].is_string(), "{done}");
+    let file = repo.read(&format!(".kanspec/tickets/{id}.md"));
+    assert!(file.contains("done (closed out "), "{file}");
+    assert!(file.contains("head: "), "{file}");
+
+    // 3. ...and nothing calls it LANDED. The card sits in REVIEW wearing the chip, the
+    //    badge says only what git knows, and a scan — which now covers `done` tickets until
+    //    they land — moves nothing, because the branch is genuinely not on main.
+    let show = json_in(&repo, &wt, &["show", &id]);
+    assert_eq!(show["state"], "done", "{show}");
+    assert_eq!(show["column"], "review", "{show}");
+    repo.ks_in(&wt, ["scan"]).ok();
+    let show = json_in(&repo, &wt, &["show", &id]);
+    assert_eq!(
+        show["column"], "review",
+        "a scan cannot invent a landing: {show}"
+    );
+    assert!(
+        !show["badge_text"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("in main"),
+        "{show}"
+    );
+    let board = json_in(&repo, &wt, &["board"]);
+    let review = board["model"]["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["column"] == "review")
+        .expect("a review column");
+    let card = review["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == id.as_str())
+        .unwrap_or_else(|| panic!("the closed-out card is in REVIEW: {board}"));
+    assert_eq!(card["awaiting_merge"], true, "{card}");
+    assert_eq!(card["state"], "done", "{card}");
+    assert_eq!(
+        card["fix"],
+        format!("kanspec scan --explain {id}"),
+        "{card}"
+    );
+
+    // 4. The dependents wait too: a ticket cut from main must not start on work main
+    //    does not have yet.
+    let dep = str_at(
+        &json_in(
+            &repo,
+            &wt,
+            &["new", "Needs the never-landing work", "--dep", &id],
+        ),
+        "id",
+    )
+    .to_string();
+    let dep_shown = json_in(&repo, &wt, &["show", &dep]);
+    assert_eq!(dep_shown["column"], "backlog", "{dep_shown}");
+    assert_eq!(dep_shown["blocked_by"][0], id.as_str(), "{dep_shown}");
 }
 
 /// The recorded escape, on the path it is actually for: a chore with no code, closed from
@@ -831,10 +913,11 @@ fn the_close_out_transcript_reads_like_design_md_and_flags_the_settling_proposal
     let lines: Vec<&str> = out.lines().collect();
 
     assert!(
-        lines[0].starts_with("\u{2713} merged verified: ")
-            && lines[0]
-                .contains("reachable from origin/main (method: trailer #145 \u{b7} checked "),
-        "line 1 is DESIGN.md's merge line:\n{out}"
+        lines[0].starts_with("\u{2713} closed out at ")
+            && lines[0].contains(" on ks/")
+            && lines[0].contains("landing is detected by git"),
+        "line 1 is DESIGN.md's close-out line (p-97d6): the record, and where landing \
+         comes from:\n{out}"
     );
     assert_eq!(
         lines[1], "Leftover triage \u{2014} 1 unchecked step:",
@@ -898,7 +981,7 @@ fn the_close_out_transcript_reads_like_design_md_and_flags_the_settling_proposal
     assert!(
         last.contains(&followup)
             && last.contains("done \u{b7} p-7de2-")
-            && last.contains(" is settling (last ticket landed)")
+            && last.contains(" is settling (last ticket closed out)")
             && last.contains("\u{2192} kanspec close p-7de2"),
         "the settling proposal is prompted, never remembered:\n{out}"
     );
@@ -1338,13 +1421,11 @@ fn a_branch_merged_before_ship_is_still_shippable_and_closes_by_ancestry() {
         ],
     );
     assert_eq!(done["state"], "done", "{done}");
-    assert!(
-        done["landed"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("ancestry"),
-        "{done}"
-    );
+    assert!(done["sha"].is_string(), "{done}");
+    // Landed before the close-out, and the scan above already knows it: the card goes
+    // straight to the Done column rather than waiting on a merge that already happened.
+    let shown = json_in(&repo, &root, &["show", &id]);
+    assert_eq!(shown["column"], "done", "{shown}");
 
     // The guard still holds for a branch that really never carried a commit.
     let fresh = str_at(&json_in(&repo, &root, &["new", "Nothing yet"]), "id").to_string();

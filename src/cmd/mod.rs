@@ -23,6 +23,7 @@ pub mod landcheck;
 pub mod prime;
 pub mod proposal;
 pub mod quirk;
+pub mod regen;
 pub mod repair;
 pub mod rules;
 pub mod scan;

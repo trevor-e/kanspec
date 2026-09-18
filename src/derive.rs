@@ -39,7 +39,15 @@ pub fn dep_satisfied(s: &Snapshot, dep: &TicketId) -> bool {
         // would let a typo unblock work silently; `doctor::check_orphan_deps` raises it as
         // an Error, and until it is fixed the dependent ticket stays visibly blocked.
         None => false,
-        Some(t) => t.fm.state.terminal() || in_main(s, t).is_some(),
+        // `done` records a close-out, not a landing (p-97d6): a dependent ticket cut from
+        // main must not start until the dep's work is actually THERE. `dropped` satisfies
+        // by fiat, a closed-out dep the moment git (or its waiver) says landed, and an
+        // open dep the moment the In-main overlay fires.
+        Some(t) => match t.fm.state {
+            State::Dropped => true,
+            State::Done => landed(s, t).is_some(),
+            _ => in_main(s, t).is_some(),
+        },
     }
 }
 
@@ -155,6 +163,52 @@ pub fn in_main<'s>(s: &'s Snapshot, t: &Ticket) -> Option<&'s MergeFact> {
     merge_fact(s, t).filter(|f| f.status == MergeStatus::Merged)
 }
 
+/// Why a `done` ticket counts as LANDED — the derived half of p-97d6's split. `done`
+/// writes the close-out on the branch; whether that work is on main is never stored in the
+/// ticket, so the Done column, dependency satisfaction and the settling clock all read it
+/// from here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Landing {
+    /// the ladder saw it in main — read out of the disposable cache, recomputed by `scan`
+    Detected,
+    /// a recorded `--no-code` waiver: there was never code for git to place
+    NoCode,
+    /// a human vouched for the state with `repair` (D-12)
+    Attested,
+}
+
+/// `done && (ladder says merged | no-code waiver | attested)`. `None` for a `done` the scan
+/// has not detected yet — the `closed out · awaiting merge` card — and for every
+/// non-terminal state, whose git overlay is [`in_main`].
+pub fn landed(s: &Snapshot, t: &Ticket) -> Option<Landing> {
+    if t.fm.state != State::Done {
+        return None;
+    }
+    if merge_fact(s, t).is_some_and(|f| f.status == MergeStatus::Merged) {
+        return Some(Landing::Detected);
+    }
+    if attested(t).is_some() {
+        return Some(Landing::Attested);
+    }
+    if has_no_code_waiver(t) {
+        return Some(Landing::NoCode);
+    }
+    None
+}
+
+/// A `done` ticket the ladder has not placed on main: closed out on its branch, waiting for
+/// the merge git will detect. The Review column's chip, the landing tripwire's subject.
+pub fn awaiting_merge(s: &Snapshot, t: &Ticket) -> bool {
+    t.fm.state == State::Done && landed(s, t).is_none()
+}
+
+fn has_no_code_waiver(t: &Ticket) -> bool {
+    t.body
+        .lines()
+        .any(|l| l.trim_start().starts_with(NO_CODE_WAIVER))
+}
+
 /// THE SEAM between `cache::MergeFact.why` and `Badge::Unknown.why`, and the two disagree
 /// on purpose-built wording.
 ///
@@ -216,16 +270,17 @@ pub fn logged_close(t: &Ticket) -> bool {
         .any(|e| matches!(e.verb, Verb::Done | Verb::Confirm))
 }
 
-/// The gate's own spelling of a recorded [`crate::scan::MergedProof`]. `plan_done` writes
-/// `in main a1b9c3d via ancestry #142`; `plan_confirm` writes
-/// `in main a1b9c3d — squash merged by hand`. Both open with the same two words and both
-/// name a commit, because neither value can be minted without a SHA git resolved.
+/// The gates' own spellings of a commit they recorded. `plan_done` writes
+/// `closed out a1b9c3d on ks/t-9c41-…` (p-97d6); `plan_confirm` writes
+/// `in main a1b9c3d — squash merged by hand`. Each opens with a fixed two-word prefix and
+/// names a commit, because neither value can be minted without a SHA git resolved.
 ///
-/// The prefix is MIRRORED from `scan::CONFIRM_NOTE` rather than imported — this file may
-/// import nothing from `scan` (`tests/purity.rs`) — so the sharing runs the other way:
-/// `scan::confirmed_proof` reads its own notes back through [`note_sha`] below, and
-/// `the_note_grammar_mirrors_the_gates_own_spelling` keeps the prefix honest.
-const PROOF_NOTE: &str = "in main";
+/// The prefixes are MIRRORED from `scan::CONFIRM_NOTE` and `cmd::done::CLOSE_NOTE` rather
+/// than imported — this file may import nothing from `scan` (`tests/purity.rs`) — so the
+/// sharing runs the other way: `scan::confirmed_proof` reads its own notes back through
+/// [`note_sha`] below, and `the_note_grammar_mirrors_the_gates_own_spelling` keeps both
+/// prefixes honest.
+const PROOF_NOTES: [&str; 2] = ["in main", "closed out"];
 
 /// The durable half of a `--no-code` close. `scan::NoCodeWaiver::record` appends
 /// `  no-code waiver by <actor> at <ts>: <why>` as PROSE under `## Log` — deliberately not
@@ -235,7 +290,11 @@ const NO_CODE_WAIVER: &str = "no-code waiver by ";
 
 /// The commit a close's own log entry names, when the gate recorded one.
 pub fn note_sha(note: &str) -> Option<&str> {
-    let rest = note.trim().strip_prefix(PROOF_NOTE)?.trim_start();
+    let note = note.trim();
+    let rest = PROOF_NOTES
+        .iter()
+        .find_map(|p| note.strip_prefix(p))?
+        .trim_start();
     let tok = rest.split_whitespace().next()?;
     // git's own shape: 7 to 64 lowercase hex. A `via`/`—` that arrived where a SHA should
     // be is a note that names no commit, which is the answer, not a parse failure.
@@ -486,6 +545,11 @@ pub fn dwell(s: &Snapshot, t: &Ticket) -> Option<Tripwire> {
     if let Some(d) = over(in_main(s, t).is_some(), idle, w.in_main_dwell_secs) {
         return Some(Tripwire::InMainNotClosed(d));
     }
+    // Closed out on the branch, and git has not seen it land (p-97d6 c3): the mirror of
+    // in-main-not-closed. Its fix is a question to git, not a verb.
+    if let Some(d) = over(awaiting_merge(s, t), idle, w.landing_dwell_secs) {
+        return Some(Tripwire::ClosedOutNotLanded(d));
+    }
     if let Some(d) = over(t.fm.state == State::Review, idle, w.review_dwell_secs) {
         return Some(Tripwire::ReviewDwell(d));
     }
@@ -513,6 +577,7 @@ fn untriaged_discovery(t: &Ticket) -> bool {
 pub enum Tripwire {
     ReviewDwell(Duration),
     InMainNotClosed(Duration),
+    ClosedOutNotLanded(Duration),
     SettlingDwell(Duration),
     DiscoveredUntriaged(Duration),
 }
@@ -522,6 +587,7 @@ impl Tripwire {
         match self {
             Tripwire::ReviewDwell(d)
             | Tripwire::InMainNotClosed(d)
+            | Tripwire::ClosedOutNotLanded(d)
             | Tripwire::SettlingDwell(d)
             | Tripwire::DiscoveredUntriaged(d) => *d,
         }
@@ -750,7 +816,11 @@ pub enum Staleness {
 pub fn column(s: &Snapshot, t: &Ticket) -> Column {
     match t.fm.state {
         State::Dropped => Column::Dropped,
-        State::Done => Column::Done,
+        // Done is DERIVED (p-97d6): a close-out git has not placed on main stays in Review
+        // wearing `closed out · awaiting merge`, and wiping the cache moves it back to the
+        // chip — never to a wrong column.
+        State::Done if landed(s, t).is_some() => Column::Done,
+        State::Done => Column::Review,
         _ if in_main(s, t).is_some() => Column::InMain,
         State::Review => Column::Review,
         State::Doing => Column::Doing,
@@ -1002,6 +1072,16 @@ pub fn attention(s: &Snapshot) -> Vec<Attention> {
                     format!("kanspec show {id}"),
                 ),
             )),
+            Some(Tripwire::ClosedOutNotLanded(d)) => watching.push((
+                WATCH_LANDING,
+                att(
+                    Owner::Watching,
+                    state_glyph(State::Done),
+                    id,
+                    format!("closed out {} ago, not on main", short(d)),
+                    format!("kanspec scan --explain {id}"),
+                ),
+            )),
             Some(Tripwire::DiscoveredUntriaged(d)) => watching.push((
                 WATCH_DISCOVERED,
                 att(
@@ -1121,9 +1201,10 @@ const AGENT_MORE: u8 = 1;
 const AGENT_THREADS: u8 = 2;
 const WATCH_STALLED: u8 = 0;
 const WATCH_REVIEW: u8 = 1;
-const WATCH_DISCOVERED: u8 = 2;
-const WATCH_STALE_SPEC: u8 = 3;
-const WATCH_DEAD_GLOBS: u8 = 4;
+const WATCH_LANDING: u8 = 2;
+const WATCH_DISCOVERED: u8 = 3;
+const WATCH_STALE_SPEC: u8 = 4;
+const WATCH_DEAD_GLOBS: u8 = 5;
 
 /// A settling proposal nobody closed. Anchored on the last thing that HAPPENED to its
 /// tickets, so a `scan` cannot reset it.
@@ -1393,16 +1474,24 @@ mod tests {
     #[test]
     fn every_terminal_or_in_main_dep_satisfies_and_a_missing_one_does_not() {
         let mut s = snap();
-        // done / dropped satisfy (D-17: blocking forever on a dropped dep is worse)
+        // a LANDED done / dropped satisfy (D-17: blocking forever on a dropped dep is worse)
         put(&mut s, ticket("t-000d", State::Done));
+        s.git.tickets.insert(tid("t-000d"), merged(&[]));
         put(&mut s, ticket("t-00dd", State::Dropped));
         // in-main satisfies even though the ticket is still open
         put(&mut s, ticket("t-00aa", State::Review));
         s.git.tickets.insert(tid("t-00aa"), merged(&[]));
         // doing does not
         put(&mut s, ticket("t-00bb", State::Doing));
+        // and neither does a close-out git has not placed on main yet (p-97d6): the
+        // dependent would be cut from a main that lacks the work it depends on
+        put(&mut s, ticket("t-00cc", State::Done));
 
         assert!(dep_satisfied(&s, &tid("t-000d")));
+        assert!(
+            !dep_satisfied(&s, &tid("t-00cc")),
+            "done is a close-out, not a landing — an undetected one does not unblock"
+        );
         assert!(
             dep_satisfied(&s, &tid("t-00dd")),
             "dropped satisfies (D-17)"
@@ -1422,6 +1511,7 @@ mod tests {
     fn blocked_by_names_every_unsatisfied_dep_including_the_missing_one() {
         let mut s = snap();
         put(&mut s, ticket("t-000d", State::Done));
+        s.git.tickets.insert(tid("t-000d"), merged(&[]));
         put(&mut s, ticket("t-00bb", State::Doing));
         let mut t = ticket("t-0001", State::Todo);
         t.fm.deps = vec![tid("t-000d"), tid("t-00bb"), tid("t-9999")];
@@ -1568,6 +1658,94 @@ mod tests {
         let t = &s.tickets[&tid("t-0001")];
         assert!(in_main(&s, t).is_none(), "done is done, not in-main");
         assert_eq!(column(&s, t), Column::Done);
+        assert_eq!(landed(&s, t), Some(Landing::Detected));
+    }
+
+    /// p-97d6 c2: Done is DERIVED. A close-out the ladder has not placed sits in Review
+    /// wearing the chip; a wipe moves it back to the chip and never to a wrong column; the
+    /// two file-borne landings (a `--no-code` waiver, a `repair` attestation) need no cache.
+    #[test]
+    fn a_close_out_the_scan_has_not_placed_waits_in_review_and_a_wipe_moves_it_back() {
+        let mut s = snap();
+        put(&mut s, ticket("t-0001", State::Done));
+        let t = &s.tickets[&tid("t-0001")];
+        assert_eq!(landed(&s, t), None);
+        assert!(awaiting_merge(&s, t));
+        assert_eq!(column(&s, t), Column::Review, "closed out, awaiting merge");
+
+        // The scan places it: Done.
+        s.git.tickets.insert(tid("t-0001"), merged(&[]));
+        let t = &s.tickets[&tid("t-0001")];
+        assert!(!awaiting_merge(&s, t));
+        assert_eq!(column(&s, t), Column::Done);
+
+        // A wipe degrades to the chip — the honest "not yet detected", never Done by
+        // assertion and never a column the state does not support.
+        s.git.tickets.clear();
+        let t = &s.tickets[&tid("t-0001")];
+        assert_eq!(column(&s, t), Column::Review);
+        assert!(awaiting_merge(&s, t));
+
+        // An `unknown` verdict is exactly as undetected as no verdict at all.
+        s.git.tickets.insert(tid("t-0001"), unknown_fact());
+        let t = &s.tickets[&tid("t-0001")];
+        assert_eq!(column(&s, t), Column::Review);
+
+        // `--no-code`: the waiver is in the file, so no cache is needed to call it landed.
+        let mut w = ticket("t-0002", State::Done);
+        w.body = "Body.\n\n## Log\n  no-code waiver by trevor at 2026-08-31T11:00Z: docs only\n"
+            .to_string();
+        put(&mut s, w);
+        let t = &s.tickets[&tid("t-0002")];
+        assert_eq!(landed(&s, t), Some(Landing::NoCode));
+        assert_eq!(column(&s, t), Column::Done);
+
+        // `repair` into done: attested, badged, and placed by the attestation.
+        let mut r = ticket("t-0003", State::Done);
+        r.log = vec![entry(ago(1), "trevor", Verb::Repair, State::Done)];
+        put(&mut s, r);
+        let t = &s.tickets[&tid("t-0003")];
+        assert_eq!(landed(&s, t), Some(Landing::Attested));
+        assert_eq!(column(&s, t), Column::Done);
+    }
+
+    /// p-97d6 c3: closed out and not detected past the window is a WATCHING line whose fix
+    /// is a question to git; a detected one is not, and a fresh close-out is not yet.
+    #[test]
+    fn a_close_out_git_has_not_seen_land_trips_after_the_landing_window() {
+        let mut s = snap();
+        let mut t = ticket("t-0001", State::Done);
+        t.log = vec![LogEntry {
+            at: ago(24 * 8),
+            state: State::Done,
+            actor: "trevor".into(),
+            verb: Verb::Done,
+            note: Some("closed out a1b9c3d on ks/t-0001".into()),
+        }];
+        put(&mut s, t);
+        assert!(matches!(
+            dwell(&s, &s.tickets[&tid("t-0001")]),
+            Some(Tripwire::ClosedOutNotLanded(_))
+        ));
+        let lines: Vec<String> = attention(&s)
+            .into_iter()
+            .filter(|a| a.subject == "t-0001")
+            .map(|a| format!("{} → {}", a.line, a.fix))
+            .collect();
+        assert_eq!(
+            lines,
+            ["closed out 8d ago, not on main → kanspec scan --explain t-0001"]
+        );
+
+        // Detected: the clock stops.
+        s.git.tickets.insert(tid("t-0001"), merged(&[]));
+        assert!(dwell(&s, &s.tickets[&tid("t-0001")]).is_none());
+
+        // Fresh: not yet.
+        let mut fresh = ticket("t-0002", State::Done);
+        fresh.log = vec![entry(ago(1), "trevor", Verb::Done, State::Done)];
+        put(&mut s, fresh);
+        assert!(dwell(&s, &s.tickets[&tid("t-0002")]).is_none());
     }
 
     // ── what stands behind a close ───────────────────────────────────────────
@@ -1596,6 +1774,28 @@ mod tests {
     /// `note_sha` mirrors a grammar that lives in `scan.rs` behind private items, so this
     /// runs the REAL `plan_confirm` and reads its note back through the mirror. A gate
     /// that changed its spelling would fail here rather than silently stop corroborating.
+    #[test]
+    fn a_close_out_note_names_the_head_it_was_written_at() {
+        assert_eq!(
+            note_sha("closed out 3f2a19c7d4b6 on ks/t-9c41-rate-limit-login"),
+            Some("3f2a19c7d4b6")
+        );
+        assert_eq!(
+            note_sha("closed out on ks/t-9c41"),
+            None,
+            "no SHA, no corroboration"
+        );
+        // ...and a close-out written by the real gate corroborates the close it records.
+        let mut s = snap();
+        let mut t = closed("t-0001");
+        t.log.last_mut().unwrap().note = Some("closed out 3f2a19c7 on ks/t-0001".into());
+        put(&mut s, t);
+        assert_eq!(
+            close_evidence(&s, &s.tickets[&tid("t-0001")]),
+            Some(CloseEvidence::Proof("3f2a19c7".into()))
+        );
+    }
+
     #[test]
     fn the_note_grammar_mirrors_the_gates_own_spelling() {
         use crate::ctx::Actor;

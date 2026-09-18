@@ -462,8 +462,13 @@ fn a_gate_granted_close_is_never_reported_even_with_the_cache_wiped() {
 
     let file = repo.read(".kanspec/tickets/t-9c41.md");
     assert!(
-        file.contains("done (in main "),
-        "the gate records the commit it was granted against:\n{file}"
+        file.contains("done (closed out "),
+        "the gate records the head it closed out at (p-97d6):\n{file}"
+    );
+    assert!(
+        file.contains("head: "),
+        "the close-out writes `head:` from git, so the ladder can ask about it once the \
+         branch is gone:\n{file}"
     );
 
     // The cache is gitignored and disposable. The corroboration must not be.

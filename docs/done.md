@@ -2,14 +2,27 @@
 
 `kanspec done <id>` is the only way a ticket reaches `done`, and it is a gate, not a
 formality. It exists because the two things that historically went missing at close-out —
-"did this actually land?" and "what did we learn?" — are exactly the two things nobody
-remembers to record.
+"what is left?" and "what did we learn?" — are exactly the two things nobody remembers to
+record.
 
-## 1. Verify it merged (never assert it)
+**Run it on the branch, before the PR merges.** `done` records the *close-out*, not the
+landing: it writes `state: done` with the branch tip read from git and a
+`closed out <sha> on <branch>` log line, and that record rides in the PR that did the work.
+It is legal from `doing` (before the PR even opens) and from `review`. Whether the work is
+on main is never stored in the ticket — every later `scan` derives it, and until one does
+the card sits in the Review column wearing `closed out · awaiting merge`. So there is no
+post-merge `kanspec: sync` commit to land, which a squash-merge team requiring a PR for
+every commit could never do.
 
-The gate re-runs merge detection against git **at close time**; a cached "merged" from a
-minute ago is not proof. Detection is a four-rung ladder, and every rung reports one of
-merged / not-merged / inconclusive:
+## 1. Record the head (never assert a merge)
+
+The gate reads the branch tip **from git** — you never type a SHA — and refuses a branch
+that carries no commit main lacks (unless a `Kanspec: <id>` trailer on main shows the
+work already landed): a close-out of nothing is `--no-code --why`, below, and is recorded
+as such.
+
+Landing is detected afterwards, by `kanspec scan`. Detection is a four-rung ladder, and
+every rung reports one of merged / not-merged / inconclusive:
 
 | Rung | What it asks | Blind to |
 |---|---|---|
@@ -19,24 +32,24 @@ merged / not-merged / inconclusive:
 | patch-id | `git cherry origin/main <head>` — rebase / cherry-pick detection | multi-commit squashes |
 
 An ancestry **miss** is inconclusive, not "no": a squash-merged branch is genuinely not an
-ancestor. When every rung declines you get an honest `unknown` with its reason and the
-whole trace, never a confident wrong answer:
+ancestor. When every rung declines the badge is an honest `unknown` with its reason, never
+a confident wrong answer, and `kanspec scan --explain t-9c41` prints the whole trace:
 
 ```
-✗ t-9c41 is not on origin/main — cannot close it
     ancestry   merge-base --is-ancestor a1b9c3d origin/main   exit 1   not an ancestor
     gh-pr      (gh unavailable: HTTP 401 Bad credentials)     exit 1   inconclusive
     trailer    log origin/main --grep 'Kanspec: t-9c41…'      exit 0   0 hits
     patch-id   cherry origin/main a1b9c3d                     exit 0   +2  squash suspected
   unknown (squash suspected, no gh)
-  → kanspec scan --explain t-9c41
-  → kanspec scan --confirm t-9c41 --why "..."
 ```
 
-`scan --confirm` is the recorded human override for the genuinely ambiguous case. It is
-signed and it lands in the ticket's `## Log`, not in the disposable cache, so the
-attestation survives `rm -rf .kanspec/cache/`. **Agents do not confirm merges** — report
-the trace and let the human decide.
+A close-out git has not seen land for `[windows] landing_dwell_secs` (default seven days)
+is a WATCHING line in `kanspec status` — `closed out 8d ago, not on main` — whose fix is
+that `--explain`. `scan --confirm` is the recorded human override for the genuinely
+ambiguous case (a gc'd branch, a hand-merged fork). It is signed and it lands in the
+ticket's `## Log`, not in the disposable cache, so the attestation survives
+`rm -rf .kanspec/cache/`. **Agents do not confirm merges** — report the trace and let the
+human decide.
 
 Docs and chores that ship no code use `kanspec done <id> --no-code --why "..."`. That is a
 different, recorded escape hatch, and it cannot be used to close a ticket already in
@@ -73,12 +86,16 @@ Both are skippable and every skip is auditable.
 ## 4. What it prints
 
 ```
-● t-9c41 done · p-7de2 is settling (last ticket landed) → kanspec close p-7de2
+✓ closed out at a1b9c3d on ks/t-9c41-rate-limit-login — landing is detected by git (`kanspec scan`), never asserted here
+● t-9c41-rate-limit-login done · p-7de2-login-rate-limiting is settling (last ticket closed out) → kanspec close p-7de2
+  → git add -A .kanspec && git commit
   parked 2 discovered tickets → kanspec status
 ```
 
-If this was the last live ticket of a proposal, the proposal surfaces as *settling* and
-close-out is prompted rather than remembered.
+The record is dirty in your tree under the default `sync = "batch"`; the `git add` line is
+how it gets into the PR — with your code, in the same commit if you like. If this was the
+last live ticket of a proposal, the proposal surfaces as *settling* and close-out is
+prompted rather than remembered.
 
 ## The agent form, in full
 

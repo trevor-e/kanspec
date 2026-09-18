@@ -9,4 +9,5 @@ code: [src/board.rs, src/server.rs, src/cmd/board.rs, src/cmd/up.rs, assets/**]
 - [board.same-model] The browser, terminal and markdown boards render one `BoardModel`; badges come from `derive` and are never guessed. {pre-kanspec}
 - [board.routes] axum routes use `{id}`, never `:id`, which panics at `Router::route()`. {pre-kanspec}
 - [board.static-export] `review --export` writes the review page as one self-contained, script-less HTML file; comments are taken only on the served page or through the CLI. {pre-kanspec}
+- [board.awaiting-merge] A `done` card the scan has not placed sits in the Review column wearing one chip, `closed out · awaiting merge`, spelled identically by the SPA, the terminal board and `Card.awaiting_merge`; its fix is `scan --explain`. {p-97d6}
 - [board.review-queue] The Review-queue tab lists proposals in review with their unresolved counts and the tickets in the review column, and approves through the gated verb. {pre-kanspec}

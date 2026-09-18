@@ -41,7 +41,7 @@ use tokio_stream::StreamExt;
 
 use crate::cli::{
     Cli, ColorChoice, Command, CommentCommand, DoneArgs, DropArgs, ParkArgs, ScanArgs, ShipArgs,
-    ShowArgs, StartArgs, StatusArgs,
+    StartArgs, StatusArgs,
 };
 use crate::ctx::Ctx;
 use crate::error::{code, GateCode, KsError, Result};
@@ -338,7 +338,7 @@ async fn api_ticket(
     Path(id): Path<String>,
 ) -> ApiResult<crate::cmd::ticket::ShowReport> {
     blocking(&st, format!("show {id}"), move |ctx| {
-        crate::cmd::ticket::show(ctx, &ShowArgs { id })
+        crate::cmd::ticket::show_ticket(ctx, &crate::ids::TicketId::parse(&id)?)
     })
     .await
     .map(Json)

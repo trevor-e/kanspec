@@ -291,9 +291,179 @@ pub struct ShowReport {
     pub next: Vec<String>,
 }
 
-pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowReport> {
+/// `show <id>` for ANY id a human meets on a board, in a status line or in a chat: a
+/// ticket gets the full card below; a proposal, decision or quirk gets its label, title,
+/// status and the one verb it is waiting on. Found on a dogfood session that answered
+/// "what is p-97d6?" with `is not a ticket id` — the label is the thing a human reads, and
+/// the verb that prints labels must accept every kind of key they show up on.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ShowAny {
+    Ticket(Box<ShowReport>),
+    Record(RecordShow),
+}
+
+/// The non-ticket half of `show`: what the id is, as a human reads it.
+#[derive(Debug, Serialize)]
+pub struct RecordShow {
+    pub id: String,
+    /// the id as a human reads it — `p-97d6-close-out-rides-in`
+    pub label: String,
+    pub kind: &'static str,
+    pub title: String,
+    pub status: String,
+    /// the chips a card would wear: specs, scope, paths, source, provenance
+    pub detail: Vec<String>,
+    pub next: Vec<String>,
+}
+
+pub fn show(ctx: &Ctx, a: &ShowArgs) -> Result<ShowAny> {
     ctx.require_initialized()?;
-    let id = TicketId::parse(&a.id)?;
+    if let Ok(id) = TicketId::parse(&a.id) {
+        return show_ticket(ctx, &id).map(|r| ShowAny::Ticket(Box::new(r)));
+    }
+    let snap = ctx.snapshot()?;
+    let ks = ctx.invoked_as;
+    if let Ok(id) = ProposalId::parse(&a.id) {
+        if let Some(p) = snap.proposals.get(&id) {
+            let open = derive::unresolved(&snap, &id);
+            let mut detail = Vec::new();
+            if !p.fm.specs.is_empty() {
+                detail.push(format!("specs {}", join(&p.fm.specs, ", ")));
+            }
+            detail.push(format!("{} items", p.items.len()));
+            if open > 0 {
+                detail.push(format!("{open} threads open"));
+            }
+            if let Some(by) = &p.fm.approved {
+                detail.push(format!("approved {by}"));
+            }
+            let next = match p.fm.status {
+                crate::model::ProposalStatus::Draft => vec![format!("{ks} review {id}")],
+                crate::model::ProposalStatus::Review if open > 0 => {
+                    vec![format!("{ks} comments {id} --unresolved")]
+                }
+                crate::model::ProposalStatus::Review => vec![format!("{ks} approve {id}")],
+                crate::model::ProposalStatus::Approved => vec![format!("{ks} close {id}")],
+                _ => Vec::new(),
+            };
+            return Ok(ShowAny::Record(RecordShow {
+                id: id.to_string(),
+                label: snap.label(&id),
+                kind: "proposal",
+                title: p.fm.title.clone(),
+                status: format!("{:?}", p.fm.status).to_lowercase(),
+                detail,
+                next,
+            }));
+        }
+        if snap.closed_ids.contains(id.as_str()) {
+            // Closed proposals bind nothing and are not loaded; saying "not found" about one
+            // that merely closed would send a human hunting for a typo.
+            return Ok(ShowAny::Record(RecordShow {
+                id: id.to_string(),
+                label: id.to_string(),
+                kind: "proposal",
+                title: String::new(),
+                status: "closed".to_string(),
+                detail: vec!["closed — binds nothing; its standing records are in `rules`".into()],
+                next: vec![format!("{ks} rules")],
+            }));
+        }
+        return Err(KsError::not_found(
+            "proposal",
+            id.to_string(),
+            fixes![fix!("kanspec status")],
+        ));
+    }
+    if let Ok(id) = crate::ids::DecisionId::parse(&a.id) {
+        let d = snap.decisions.get(&id).ok_or_else(|| {
+            KsError::not_found("decision", id.to_string(), fixes![fix!("kanspec rules")])
+        })?;
+        let mut detail = vec![format!("dated {}", d.fm.date)];
+        if let Some(src) = &d.fm.source {
+            detail.push(format!("source {src}"));
+        }
+        if !d.fm.scope.is_empty() {
+            detail.push(format!("scope {}", d.fm.scope.join(", ")));
+        }
+        let next = match d.fm.status {
+            crate::model::DecisionStatus::Proposed => vec![format!("{ks} accept {id}")],
+            _ => vec![format!("{ks} why {id}")],
+        };
+        return Ok(ShowAny::Record(RecordShow {
+            id: id.to_string(),
+            label: snap.label(&id),
+            kind: "decision",
+            title: d.fm.title.clone(),
+            status: format!("{:?}", d.fm.status).to_lowercase(),
+            detail,
+            next,
+        }));
+    }
+    if let Ok(id) = crate::ids::QuirkId::parse(&a.id) {
+        let q = snap.quirks.get(&id).ok_or_else(|| {
+            KsError::not_found("quirk", id.to_string(), fixes![fix!("kanspec quirks")])
+        })?;
+        let mut detail = vec![format!("{:?}", q.fm.severity).to_lowercase()];
+        if !q.fm.paths.is_empty() {
+            detail.push(format!("paths {}", q.fm.paths.join(", ")));
+        }
+        if let Some(src) = &q.fm.source {
+            detail.push(format!("learned in {}", snap.label(src)));
+        }
+        return Ok(ShowAny::Record(RecordShow {
+            id: id.to_string(),
+            label: snap.label(&id),
+            kind: "quirk",
+            title: q.fm.title.clone(),
+            status: format!("{:?}", q.fm.status).to_lowercase(),
+            detail,
+            next: vec![format!("{ks} quirks")],
+        }));
+    }
+    Err(KsError::invalid(
+        format!(
+            "`{}` is not a ticket (t-), proposal (p-), decision (D-) or quirk (q-) id",
+            a.id
+        ),
+        fixes![fix!("kanspec ls"), fix!("kanspec status")],
+    ))
+}
+
+impl Render for ShowAny {
+    fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+        match self {
+            ShowAny::Ticket(t) => t.human(w, st),
+            ShowAny::Record(r) => r.human(w, st),
+        }
+    }
+}
+
+impl Render for RecordShow {
+    fn human(&self, w: &mut dyn std::io::Write, st: &Style) -> std::io::Result<()> {
+        let g = match (self.kind, self.status.as_str()) {
+            ("proposal", "closed" | "abandoned") | ("decision", "superseded" | "revoked") => {
+                glyph::FAIL
+            }
+            ("decision", "accepted") | ("quirk", "active") => glyph::OK,
+            _ => crate::out::state_glyph(State::Review),
+        };
+        Line::new(g, &self.title)
+            .id(&self.label)
+            .dim(format!("· {} · {}", self.kind, self.status))
+            .fix(self.next.first().cloned().unwrap_or_default())
+            .write(w, st)?;
+        if !self.detail.is_empty() {
+            writeln!(w, "   {}", self.detail.join(" · "))?;
+        }
+        Ok(())
+    }
+}
+
+/// The ticket card: everything `show` knew before it learned the other three kinds.
+pub fn show_ticket(ctx: &Ctx, id: &TicketId) -> Result<ShowReport> {
+    let id = id.clone();
     let snap = ctx.snapshot()?;
     let t = snap.ticket(&id)?;
     let badge = derive::badge(&snap, t);

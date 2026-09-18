@@ -88,7 +88,10 @@ kanspec/
         │                      completions                                               S7 v0.1
         ├── ticket.rs          new / show / ls / log / where                             S5 v0.1
         ├── flow.rs            ready / start / ship / park / drop                        S5 v0.1
-        ├── done.rs            THE close-out gate (interactive + --json)                 S5 v0.1
+        ├── done.rs            THE close-out gate (interactive + --json); records the
+        │                      close-out on the branch, landed is derived (p-97d6)
+        ├── regen.rs           regenerate [--stage --amend-merge] / merge-driver — the
+        │                      projections' merge driver + post-merge fold (p-97d6 c5)
         ├── status.rs          YOU / AGENT / WATCHING                                    S4 v0.1
         ├── doctor.rs          doctor [--fix]                                            S4 v0.1
         ├── scan.rs            scan [--explain] [--confirm]                              S3 v0.1
@@ -1338,7 +1341,7 @@ impl NoCodeWaiver {
     /// proof the log exists for, and there is no `no_code` `TicketKey` (invariant
     /// 1). Pinned by a unit test asserting the line does NOT parse as a log entry.
     ///
-    /// S5 NOTE: `record` needs `&mut Plan` while `DoneFacts.landed` is built
+    /// S5 NOTE: `record` needs `&mut Plan` while `DoneFacts.close` is built
     /// BEFORE `plan_done` runs, so call it from INSIDE `plan_done` (it is pure —
     /// no IO), not from the handler.
     pub fn record(plan: &mut Plan, id: &TicketId, why: &str, by: &Actor, at: DateTime<Utc>)
@@ -1413,10 +1416,20 @@ impl Detection {
 pub fn ladder(git: &Git, gh: &Gh, t: &Ticket, main: &str,
               fetch_age: Option<Duration>, now: DateTime<Utc>) -> Detection;
 
-/// The `done` gate. RE-RUNS the ladder rather than trusting the cache — "a 60s-old
-/// merged is not a gate". ✅ (One Gate reads `MergeVerdict` straight out of
-/// gitstate.json.)
-pub fn proof_for_done(ctx: &Ctx, t: &Ticket) -> Result<MergedProof>;
+/// The proof-grade question. RE-RUNS the ladder rather than trusting the cache —
+/// "a 60s-old merged is not a proof". Since p-97d6 nothing GATES on it: `done`
+/// records a close-out and landed is derived by `scan`; this remains the only way
+/// to hold a sealed `MergedProof`, and `tests/proof_is_sealed.rs` pins that a
+/// forged cache cannot mint one.
+pub fn prove_landed(ctx: &Ctx, t: &Ticket) -> Result<MergedProof>;
+
+/// p-97d6: what `plan_done` takes instead. `RecordedHead` is minted ONLY by
+/// `head_for_done`, which resolves the branch tip (or the recorded `head:` once
+/// the branch is gone) through git and runs `ship`'s zero-commit guard — so the
+/// `head:` a close-out writes can never be something an agent typed.
+pub struct RecordedHead { sha: Sha, rev: String }
+pub enum CloseOut { Recorded(RecordedHead), NoCode(NoCodeWaiver) }
+pub fn head_for_done(ctx: &Ctx, t: &Ticket) -> Result<RecordedHead>;
 
 /// Runs the ladder across every non-terminal ticket + spec anchors + branch facts.
 /// The ONLY producer of `ScanToken`. Runs OUTSIDE the lock (gh/network); the
@@ -1485,7 +1498,7 @@ pub struct Facts { pub actor: Actor, pub at: DateTime<Utc>, pub invocation: Stri
 pub struct StartFacts { pub base: Facts, pub branch: String,
                         pub worktree: Option<PathBuf>, pub head: HeadSha }
 pub struct ShipFacts  { pub base: Facts, pub head: HeadSha }
-pub struct DoneFacts  { pub base: Facts, pub landed: Landed, pub touched: Vec<ChangedPath> }
+pub struct DoneFacts  { pub base: Facts, pub close: CloseOut, pub touched: Vec<ChangedPath> }
 
 /// The uniform planner shape. Every mutating verb is one of these, and each is a
 /// table-driven unit test against a hand-built `Snapshot` with ZERO IO.
@@ -2234,7 +2247,7 @@ history. What follows is what still buys something.
 | D-2 | Crate list names `gray_matter` | **Removed.** It cannot serialize and mutates content. `src/fm.rs` (first-party) + `serde_yaml_ng` read-only. |
 | D-3 | Ladder rung 4 "patch-id — last resort for squashes" | **Backwards.** Relabelled *rebase/cherry-pick detection*; a `+` line is `Unknown`, never `NotMerged`. |
 | D-4 | Ladder order not fully specified | **Two guards added** before rung 1: object-exists, and `rev-list --count main..head != 0` (a fresh `start` branch is trivially an ancestor — a verified false MERGED). |
-| D-5 | "`prepare-commit-msg` (per-branch, set by `start`)" | **Git has no per-branch hooks.** One repo-wide hook dispatching on `branch.<name>.kanspec-ticket` (read through `hooks::BRANCH_TICKET_KEY` / `hooks::branch_ticket_key`, which `start` must use for the same spelling), skipping `$2 ∈ {merge, squash, commit}`. Installed by `init`, not by `start`. **Round-A correction: it is a PAIR of hooks, not one.** `prepare-commit-msg` runs *before* the editor, so on an interactive commit the message is still empty — and stamping it makes it non-empty, silently destroying git's "an empty message aborts the commit" (reproduced against real git: `GIT_EDITOR=true git commit` committed with the message `Kanspec: t-9c41`). So `prepare-commit-msg` stamps only a message that already has content (`-m`/`-F`/`-t`), and a companion **`commit-msg`** hook, which runs *after* the editor, stamps the rest. Neither stamps twice; both skip a merge, a squash, and anything below a `git commit -v` scissors line. `hooks::HOOKS` therefore has four entries: `post-merge`, `post-checkout`, `prepare-commit-msg`, `commit-msg`. |
+| D-5 | "`prepare-commit-msg` (per-branch, set by `start`)" | **Git has no per-branch hooks.** One repo-wide hook dispatching on `branch.<name>.kanspec-ticket` (read through `hooks::BRANCH_TICKET_KEY` / `hooks::branch_ticket_key`, which `start` must use for the same spelling), skipping `$2 ∈ {merge, squash, commit}`. Installed by `init`, not by `start`. **Round-A correction: it is a PAIR of hooks, not one.** `prepare-commit-msg` runs *before* the editor, so on an interactive commit the message is still empty — and stamping it makes it non-empty, silently destroying git's "an empty message aborts the commit" (reproduced against real git: `GIT_EDITOR=true git commit` committed with the message `Kanspec: t-9c41`). So `prepare-commit-msg` stamps only a message that already has content (`-m`/`-F`/`-t`), and a companion **`commit-msg`** hook, which runs *after* the editor, stamps the rest. Neither stamps twice; both skip a merge, a squash, and anything below a `git commit -v` scissors line. `hooks::HOOKS` therefore has four entries: `post-merge`, `post-checkout`, `prepare-commit-msg`, `commit-msg`. **p-97d6 c5 adds a fifth, `pre-commit`**, gated on `MERGE_HEAD`, so a merge committed by hand after a conflict elsewhere carries regenerated projections; the automatic merge is handled by `post-merge` folding the regeneration into the commit git just made (`cmd/regen.rs` says why `pre-merge-commit`, the obvious hook, cannot: git writes the merge's tree before running it). |
 | D-6 | "resolves `git rev-parse --git-common-dir`" | Insufficient: it is *relative* in the primary worktree. `--path-format=absolute` + `git_dir == common_dir` **first** + `worktree list` fallback + a sanity check that **refuses** rather than guessing. |
 | D-7 | Hooks installed (implied `.git/hooks`) | **Resolve via `rev-parse --git-path hooks`**; `core.hooksPath` (husky/lefthook) makes `.git/hooks` inert. Install kanspec as the entrypoint, move any pre-existing hook to `<hook>.d/10-<name>`. Naive append is unsafe two ways (`exit 0` starvation; missing trailing newline). |
 | D-8 | `head:` "survives branch deletion" | **Narrower than claimed:** ~2 weeks post-reflog-expiry, then gc removes it, and it only rescues rung 1 — which only fires when the SHA is reachable from main anyway. Still recorded: it is `cherry`'s input, the CI-by-SHA key, and `--explain` provenance. |

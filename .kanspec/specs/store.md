@@ -1,6 +1,6 @@
 ---
 feature: 'The single write path: lock, fresh snapshot, pure planner, atomic files, projections republished'
-code: [src/store.rs, src/fm.rs, src/lock.rs, src/plan.rs, src/keys.rs, src/project.rs, src/model.rs, src/logentry.rs, src/doctor.rs]
+code: [src/store.rs, src/fm.rs, src/lock.rs, src/plan.rs, src/keys.rs, src/project.rs, src/model.rs, src/logentry.rs, src/doctor.rs, src/cmd/regen.rs, src/cmd/init.rs]
 ---
 # store
 
@@ -11,4 +11,5 @@ code: [src/store.rs, src/fm.rs, src/lock.rs, src/plan.rs, src/keys.rs, src/proje
 - [store.projections] `transact` republishes KANSPEC-FEATURES.md and KANSPEC-ARCHITECTURE.md itself whenever a plan touches a spec, decision, quirk, rule stamp or the git facts; no handler calls a regenerate. {pre-kanspec}
 - [store.keys] Every frontmatter key is a `keys.rs` variant; a derived fact such as merge state has no variant and so cannot be written into a file. {pre-kanspec}
 - [store.log-proves] Every ticket state is reached by a logged transition; the write path proves the `## Log` before and after staging, so a hand-edited `state:` fails at the next verb. {pre-kanspec}
+- [store.projection-merge] The two generated projections merge through `kanspec merge-driver` (`.gitattributes` `merge=kanspec`, driver config written by `init` beside the hooks): the driver never conflicts and never leaves markers, and the `post-merge` hook regenerates from the merged store and folds the result into the merge commit git just made. {p-97d6}
 - [store.pure-derive] `derive.rs` and every doctor check are functions of the `Snapshot` alone: shifting its clock moves every tripwire, and nothing else moves with the wall clock. {pre-kanspec}

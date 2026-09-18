@@ -186,6 +186,8 @@ pub fn dispatch(ctx: &Ctx, cli: &Cli) -> Result<u8> {
             out::emit(&r, &ctx.out, ctx.invoked_as)?;
             Ok(r.exit_code())
         }
+        C::Regenerate(a) => ok(&cmd::regen::regenerate(ctx, a)?, ctx),
+        C::MergeDriver(a) => ok(&cmd::regen::merge_driver(ctx, a)?, ctx),
     }
 }
 
