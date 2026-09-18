@@ -301,7 +301,7 @@ impl Git {
 
     /// exit 0 -> the output; anything else -> `KsError::Git` naming what failed. The ONE
     /// place a non-zero exit becomes an error, so stderr reaches the message exactly once.
-    fn must(&self, what: &str, args: &[&str], ps: &[Pathspec]) -> Result<GitOut> {
+    pub fn must(&self, what: &str, args: &[&str], ps: &[Pathspec]) -> Result<GitOut> {
         let o = if ps.is_empty() {
             self.run(args)?
         } else {
@@ -373,6 +373,20 @@ impl Git {
                 &o.err,
             )
         })
+    }
+
+    /// The clone's own config file — where `merge.kanspec.driver` lives — for the report.
+    pub fn config_path(&self) -> PathBuf {
+        self.run(&[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "config",
+        ])
+        .ok()
+        .filter(|o| o.code == 0)
+        .map(|o| PathBuf::from(o.out.trim()))
+        .unwrap_or_else(|| self.root.join(".git").join("config"))
     }
 
     /// `symbolic-ref`; `None` means detached HEAD.

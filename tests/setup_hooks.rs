@@ -171,10 +171,9 @@ fn init_is_idempotent_and_never_clobbers_an_edit() {
         ".kanspec/config.toml",
         "port = 6001\nmain = \"origin/trunk\"\n",
     );
-    repo.write(
-        ".gitattributes",
-        "*.png binary\n.kanspec/proposals/**/comments.jsonl merge=union\n",
-    );
+    const ATTRS: &str = "*.png binary\n.kanspec/proposals/**/comments.jsonl merge=union\n\
+                         /KANSPEC-FEATURES.md merge=kanspec\n/KANSPEC-ARCHITECTURE.md merge=kanspec\n";
+    repo.write(".gitattributes", ATTRS);
     repo.write(".kanspec/tickets/t-aaaa.md", "---\nid: t-aaaa\n---\nbody\n");
 
     let r = repo.ks(["init"]).ok();
@@ -185,8 +184,8 @@ fn init_is_idempotent_and_never_clobbers_an_edit() {
     );
     assert_eq!(
         repo.read(".gitattributes"),
-        "*.png binary\n.kanspec/proposals/**/comments.jsonl merge=union\n",
-        "a second init duplicated the merge=union line"
+        ATTRS,
+        "a second init duplicated a merge line"
     );
     assert!(repo.exists(".kanspec/tickets/t-aaaa.md"));
     assert!(
@@ -206,6 +205,18 @@ fn init_appends_the_union_line_to_a_gitattributes_it_did_not_write() {
     let text = repo.read(".gitattributes");
     assert!(text.starts_with("*.png binary\n"), "{text:?}");
     assert!(text.contains("comments.jsonl merge=union"), "{text:?}");
+    // p-97d6 c5: both projections route through the driver, anchored to the repo root.
+    assert!(
+        text.contains("/KANSPEC-FEATURES.md merge=kanspec"),
+        "{text:?}"
+    );
+    assert!(
+        text.contains("/KANSPEC-ARCHITECTURE.md merge=kanspec"),
+        "{text:?}"
+    );
+    // ...and the clone's config names the driver, resolved the way the hooks resolve.
+    let driver = repo.git(&["config", "--local", "--get", "merge.kanspec.driver"]);
+    assert!(driver.contains("merge-driver %O %A %B %P"), "{driver:?}");
 }
 
 #[test]

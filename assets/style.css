@@ -332,6 +332,7 @@ main { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 12px 14px 18px; }
 .chip.mono     { font-family: var(--mono); font-size: 10px; }
 .chip.blocked  { color: var(--ink-3); }
 .chip.threads  { color: var(--blue); background: var(--blue-bg); border-color: transparent; }
+.chip.awaiting { color: var(--green); border-color: var(--green); }
 
 .card-foot {
   display: flex;

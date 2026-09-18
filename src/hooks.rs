@@ -42,7 +42,108 @@ pub const HOOKS: &[&str] = &[
     "post-checkout",
     "prepare-commit-msg",
     "commit-msg",
+    // p-97d6 c5: a merge commit carries the projections regenerated from the MERGED store.
+    // `post-merge` handles the automatic merge (see `action_for` for why it is not
+    // `pre-merge-commit`); `pre-commit`, gated on `MERGE_HEAD`, is the commit a human makes
+    // after resolving conflicts elsewhere in the tree.
+    "pre-commit",
 ];
+
+/// The git merge driver's name — `.gitattributes` says `merge=kanspec`, and
+/// `merge.kanspec.driver` in the clone's config says what that runs. The attributes line
+/// travels with the repo; the config line is per clone, which is why `init` writes it
+/// beside the hooks and `--refresh-hooks` rewrites it.
+pub const MERGE_DRIVER: &str = "kanspec";
+
+/// The `merge=kanspec` attribute for one projection path, anchored to the repo root.
+pub fn merge_attribute_line(projection: &std::path::Path) -> String {
+    format!(
+        "/{} merge={MERGE_DRIVER}",
+        projection.to_string_lossy().replace('\\', "/")
+    )
+}
+
+/// The command git runs for `merge=kanspec`. `%O %A %B %P` are git's placeholders; the
+/// binary resolves through [`BIN_ENV`] exactly as the hooks do, so a cargo target dir or a
+/// test binary drives the same driver the user's install would.
+pub fn merge_driver_command(invoked_as: &str) -> String {
+    format!("\"${{{BIN_ENV}:-{invoked_as}}}\" merge-driver %O %A %B %P")
+}
+
+/// Write `merge.kanspec.{name,driver}` into the clone's config. Idempotent, and reported
+/// like a hook so `init` lists it beside them. Best effort in one respect only: a config
+/// that is read-only leaves the attribute line pointing at a driver git cannot find, which
+/// git treats as a conflict — the exact behaviour a repo without kanspec has today.
+pub fn install_merge_driver(ctx: &Ctx) -> Result<HookReport> {
+    let want = merge_driver_command(ctx.invoked_as);
+    let have = ctx
+        .git
+        .run(&[
+            "config",
+            "--local",
+            "--get",
+            &format!("merge.{MERGE_DRIVER}.driver"),
+        ])
+        .ok()
+        .filter(|o| o.code == 0)
+        .map(|o| o.out.trim().to_string());
+    let action = match have.as_deref() {
+        Some(h) if h == want => HookAction::Unchanged,
+        Some(_) => HookAction::Refreshed,
+        None => HookAction::Installed,
+    };
+    if action.changed() {
+        ctx.git.must(
+            "cannot write the merge driver into git config",
+            &[
+                "config",
+                "--local",
+                &format!("merge.{MERGE_DRIVER}.name"),
+                "kanspec generated projections",
+            ],
+            &[],
+        )?;
+        ctx.git.must(
+            "cannot write the merge driver into git config",
+            &[
+                "config",
+                "--local",
+                &format!("merge.{MERGE_DRIVER}.driver"),
+                &want,
+            ],
+            &[],
+        )?;
+    }
+    Ok(HookReport {
+        hook: "merge-driver",
+        path: ctx.git.config_path(),
+        action,
+        note: Some(format!(
+            "merge.{MERGE_DRIVER}.driver — KANSPEC-*.md never conflict; the merge commit \
+             regenerates them"
+        )),
+    })
+}
+
+/// The inverse of [`install_merge_driver`]. A section that is not there is not an error.
+pub fn remove_merge_driver(ctx: &Ctx) -> Result<HookReport> {
+    let o = ctx.git.run(&[
+        "config",
+        "--local",
+        "--remove-section",
+        &format!("merge.{MERGE_DRIVER}"),
+    ])?;
+    Ok(HookReport {
+        hook: "merge-driver",
+        path: ctx.git.config_path(),
+        action: if o.code == 0 {
+            HookAction::Removed
+        } else {
+            HookAction::Unchanged
+        },
+        note: None,
+    })
+}
 
 /// The marker line that tells install from re-install, and ours from theirs.
 pub const MARKER: &str = "# kanspec-managed hook — do not edit; see `kanspec init --refresh-hooks`";
@@ -326,9 +427,28 @@ command -v "$ks_bin" >/dev/null 2>&1 || exit 0"#
 {resolve}
 "$ks_bin" scan --quiet || exit 0"#
         ),
+        // The tree is MERGED here and nothing has rendered the two projections from it
+        // (p-97d6 c5, see `cmd::regen`). `--amend-merge` folds the regeneration into the
+        // merge commit git just made — and ONLY into that: it refuses unless HEAD is a
+        // merge commit whose first parent is ORIG_HEAD and which no remote ref contains.
+        //
+        // Not `pre-merge-commit`, which looks like the right hook and is not: `git merge`
+        // writes the result tree BEFORE running it, so anything that hook stages is left
+        // in the index beside a merge commit that does not carry it (verified against
+        // git 2.43). `post-merge` sees the finished commit; a guarded amend is the one
+        // honest way to make that commit carry a projection of its own store.
         "post-merge" => format!(
             r#"{resolve}
+"$ks_bin" regenerate --quiet --stage --amend-merge || exit 0
 "$ks_bin" scan --quiet || exit 0"#
+        ),
+        // The same moment, reached by hand: a merge that stopped on a conflict elsewhere
+        // and is being committed after the resolve. Every other commit exits before
+        // resolving the binary, so this costs one `rev-parse` on an ordinary commit.
+        "pre-commit" => format!(
+            r#"[ -e "$(git rev-parse --git-path MERGE_HEAD 2>/dev/null)" ] || exit 0
+{resolve}
+"$ks_bin" regenerate --quiet --stage || exit 0"#
         ),
         // Git has no per-branch hooks (D-5). `kanspec start` records
         // `branch.<name>.kanspec-ticket`; this reads it back, which is why the hook costs

@@ -1,14 +1,18 @@
 //! THE close-out gate — interactive and `--json`, one typed value between them.
 //!
-//! Four cheap steps: verify merged (refuse otherwise; `--no-code --why` is the recorded
-//! escape), leftover triage (spawn / drop-with-reason / actually-done — **no fourth
-//! option**), the knowledge checkpoint, then log the transition and flag the proposal
-//! settling if this was its last live ticket.
+//! Four cheap steps: record the head (read from git; `--no-code --why` is the recorded
+//! escape for work with no branch), leftover triage (spawn / drop-with-reason /
+//! actually-done — **no fourth option**), the knowledge checkpoint, then log the transition
+//! and flag the proposal settling if this was its last live ticket.
 //!
-//! `plan_done` takes a `Landed`, whose two constructors are both sealed in `scan.rs`, so a
-//! `done` that never consulted git **does not compile**. And the proof is re-run FRESH here
-//! rather than read out of `cache/gitstate.json`: a 60-second-old "merged" is a badge, not a
-//! gate.
+//! **`done` records the close-out, not the landing** (p-97d6). It runs on the branch, so the
+//! record rides in the PR that did the work instead of trailing the merge as a commit on
+//! main that a squash-merge team can never land. Landed is derived by the ladder and never
+//! stored: a `done` ticket the scan has not detected sits in the Review column wearing
+//! `closed out · awaiting merge`, and moves to Done the moment git says so.
+//!
+//! `plan_done` takes a `CloseOut`, whose two constructors are both sealed in `scan.rs`, so
+//! a `done` that never consulted git for its `head:` **does not compile**.
 //!
 //! Owner: **S5**.
 
@@ -29,7 +33,7 @@ use crate::model::Snapshot;
 use crate::out::join;
 use crate::out::{glyph, Color, Line, Render, Style};
 use crate::plan::{DoneFacts, EntityRef, Op, Plan};
-use crate::scan::{self, Landed, NoCodeWaiver};
+use crate::scan::{self, CloseOut, NoCodeWaiver};
 use crate::store::Store;
 use crate::transitions::{self, State, Verb};
 use crate::triage::{specs_matching, SpecCheck, Triage};
@@ -40,10 +44,12 @@ pub struct DoneReport {
     pub id: TicketId,
     pub title: String,
     pub state: State,
-    /// how the gate was satisfied: the ladder's badge, or the recorded `--no-code` reason
-    pub landed: String,
-    pub method: Option<String>,
+    /// what was recorded: the head the close-out was written at, or the `--no-code` reason
+    pub closed_out: String,
+    /// the recorded `head:`, short — absent for a `--no-code` close
     pub sha: Option<String>,
+    /// the branch (or recorded head) the SHA was read from
+    pub rev: Option<String>,
     pub spawned: Vec<Spawned>,
     pub dropped_steps: Vec<String>,
     pub marked_done: Vec<usize>,
@@ -78,15 +84,16 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     let snap = ctx.snapshot()?;
     let t = snap.ticket(&id)?;
 
-    // Refuse an illegal move before spending a ladder run on it. The authoritative check
-    // still happens inside the lock, against a fresh snapshot.
+    // Refuse an illegal move before asking git anything. The authoritative check still
+    // happens inside the lock, against a fresh snapshot.
     transitions::require(&id, t.fm.state, Verb::Done)?;
 
-    // ── step 1: verify merged ────────────────────────────────────────────────
+    // ── step 1: record the head ──────────────────────────────────────────────
     //
-    // Every subprocess and network call in this handler happens between here and
-    // `transact`, never inside it.
-    let landed = if a.no_code {
+    // Every subprocess in this handler happens between here and `transact`, never inside
+    // it. No ladder runs here (p-97d6): landed is derived by `scan`, so the close-out can be
+    // written on the branch before the PR is even open.
+    let close = if a.no_code {
         // Step 1 refuses before step 2 asks anything: a caller who cannot use the escape
         // should hear that, not be interviewed about leftover steps first. `plan_done`
         // repeats this check as the backstop every other caller (the server's POST handler,
@@ -100,7 +107,7 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         // into the plan it is building (§2.15's S5 note). Minting it here is what turns an
         // unexplained escape into a refusal *before* the lock is taken.
         let mut probe = Plan::empty();
-        Landed::NoCode(NoCodeWaiver::record(
+        CloseOut::NoCode(NoCodeWaiver::record(
             &mut probe,
             &id,
             a.why.as_deref().unwrap_or_default(),
@@ -108,8 +115,9 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
             ctx.now,
         )?)
     } else {
-        // FRESH: `proof_for_done` re-runs the whole ladder rather than trusting the cache.
-        Landed::Proof(scan::proof_for_done(ctx, t)?)
+        // Through git, with the zero-commit guard: the `head:` this writes is what the
+        // ladder's ancestry rung will ask about once the branch is gone.
+        CloseOut::Recorded(scan::head_for_done(ctx, t)?)
     };
 
     // The branch's own changed paths, for the knowledge checkpoint. `scan::touched_paths`
@@ -146,18 +154,15 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         .flat_map(|sp| sp.fm.code.clone())
         .collect();
 
-    let landed_line = describe(ctx, &landed, &main);
-    let (method, sha) = match &landed {
-        Landed::Proof(p) => (
-            Some(p.method().to_string()),
-            Some(p.sha().short().to_string()),
-        ),
-        Landed::NoCode(_) => (None, None),
+    let closed_out = describe(ctx, &close);
+    let (sha, rev) = match &close {
+        CloseOut::Recorded(h) => (Some(h.sha().short().to_string()), Some(h.rev().to_string())),
+        CloseOut::NoCode(_) => (None, None),
     };
 
     let f = DoneFacts {
         base: ctx.facts(),
-        landed,
+        close,
         touched,
     };
     let committed = Store::open(ctx).transact(Some(Verb::Done), &ctx.invocation(), |s, m| {
@@ -217,6 +222,12 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     if let Some(p) = &settling {
         next.push(format!("{} close {p}", ctx.invoked_as));
     }
+    // The record is on the branch; the tree is what carries it into the PR. Under the
+    // default `sync = "batch"` that is the user's next commit, and saying so here is what
+    // retires the post-merge `kanspec: sync` commit from the sanctioned flow (p-97d6 c6).
+    if sha.is_some() && ctx.cfg.sync == crate::config::SyncMode::Batch {
+        next.push("git add -A .kanspec && git commit".to_string());
+    }
     if let Some(first) = spawned.first() {
         next.push(format!("{} start {}", ctx.invoked_as, first.id));
     }
@@ -234,9 +245,9 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
     Ok(DoneReport {
         title: t.fm.title.clone(),
         state: t.fm.state,
-        landed: landed_line,
-        method,
+        closed_out,
         sha,
+        rev,
         spawned,
         dropped_steps: triage
             .dropped()
@@ -273,16 +284,16 @@ pub fn plan_done(
     let mut plan = Plan::empty();
 
     // ── the gate, as a type ──────────────────────────────────────────────────
-    let landed_note = match &f.landed {
-        crate::scan::Landed::Proof(p) => {
-            format!(
-                "in main {} via {}{}",
-                p.sha().short(),
-                p.method(),
-                p.pr().map(|n| format!(" #{n}")).unwrap_or_default()
-            )
+    //
+    // `CLOSE_NOTE` + the SHA is the durable half of the record: `derive::note_sha` reads it
+    // back as the commit the close-out stands on, exactly as it reads `in main <sha>`.
+    let mut also: Vec<(TicketKey, Yv)> = Vec::new();
+    let landed_note = match &f.close {
+        CloseOut::Recorded(h) => {
+            also.push((TicketKey::Head, Yv::s(h.sha().as_str().to_string())));
+            format!("{CLOSE_NOTE} {} on {}", h.sha().short(), h.rev())
         }
-        crate::scan::Landed::NoCode(w) => {
+        CloseOut::NoCode(w) => {
             // `--no-code` is the chore/docs escape from `doing`. A ticket already in
             // `review` has a branch, a head SHA and a PR: closing THAT without git truth is
             // the exact bypass the gate exists to stop.
@@ -381,7 +392,6 @@ pub fn plan_done(
     }
 
     // ── the transition, last: the authoritative file goes last (R-1) ─────────
-    let mut also: Vec<(TicketKey, Yv)> = Vec::new();
     if let Some(why) = t.spec_unchanged() {
         // Recorded on the ticket and visible on the board: skippable, but every skip is an
         // auditable act.
@@ -432,18 +442,21 @@ fn interactive(ctx: &Ctx) -> bool {
     matches!(ctx.out, OutMode::Human { .. }) && std::io::stdin().is_terminal()
 }
 
-/// The `✓ merged verified: …` line, prepared where the clock and the resolved main branch
-/// are still in scope.
-fn describe(ctx: &Ctx, landed: &Landed, main: &str) -> String {
-    match landed {
-        Landed::Proof(p) => format!(
-            "merged verified: {} reachable from {main} (method: {}{} · checked {})",
-            p.sha().short(),
-            p.method(),
-            p.pr().map(|n| format!(" #{n}")).unwrap_or_default(),
-            crate::out::rel_time(p.checked_at(), ctx.now),
+/// The `## Log` note a close-out opens with. Mirrored by `derive::PROOF_NOTES` (that file
+/// may import nothing from here); `the_close_note_is_one_derive_reads_back` pins the two.
+pub const CLOSE_NOTE: &str = "closed out";
+
+/// The `✓ closed out …` line. It says what was recorded and where landing will come from,
+/// so nobody reads a close-out as a claim that the work is on main.
+fn describe(_ctx: &Ctx, close: &CloseOut) -> String {
+    match close {
+        CloseOut::Recorded(h) => format!(
+            "closed out at {} on {} — landing is detected by git (`kanspec scan`), never \
+             asserted here",
+            h.sha().short(),
+            h.rev(),
         ),
-        Landed::NoCode(w) => format!(
+        CloseOut::NoCode(w) => format!(
             "no code to verify — recorded by {} at {}: {}",
             w.by(),
             w.at().to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -459,7 +472,7 @@ impl Render for DoneReport {
             w,
             "{} {}",
             crate::out::paint(&glyph::OK.to_string(), Color::Green, st.color),
-            self.landed
+            self.closed_out
         )?;
 
         let triaged = self.spawned.len() + self.dropped_steps.len() + self.marked_done.len();
@@ -523,7 +536,7 @@ impl Render for DoneReport {
             .settling_label
             .as_deref()
             .or(self.settling.as_ref().map(ProposalId::as_str))
-            .map(|p| format!(" · {p} is settling (last ticket landed)"))
+            .map(|p| format!(" · {p} is settling (last ticket closed out)"))
             .unwrap_or_default();
         Line::state(self.state, format!("done{settling}"))
             .id(crate::ids::label(&self.id, &self.title))
@@ -601,7 +614,7 @@ mod tests {
         s
     }
 
-    fn facts(landed: Landed) -> DoneFacts {
+    fn facts(close: CloseOut) -> DoneFacts {
         DoneFacts {
             base: Facts {
                 actor: Actor::Human {
@@ -610,16 +623,16 @@ mod tests {
                 at: at(),
                 invocation: "kanspec done t-9c41".into(),
             },
-            landed,
+            close,
             touched: Vec::new(),
         }
     }
 
     /// A `NoCodeWaiver` can only be made by `record`, which is exactly the point: this
     /// helper is the whole surface a test has, and it is the same one the handler uses.
-    fn waiver(why: &str) -> Landed {
+    fn waiver(why: &str) -> CloseOut {
         let mut probe = Plan::empty();
-        Landed::NoCode(
+        CloseOut::NoCode(
             NoCodeWaiver::record(
                 &mut probe,
                 &TicketId::parse("t-9c41").unwrap(),
@@ -768,12 +781,13 @@ mod tests {
         }
     }
 
-    /// `MergedProof` is sealed: `scan.rs` mints one only from a real ladder run against a
-    /// real `Ctx`, which is exactly the property that makes `done` uncheatable — and exactly
-    /// why the PROOF path is proved end to end in `tests/lifecycle.rs` against a real squash
-    /// merge rather than here. The ops below are identical for both `Landed` variants, so
-    /// the recorded escape is the honest way to exercise them without a repository.
-    fn landed(state: State) -> Landed {
+    /// `RecordedHead` is sealed: `scan.rs` mints one only from a real `rev-parse` against a
+    /// real `Ctx`, which is exactly the property that keeps `head:` out of an agent's hands
+    /// — and exactly why the recorded path is proved end to end in `tests/lifecycle.rs`
+    /// against a real branch rather than here. The ops below are identical for both
+    /// `CloseOut` variants, so the recorded escape is the honest way to exercise them
+    /// without a repository.
+    fn landed(state: State) -> CloseOut {
         let _ = state;
         waiver("docs only")
     }

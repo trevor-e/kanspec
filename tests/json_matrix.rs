@@ -227,6 +227,15 @@ fn cases() -> Vec<Case> {
             Run::V02,
         ),
         skip("landcheck", &["landcheck"], Run::V02),
+        // p-97d6 c5: the hook entry points. Both answer on the bare fixture — `regenerate`
+        // re-renders the two projections, and `merge-file` on three identical files is a
+        // clean (and byte-preserving) three-way merge.
+        skip("regenerate", &["regenerate"], Run::V02Read),
+        skip(
+            "merge-driver",
+            &["merge-driver", "README.md", "README.md", "README.md"],
+            Run::V02Read,
+        ),
     ]
 }
 
@@ -296,8 +305,12 @@ fn nothing_is_excluded_from_the_run_matrix_without_a_reason() {
             //   `ci`        — genuinely partial: bare `ci` reports the detected provider,
             //                 but the per-ticket CI reader (homerunner journal + SSE, gh
             //                 fallback) is not built, so `ci why` still refuses.
+            //   `regenerate` / `merge-driver` — the `pre-merge-commit` hook's entry point
+            //                 and the git merge driver (p-97d6 c5): hidden because git and
+            //                 the hooks are their callers, answerable on the bare fixture.
             Run::V02 | Run::V02Read => assert!(
-                !hidden.contains(top) || matches!(top, "landcheck" | "ci"),
+                !hidden.contains(top)
+                    || matches!(top, "landcheck" | "ci" | "regenerate" | "merge-driver"),
                 "{} is hidden but is neither the Stop hook, the partial CI reader,                  nor a shipped verb",
                 case.path
             ),

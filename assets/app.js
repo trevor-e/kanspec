@@ -307,6 +307,13 @@ function renderCard(card) {
   if (card.unresolved > 0) {
     chips.appendChild(el('span', 'chip threads', card.unresolved + ' threads open'));
   }
+  // p-97d6: `done` is recorded on the branch; landed is derived. A close-out git has not
+  // placed yet sits in REVIEW wearing this chip — the mirror of the IN MAIN overlay.
+  if (card.awaiting_merge) {
+    const a = el('span', 'chip awaiting', 'closed out · awaiting merge');
+    a.title = 'done was recorded on the branch; the scan has not seen it on main yet';
+    chips.appendChild(a);
+  }
   if (chips.childNodes.length) n.appendChild(chips);
 
   const foot = el('div', 'card-foot');
@@ -731,7 +738,7 @@ function verbsFor(t) {
 
   const hint = el('div', 'sub');
   hint.style.marginTop = '8px';
-  hint.textContent = 'done runs the full gate — it refuses without a git-detected merge, and prints why.';
+  hint.textContent = 'done records the close-out on the branch — landed is detected by git afterwards, never asserted here.';
   s.appendChild(hint);
   return s;
 }

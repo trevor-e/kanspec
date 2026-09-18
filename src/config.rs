@@ -137,6 +137,8 @@ pub struct Windows {
     pub stall_secs: u64,
     pub review_dwell_secs: u64,
     pub in_main_dwell_secs: u64,
+    /// `done` recorded on the branch, and no scan has seen it land (p-97d6 c3)
+    pub landing_dwell_secs: u64,
     pub settling_dwell_secs: u64,
     pub discovered_dwell_secs: u64,
     /// how long an accepted decision stands before `rules --audit` asks whether it is
@@ -153,6 +155,7 @@ impl Default for Windows {
             stall_secs: 7_200,
             review_dwell_secs: 604_800,
             in_main_dwell_secs: 86_400,
+            landing_dwell_secs: 604_800,
             settling_dwell_secs: 259_200,
             discovered_dwell_secs: 604_800,
             decision_review_secs: 7_776_000,
@@ -332,7 +335,8 @@ architecture = "{architecture}"
 [windows]
 stall_secs            = {stall}     # doing, no commit or update -> STALLED
 review_dwell_secs     = {review}   # in review this long -> a WATCHING line
-in_main_dwell_secs    = {in_main}    # landed but not closed
+in_main_dwell_secs    = {in_main}    # landed but not closed out
+landing_dwell_secs    = {landing}   # closed out, not yet detected on main
 settling_dwell_secs   = {settling}   # proposal's last ticket landed, not closed
 discovered_dwell_secs = {discovered}   # discovered_in ticket sitting untriaged
 decision_review_secs  = {decision_review}  # accepted this long, proposal closed -> audit asks
@@ -379,6 +383,7 @@ changes_max       = {changes_max}       # ... or that implements more [cN] than 
             stall = d.windows.stall_secs,
             review = d.windows.review_dwell_secs,
             in_main = d.windows.in_main_dwell_secs,
+            landing = d.windows.landing_dwell_secs,
             settling = d.windows.settling_dwell_secs,
             discovered = d.windows.discovered_dwell_secs,
             decision_review = d.windows.decision_review_secs,

@@ -171,6 +171,17 @@ pub fn run(ctx: &Ctx, agent: Agent, remove: bool) -> Result<Vec<SetupChange>> {
         what: "git hook",
         changed: h.action.changed(),
     }));
+    // The projections' merge driver is per-clone git config and belongs with the hooks.
+    let driver = if remove {
+        crate::hooks::remove_merge_driver(ctx)?
+    } else {
+        crate::hooks::install_merge_driver(ctx)?
+    };
+    changes.push(SetupChange {
+        path: driver.path,
+        what: "merge driver",
+        changed: driver.action.changed(),
+    });
 
     let root = ctx.repo.primary_root();
     for c in &mut changes {

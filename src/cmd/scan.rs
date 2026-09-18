@@ -218,7 +218,11 @@ fn next_verb(state: State, status: MergeStatus, id: &TicketId) -> Option<String>
     match (status, state) {
         (MergeStatus::Merged, State::Review) => Some(format!("kanspec done {id}")),
         (MergeStatus::Merged, State::Doing) => Some(format!("kanspec ship {id}")),
-        (MergeStatus::Unknown, State::Review) => Some(format!("kanspec scan --explain {id}")),
+        // A close-out git cannot place yet (p-97d6): the question goes to git, and the
+        // recorded override is the human's answer when git has none.
+        (MergeStatus::Unknown, State::Review | State::Done) => {
+            Some(format!("kanspec scan --explain {id}"))
+        }
         _ => None,
     }
 }

@@ -6,7 +6,9 @@ code: [src/cmd/ticket.rs, src/cmd/flow.rs, src/cmd/done.rs, src/triage.rs, src/t
 
 ## Rules
 - [verbs.claim-first] `start` is the claim and the lock: the branch is cut from the configured main with `--no-track`, the claim is logged, and the verb refuses when main cannot see the store (`main_blind`, `main_behind`). {pre-kanspec}
-- [verbs.done-gate] `done` re-runs the ladder at close time, triages every unchecked step (spawn, drop with a reason, or actually done, no fourth option) and takes one spec waiver per uncovered spec, never a blanket. {pre-kanspec}
+- [verbs.done-gate] `done` triages every unchecked step (spawn, drop with a reason, or actually done, no fourth option) and takes one spec waiver per uncovered spec, never a blanket. {pre-kanspec}
+- [verbs.done-records] `done` records the close-out, not the landing: legal from `doing` and `review`, it writes `state: done` with `head:` read from git and a `closed out <sha> on <rev>` log line, on the branch, so the record rides in the PR. It never runs the ladder and never asserts a merge. {p-97d6}
+- [verbs.landing-dwell] A `done` ticket no scan has detected on main for `[windows] landing_dwell_secs` is a WATCHING line — `closed out Nd ago, not on main` — whose fix is `scan --explain`, never a verb. {p-97d6}
 - [verbs.no-confirm] Agents never run `scan --confirm`; the human override is signed into the `## Log` and is the only merge attestation a person makes. {pre-kanspec}
 - [verbs.fix-named] Every refusal is a `KsError` naming its one fix; gate codes are the closed `GateCode` enum, serialised snake_case, which hooks and agents branch on and which never change once shipped. {pre-kanspec}
 - [verbs.status-owner] `status` lists what only a human can discharge under YOU (in main not closed, proposals in review, proposed decisions), agent work under AGENT and tripwires under WATCHING; every line names its fix. {pre-kanspec}

@@ -432,7 +432,7 @@ fn the_done_gate_refuses_an_undetectable_merge_and_hands_back_the_ladder() {
     let t = snap
         .ticket(&TicketId::parse(Shape::SquashGhTitleOnly.ticket()).unwrap())
         .unwrap();
-    let err = scan::proof_for_done(&ctx, t).expect_err("an undecidable merge cannot close");
+    let err = scan::prove_landed(&ctx, t).expect_err("an undecidable merge cannot close");
     assert_eq!(err.kind(), "gate");
     assert_eq!(err.code(), Some("not_landed"));
     match err.detail() {
@@ -455,7 +455,7 @@ fn the_done_gate_refuses_an_undetectable_merge_and_hands_back_the_ladder() {
     let t = snap
         .ticket(&TicketId::parse(Shape::TrueMerge.ticket()).unwrap())
         .unwrap();
-    let proof = scan::proof_for_done(&ctx, t).expect("ancestry proves this one");
+    let proof = scan::prove_landed(&ctx, t).expect("ancestry proves this one");
     assert_eq!(proof.method(), Method::Ancestry);
     assert_eq!(proof.ticket().as_str(), Shape::TrueMerge.ticket());
     // The badge takes the CALLER'S clock (round B), so it is deterministic under
@@ -514,7 +514,7 @@ fn a_confirmation_is_recorded_on_the_ticket_and_outlives_a_cache_wipe() {
     let ctx = ctx_at(&repo.root);
     let snap = ctx.snapshot().unwrap();
     let t = snap.ticket(&TicketId::parse(id).unwrap()).unwrap();
-    let proof = scan::proof_for_done(&ctx, t).expect("the recorded override unblocks `done`");
+    let proof = scan::prove_landed(&ctx, t).expect("the recorded override unblocks `done`");
     assert_eq!(proof.method(), Method::HumanConfirm);
     assert_eq!(
         proof.sha().as_str(),

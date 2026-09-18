@@ -99,13 +99,13 @@ pub enum Command {
     Start(StartArgs),
     /// doing -> review; records the head SHA from git and the PR number
     Ship(ShipArgs),
-    /// The close-out gate: requires a git-detected merge
+    /// The close-out gate: records done on the branch; landed is derived by scan
     Done(DoneArgs),
     /// doing -> todo; an explicit unclaim so nothing rots silently
     Park(ParkArgs),
     /// any -> dropped
     Drop(DropArgs),
-    /// Show one ticket with its badges, context and owed verb
+    /// Show a ticket with its badges, context and owed verb — or what any p-/D-/q- id is
     Show(ShowArgs),
     /// Print a ticket's transition log
     Log(LogArgs),
@@ -183,6 +183,19 @@ pub enum Command {
     /// not a verb a human is meant to reach for from `--help`.
     #[command(hide = true)]
     Landcheck(LandcheckArgs),
+    /// Re-render KANSPEC-FEATURES.md and KANSPEC-ARCHITECTURE.md from the store; --stage adds them
+    ///
+    /// Hidden: `transact` already regenerates the projections on every verb that changes
+    /// their sources, so this exists for the `pre-merge-commit` hook — the one moment a
+    /// merged store is on disk and nothing has rendered it yet (p-97d6 c5).
+    #[command(hide = true)]
+    Regenerate(RegenerateArgs),
+    /// The `merge.kanspec.driver` git calls for the two generated projections
+    ///
+    /// Hidden: git is the only caller. It never conflicts and never prints; see
+    /// `cmd::regen` for why it cannot regenerate and what does instead.
+    #[command(hide = true)]
+    MergeDriver(MergeDriverArgs),
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -341,8 +354,8 @@ pub struct DoneArgs {
     #[arg(long, conflicts_with = "decision")]
     pub no_decisions: bool,
 
-    // ── the merge gate's recorded escape ──────────────────────────────────────
-    /// Chore/docs escape: close without a git-detected merge. Requires --why
+    // ── the recorded escape for work with no branch ───────────────────────────
+    /// Chore/docs escape: close without a branch or a head to record. Requires --why
     #[arg(long, requires = "why")]
     pub no_code: bool,
     /// The recorded reason for --no-code
@@ -370,7 +383,7 @@ pub struct DropArgs {
 
 #[derive(Args, Debug)]
 pub struct ShowArgs {
-    /// The ticket to show
+    /// The ticket, proposal, decision or quirk to show — a bare key or its label
     pub id: String,
 }
 
@@ -810,6 +823,33 @@ pub struct LandcheckArgs {
     /// Report what would block without exiting 2
     #[arg(long)]
     pub dry_run: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RegenerateArgs {
+    /// `git add` whichever projections exist, so a merge commit carries them
+    #[arg(long)]
+    pub stage: bool,
+    /// After staging a changed projection, fold it into the merge commit git JUST made —
+    /// refused unless HEAD is a merge commit, its first parent is ORIG_HEAD, and no remote
+    /// ref contains it. The `post-merge` hook's flag.
+    #[arg(long, requires = "stage")]
+    pub amend_merge: bool,
+    /// Print nothing on success — the hooks run this
+    #[arg(long)]
+    pub quiet: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MergeDriverArgs {
+    /// %O — the common ancestor's version
+    pub base: PathBuf,
+    /// %A — our version; the driver writes its result here
+    pub ours: PathBuf,
+    /// %B — their version
+    pub theirs: PathBuf,
+    /// %P — the path being merged, for the record
+    pub path: Option<String>,
 }
 
 #[cfg(test)]

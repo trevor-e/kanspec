@@ -51,7 +51,8 @@ projection.
 [windows]
 stall_secs            = 7200     # doing, no commit or update -> STALLED
 review_dwell_secs     = 604800   # in review this long -> a WATCHING line
-in_main_dwell_secs    = 86400    # landed but not closed
+in_main_dwell_secs    = 86400    # landed but not closed out
+landing_dwell_secs    = 604800   # closed out, not yet detected on main
 settling_dwell_secs   = 259200   # proposal's last ticket landed, not closed
 discovered_dwell_secs = 604800   # a discovered_in ticket sitting untriaged
 decision_review_secs  = 7776000  # accepted this long with its proposal closed -> `rules --audit` asks

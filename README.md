@@ -80,7 +80,7 @@ kanspec ready                     # todo tickets with every dep satisfied
 kanspec start t-9c41              # atomic claim; creates ks/t-9c41-rate-limit-login
 kanspec ship  t-9c41 --pr 142     # records the head SHA from git, never typed
 kanspec scan                      # merge detection: ancestry -> gh -> trailer -> patch-id
-kanspec done  t-9c41              # the close-out gate; refuses without a git-detected merge
+kanspec done  t-9c41              # the close-out gate, run ON THE BRANCH: records done; git detects landing
 
 kanspec status                    # everything non-terminal, grouped by who owes the next verb
 kanspec up                        # live board on 127.0.0.1:5757

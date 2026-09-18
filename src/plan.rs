@@ -382,8 +382,8 @@ pub struct ShipFacts {
 
 pub struct DoneFacts {
     pub base: Facts,
-    /// a `MergedProof` from a freshly re-run ladder, or a recorded `NoCodeWaiver`
-    pub landed: crate::scan::Landed,
+    /// the head git resolved for the close-out, or a recorded `NoCodeWaiver` (p-97d6)
+    pub close: crate::scan::CloseOut,
     pub touched: Vec<crate::git::ChangedPath>,
 }
 
