@@ -133,7 +133,10 @@ fn propose_pre_mints_one_ticket_placeholder_per_capability() {
     let src = repo.read(&format!(".kanspec/proposals/{none}/proposal.md"));
     assert!(src.contains("## Tickets\n"), "{src}");
     assert!(src.contains("- [t1] \n"), "{src}");
-    assert!(!src.contains("- [t1] (spec:"), "no capability, no spec on the placeholder:\n{src}");
+    assert!(
+        !src.contains("- [t1] (spec:"),
+        "no capability, no spec on the placeholder:\n{src}"
+    );
     assert!(src.contains("One ticket is one PR is one session"), "{src}");
 }
 
