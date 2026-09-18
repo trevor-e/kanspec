@@ -65,6 +65,9 @@ pub struct DoneReport {
     pub spec_globs: Vec<String>,
     /// "parked 2 discovered tickets" — nothing captured along the way rots silently
     pub discovered: Vec<TicketId>,
+    /// `discovered` as a human reads them — labels, never bare keys
+    #[serde(skip)]
+    pub discovered_labels: String,
     pub next: Vec<String>,
 }
 
@@ -261,6 +264,7 @@ pub fn done(ctx: &Ctx, a: &DoneArgs) -> Result<DoneReport> {
         spec_globs,
         settling_label: settling.as_ref().map(|p| snap.label(p)),
         settling,
+        discovered_labels: snap.labels(&discovered, ", "),
         discovered,
         next,
         id,
@@ -552,7 +556,11 @@ impl Render for DoneReport {
                 glyph::DISCOVERED,
                 self.discovered.len(),
                 if self.discovered.len() == 1 { "" } else { "s" },
-                join(&self.discovered, ", ")
+                if self.discovered_labels.is_empty() {
+                    join(&self.discovered, ", ")
+                } else {
+                    self.discovered_labels.clone()
+                }
             )?;
         }
         for n in self.next.iter().skip(1) {
