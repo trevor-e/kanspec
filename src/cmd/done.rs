@@ -323,6 +323,7 @@ pub fn plan_done(
             discovered_in: None,
             created: f.base.at,
             genesis: &genesis,
+            steps: &[],
         });
         plan.push(Op::CreateEntity {
             entity: EntityRef::Ticket(new_id.clone()),

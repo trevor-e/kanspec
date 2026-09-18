@@ -639,6 +639,13 @@ pub fn render_page_html(p: &crate::cmd::proposal::ProposalPage) -> String {
             }
             // What the ticket will have to read — one dim line under the item, the same
             // text `review` prints, so a human sees the cut before they approve it.
+            if !i.steps.is_empty() {
+                h.push_str("<ul class=\"steps\">");
+                for s in &i.steps {
+                    let _ = write!(h, "<li>{}</li>", esc(s));
+                }
+                h.push_str("</ul>");
+            }
             if let Some(b) = &i.budget {
                 let _ = write!(h, "<div class=\"budget\">{}</div>", esc(&b.line));
             }

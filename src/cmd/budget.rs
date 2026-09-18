@@ -41,6 +41,11 @@ pub struct ItemBudget {
     pub surface: Option<Surface>,
     /// the backticked paths from the implemented `[cN]` bullets that narrowed the surface
     pub narrowed_to: Vec<String>,
+    /// the `· S ·` estimate the author wrote, if any
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    /// the sub-bullets under the item — the steps the ticket will be minted with
+    pub steps: usize,
     /// the one line every surface prints, so they cannot drift
     pub line: String,
 }
@@ -66,7 +71,17 @@ pub fn for_proposal(ctx: &Ctx, s: &Snapshot, p: &Proposal) -> Result<Vec<ItemBud
             })
             .flat_map(|c| paths_named(&c.text))
             .collect();
-        out.push(for_item(ctx, s, item, spec, &named)?);
+        let mut b = for_item(ctx, s, item, spec, &named)?;
+        b.size = bullet.size.clone();
+        b.steps = i.steps.len();
+        if b.steps > 0 {
+            b.line.push_str(&format!(
+                " · {} step{}",
+                b.steps,
+                if b.steps == 1 { "" } else { "s" }
+            ));
+        }
+        out.push(b);
     }
     Ok(out)
 }
@@ -86,6 +101,8 @@ fn for_item(
             reads: None,
             surface: None,
             narrowed_to: Vec::new(),
+            size: None,
+            steps: 0,
         });
     };
     if !s.specs.contains_key(&name) {
@@ -96,6 +113,8 @@ fn for_item(
             reads: None,
             surface: None,
             narrowed_to: Vec::new(),
+            size: None,
+            steps: 0,
         });
     }
     let files = super::rules::spec_files(ctx, s, &name)?;
@@ -134,6 +153,8 @@ fn for_item(
         reads: Some(reads),
         surface,
         narrowed_to,
+        size: None,
+        steps: 0,
         line,
     })
 }

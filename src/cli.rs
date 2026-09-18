@@ -265,6 +265,9 @@ pub struct NewArgs {
     /// Do not stamp discovered_in at all
     #[arg(long)]
     pub no_link: bool,
+    /// A step under `## Steps`, unchecked; repeatable, in order
+    #[arg(long = "step", value_name = "TEXT")]
+    pub steps: Vec<String>,
 }
 
 #[derive(Args, Debug)]

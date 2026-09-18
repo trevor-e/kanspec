@@ -608,6 +608,82 @@ fn every_ticket_item_shows_what_it_will_have_to_read() {
     assert!(!src.contains("reads 1 rule"), "{src}");
 }
 
+/// p-67f0 c4: sub-bullets under a `[tN]` mint as that ticket's `## Steps`, the estimate
+/// segment is read onto the budget line, and a bare `[tN]` still mints an empty list.
+#[test]
+fn sub_bullets_under_a_ticket_item_mint_as_its_steps() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    let p = only_proposal(&repo);
+    let id = &p[..6];
+    body(
+        &repo,
+        &p,
+        "## Why\nwhy\n\n## Changes\n- [c1] lockout\n\n## Prescriptions\n\n## Tickets\n- [t1] Rate-limit login endpoint · L · implements: c1\n  - lockout counter in Redis\n  - 429 + Retry-After on lock\n  - test: two concurrent requests\n- [t2] A bare item\n",
+    );
+    let out: serde_json::Value = repo.json(&["review", id]);
+    assert_eq!(out["budgets"][0]["steps"], 3);
+    assert_eq!(out["budgets"][0]["size"], "L");
+    assert!(
+        out["budgets"][0]["line"]
+            .as_str()
+            .unwrap()
+            .ends_with("· 3 steps"),
+        "{}",
+        out["budgets"][0]
+    );
+    assert_eq!(out["budgets"][1]["steps"], 0);
+    assert!(out["budgets"][1].get("size").is_none());
+
+    let ctx = common::ctx_at(&repo.root);
+    let model = kanspec::cmd::proposal::page(&ctx, id).expect("the page assembles");
+    let t1 = model
+        .items
+        .iter()
+        .find(|i| i.kind == 't' && i.id.n == 1)
+        .unwrap();
+    assert_eq!(t1.steps.len(), 3, "the page shows the steps-to-be");
+
+    let out: serde_json::Value = repo.json(&["approve", id]);
+    let minted = out["minted"].as_array().unwrap();
+    assert_eq!(minted.len(), 2);
+    let t1 = repo.read(&format!(
+        ".kanspec/tickets/{}.md",
+        minted[0].as_str().unwrap()
+    ));
+    let steps: Vec<&str> = t1.lines().filter(|l| l.starts_with("- [ ] ")).collect();
+    assert_eq!(
+        steps,
+        [
+            "- [ ] lockout counter in Redis",
+            "- [ ] 429 + Retry-After on lock",
+            "- [ ] test: two concurrent requests",
+        ]
+    );
+    assert!(
+        !t1.contains("· L ·") && !t1.contains("size"),
+        "the estimate is never stored:\n{t1}"
+    );
+    let t2 = repo.read(&format!(
+        ".kanspec/tickets/{}.md",
+        minted[1].as_str().unwrap()
+    ));
+    assert!(
+        !t2.contains("- [ ]"),
+        "a bare item mints an empty list, exactly as before"
+    );
+
+    // `new --step` is the same scaffold by hand, in order.
+    let out: serde_json::Value =
+        repo.json(&["new", "By hand", "--step", "first", "--step", "second"]);
+    let t = repo.read(&format!(
+        ".kanspec/tickets/{}.md",
+        out["id"].as_str().unwrap()
+    ));
+    let steps: Vec<&str> = t.lines().filter(|l| l.starts_with("- [ ] ")).collect();
+    assert_eq!(steps, ["- [ ] first", "- [ ] second"]);
+}
+
 /// `abandon` makes no claim that anything was dispositioned, so it must never stamp a
 /// ledger or move the directory — only `close` earns those.
 #[test]
