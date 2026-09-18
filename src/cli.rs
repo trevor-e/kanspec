@@ -509,6 +509,10 @@ pub struct RulesArgs {
     /// Lift the `[prime] spec_budget_tokens` budget: every rule of every matched spec
     #[arg(long, conflicts_with_all = ["audit", "adopt"])]
     pub full: bool,
+    /// What an agent will have to read before touching this capability: the standing
+    /// rules in scope for a branch under the spec's `code:` globs, in tokens
+    #[arg(long, value_name = "SPEC", conflicts_with_all = ["paths", "audit", "adopt", "full"])]
+    pub budget: Option<String>,
 }
 
 #[derive(Args, Debug)]

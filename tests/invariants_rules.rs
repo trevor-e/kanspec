@@ -129,6 +129,79 @@ fn accept(repo: &TestRepo, title: &str, scope: &str) -> String {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// The per-capability budget (p-67f0 c5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `rules --budget auth` is the generator pointed at every tracked file under auth's
+/// globs — so its injected figure is exactly what `rules --path <each file>` prints, in
+/// tokens, and therefore exactly what `prime` spends on a branch touching them all.
+#[test]
+fn the_budget_figure_is_what_a_branch_under_the_globs_would_be_served() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.write("src/auth/login.ts", "export const login = 1;\n");
+    repo.write("src/auth/session.ts", "export const session = 1;\n");
+    repo.write("src/billing/charge.ts", "export const charge = 1;\n");
+    repo.commit("auth + billing code");
+
+    let out: serde_json::Value = repo.json(&["rules", "--budget", "auth"]);
+    let b = &out["budget"];
+    assert_eq!(b["files"], 2, "the two tracked files under src/auth/**");
+    assert_eq!(b["scoped"], true);
+    assert_eq!(
+        b["decisions"], 1,
+        "the auth decision's scope reaches the surface"
+    );
+    assert_eq!(b["quirks"], 1, "the auth quirk; billing's is not in scope");
+    assert_eq!(
+        b["rules"], 2,
+        "auth's two rules; billing's globs are untouched"
+    );
+
+    let served = repo
+        .ks([
+            "rules",
+            "--path",
+            "src/auth/login.ts",
+            "--path",
+            "src/auth/session.ts",
+        ])
+        .ok()
+        .stdout;
+    assert_eq!(
+        b["injected_tokens"].as_u64().unwrap() as usize,
+        served.len() / 4,
+        "the figure is the served payload in tokens, not a second estimate"
+    );
+    // One small spec never exceeds the prime budget, so the two figures agree.
+    assert_eq!(b["tokens"], b["injected_tokens"]);
+
+    // The human line names the surface and disclaims the work.
+    let human = repo.ks(["rules", "--budget", "auth"]).ok().stdout;
+    assert!(human.contains("reads 2 rules"), "{human}");
+    assert!(human.contains("surface 2 files"), "{human}");
+    assert!(human.contains("never an estimate of the work"), "{human}");
+}
+
+#[test]
+fn a_spec_without_code_globs_has_an_unknown_surface() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.ks(["spec", "new", "docs", "--feature", "The handbook"])
+        .ok();
+    append_rule(&repo, "docs", "- [docs.tone] Plain words. {p-1111}");
+    let out: serde_json::Value = repo.json(&["rules", "--budget", "docs"]);
+    assert_eq!(out["budget"]["scoped"], false);
+    assert_eq!(out["budget"]["rules"], 1, "its own rule, not the corpus");
+    assert_eq!(out["budget"]["decisions"], 0);
+    let human = repo.ks(["rules", "--budget", "docs"]).ok().stdout;
+    assert!(human.contains("surface unknown"), "{human}");
+
+    let r = repo.ks(["rules", "--budget", "nope"]);
+    assert_ne!(r.code, 0, "an unknown spec is a typed refusal");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Invariant 3
 // ─────────────────────────────────────────────────────────────────────────────
 

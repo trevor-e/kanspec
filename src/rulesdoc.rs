@@ -734,6 +734,97 @@ pub struct AuditWarning {
     pub adoptable: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// THE PER-CAPABILITY BUDGET (p-67f0 c5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What an agent will have to READ before touching one capability: the standing rules
+/// that ride in `prime` for a branch touching every tracked file under the spec's `code:`
+/// globs. It is a fact about the corpus and the tree — the same generator `prime` spends,
+/// pointed at the spec's own surface — and never an estimate of the work itself. `review`
+/// puts it under every `[tN]` so an oversized cut is visible before `approve`.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecBudget {
+    pub spec: SpecName,
+    /// tracked files under the spec's `code:` globs — the scope the figure was built for
+    pub files: usize,
+    /// false when the spec names no `code:` globs: the figure is then the spec's own rules
+    /// alone, because nothing associates it with a path
+    pub scoped: bool,
+    /// accepted decisions whose scope the surface reaches (their full text is injected)
+    pub decisions: usize,
+    /// active quirks whose paths the surface reaches
+    pub quirks: usize,
+    /// spec rules in scope, across every spec the surface reaches — the whole reading list
+    pub rules: usize,
+    /// everything in scope, in tokens — what the agent is expected to read, budget or not
+    pub tokens: usize,
+    /// what `prime` would actually inject under `[prime] spec_budget_tokens`; the rest is
+    /// named on the payload as elided
+    pub injected_tokens: usize,
+    /// specs the prime budget would name but not show for this surface
+    pub elided: usize,
+}
+
+/// The figure for `name`, given the tracked files under its globs (listed by the caller
+/// with `git ls-files`, so this stays pure). A spec with no `code:` globs — or globs that
+/// match no tracked file — has no surface to scope by, and an empty scope would mean
+/// *unscoped*, i.e. the whole corpus; the figure is then the spec's own rules and nothing
+/// else, and `scoped`/`files` say so.
+pub fn spec_budget(s: &Snapshot, name: &SpecName, files: &[String]) -> Result<SpecBudget> {
+    let spec = s.specs.get(name).ok_or_else(|| {
+        KsError::not_found("spec", name.as_str(), fixes![fix!("kanspec features")])
+    })?;
+    let scoped = !spec.fm.code.is_empty();
+    if !scoped || files.is_empty() {
+        let mut own = spec_line(&spec.name);
+        for r in &spec.rules {
+            own.push_str(&rule_line(&StandingRule {
+                spec: spec.name.clone(),
+                anchor: r.anchor.clone(),
+                text: r.text.clone(),
+                provenance: r.provenance.clone(),
+            }));
+        }
+        let tokens = own.len() / CHARS_PER_TOKEN;
+        return Ok(SpecBudget {
+            spec: spec.name.clone(),
+            files: 0,
+            scoped,
+            decisions: 0,
+            quirks: 0,
+            rules: spec.rules.len(),
+            tokens,
+            injected_tokens: tokens,
+            elided: 0,
+        });
+    }
+    let scope = Scope::of(files)?;
+    let full = build_full(s, &scope);
+    let budgeted = build(s, &scope);
+    Ok(SpecBudget {
+        spec: spec.name.clone(),
+        files: files.len(),
+        scoped,
+        decisions: full.decisions.iter().filter(|d| d.body.is_some()).count(),
+        quirks: full.quirks.len(),
+        rules: full.spec_rules.len(),
+        tokens: render_text(&full).len() / CHARS_PER_TOKEN,
+        injected_tokens: render_text(&budgeted).len() / CHARS_PER_TOKEN,
+        elided: budgeted.elided.len(),
+    })
+}
+
+/// `~0.9k` — tokens as a human reads them on a budget line. Under a thousand the exact
+/// count is short enough to print.
+pub fn tokens_short(n: usize) -> String {
+    if n < 1000 {
+        format!("~{n}")
+    } else {
+        format!("~{:.1}k", n as f64 / 1000.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -829,6 +920,71 @@ mod tests {
         );
         s.specs.insert(sp.name.clone(), sp);
         s
+    }
+
+    #[test]
+    fn the_budget_is_the_generator_pointed_at_the_specs_own_surface() {
+        let s = corpus();
+        let auth = SpecName::parse("auth").unwrap();
+        let files = vec!["src/auth/login.ts".to_string()];
+        let b = spec_budget(&s, &auth, &files).unwrap();
+        assert!(b.scoped);
+        assert_eq!(b.files, 1);
+        assert_eq!(
+            b.decisions, 1,
+            "D-8c1a's scope reaches the surface; D-2c77 is proposed"
+        );
+        assert_eq!(b.quirks, 0, "q-22cd is fixed and q-11ba is billing's");
+        assert_eq!(b.rules, 1);
+        // The figure IS the rendered payload for that scope, in the budget's own unit.
+        let doc = build_full(&s, &Scope::of(&files).unwrap());
+        assert_eq!(b.tokens, render_text(&doc).len() / CHARS_PER_TOKEN);
+        assert!(b.tokens > 0);
+        assert_eq!(
+            b.injected_tokens, b.tokens,
+            "one small spec never exceeds the budget"
+        );
+        assert_eq!(b.elided, 0);
+    }
+
+    #[test]
+    fn a_spec_with_no_surface_is_its_own_rules_and_says_so() {
+        let mut s = corpus();
+        let sp = spec("docs", &[], &[("docs.tone", "Plain words.")]);
+        s.specs.insert(sp.name.clone(), sp);
+        let docs = SpecName::parse("docs").unwrap();
+        let b = spec_budget(&s, &docs, &[]).unwrap();
+        assert!(
+            !b.scoped,
+            "no code globs: nothing associates it with a path"
+        );
+        assert_eq!(b.files, 0);
+        assert_eq!((b.decisions, b.quirks, b.rules), (0, 0, 1));
+        assert!(
+            b.tokens > 0 && b.tokens < 100,
+            "its one rule, not the whole corpus"
+        );
+
+        // Globs that match no tracked file are the same shape, but the spec IS scoped.
+        let auth = SpecName::parse("auth").unwrap();
+        let b = spec_budget(&s, &auth, &[]).unwrap();
+        assert!(b.scoped);
+        assert_eq!((b.files, b.decisions, b.rules), (0, 0, 1));
+    }
+
+    #[test]
+    fn an_unknown_spec_is_a_not_found_naming_the_fix() {
+        let s = corpus();
+        let e = spec_budget(&s, &SpecName::parse("nope").unwrap(), &[]).unwrap_err();
+        assert!(e.to_string().contains("nope"), "{e}");
+    }
+
+    #[test]
+    fn tokens_read_short() {
+        assert_eq!(tokens_short(0), "~0");
+        assert_eq!(tokens_short(999), "~999");
+        assert_eq!(tokens_short(1000), "~1.0k");
+        assert_eq!(tokens_short(2450), "~2.5k");
     }
 
     #[test]
