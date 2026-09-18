@@ -52,13 +52,38 @@ fn scaffold(
          ## Changes\n- [c1] \n\n\
          ## Testing and verification\n\n\
          ## Prescriptions\n\n\
-         ## Tickets\n",
+         ## Tickets\n{TICKETS_NORM}\n{}",
         fm::emit(&Yv::s(title), false),
         fm::emit(
             &Yv::list(specs.iter().map(ToString::to_string).collect::<Vec<_>>()),
             true
         ),
+        ticket_placeholders(specs),
     )
+}
+
+/// The sizing norm, as scaffold text under `## Tickets` (p-67f0 c3). Prose, not a comment:
+/// the author who cuts the tickets is an agent reading this file, and the page shows it
+/// beside the items. `parse_items` skips it because it is not a `- [` line.
+pub const TICKETS_NORM: &str =
+    "One ticket is one PR is one session: one capability, a handful of steps as indented \
+sub-bullets, sized S or M — an L is a ticket to cut again. \
+`[tN] (spec: x) title · S · implements: c1`, then `  - a step` under it.";
+
+/// One `[tN] (spec: x)` placeholder per capability the proposal names, so the default cut
+/// is along the capability — the unit whose rules `prime` injects and whose globs the
+/// diff maps to, so a one-capability ticket pays for one spec's rules and no other's.
+/// With no spec named, one bare placeholder, so the first item is still written in the
+/// shape the machinery reads.
+fn ticket_placeholders(specs: &[SpecName]) -> String {
+    if specs.is_empty() {
+        return "- [t1] \n".to_string();
+    }
+    specs
+        .iter()
+        .enumerate()
+        .map(|(n, s)| format!("- [t{}] (spec: {s}) \n", n + 1))
+        .collect()
 }
 
 /// Mint the `p-` id and scaffold proposal.md.

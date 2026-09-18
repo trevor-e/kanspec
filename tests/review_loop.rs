@@ -69,6 +69,75 @@ fn propose_scaffolds_the_one_page_format_and_nothing_else() {
         "no tasks.md artifact"
     );
     assert!(src.contains("status: draft"), "{src}");
+
+    // p-67f0 c3: the scaffold cuts along the capability by default — one `[tN]`
+    // placeholder per named spec — and carries the sizing norm as prose the author reads.
+    assert!(src.contains("- [t1] (spec: auth) "), "{src}");
+    assert!(!src.contains("[t2]"), "one spec, one placeholder:\n{src}");
+    assert!(src.contains("One ticket is one PR is one session"), "{src}");
+
+    // The scaffold is still a valid proposal that reviews cleanly: the placeholder is an
+    // item with an empty title, the norm is prose the item parser skips.
+    let id = &p[..6];
+    let out: serde_json::Value = repo.json(&["review", id]);
+    assert_eq!(out["status"], "review");
+    assert_eq!(out["budgets"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(out["budgets"][0]["spec"], "auth");
+}
+
+#[test]
+fn propose_pre_mints_one_ticket_placeholder_per_capability() {
+    let repo = TestRepo::new();
+    seed(&repo);
+    repo.ks([
+        "spec",
+        "new",
+        "billing",
+        "--feature",
+        "Charges",
+        "--code",
+        "src/billing/**",
+    ])
+    .ok();
+    repo.ks([
+        "propose",
+        "Two capabilities",
+        "--spec",
+        "auth",
+        "--spec",
+        "billing",
+    ])
+    .ok();
+    let dir = repo.root.join(".kanspec/proposals");
+    let two = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.contains("two-capabilities"))
+        .expect("the second proposal directory");
+    let src = repo.read(&format!(".kanspec/proposals/{two}/proposal.md"));
+    assert!(
+        src.contains("- [t1] (spec: auth) \n- [t2] (spec: billing) \n"),
+        "{src}"
+    );
+
+    // No spec at all: one bare placeholder, same norm.
+    repo.ks(["propose", "Nothing named"]).ok();
+    let dir = repo.root.join(".kanspec/proposals");
+    let none = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .find(|n| n.contains("nothing-named"))
+        .expect("the third proposal directory");
+    let src = repo.read(&format!(".kanspec/proposals/{none}/proposal.md"));
+    assert!(src.contains("## Tickets\n"), "{src}");
+    assert!(src.contains("- [t1] \n"), "{src}");
+    assert!(
+        !src.contains("- [t1] (spec:"),
+        "no capability, no spec on the placeholder:\n{src}"
+    );
+    assert!(src.contains("One ticket is one PR is one session"), "{src}");
 }
 
 /// The directory name carries human-readable text, which is the whole reason
