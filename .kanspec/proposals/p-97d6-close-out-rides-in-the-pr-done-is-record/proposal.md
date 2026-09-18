@@ -1,10 +1,10 @@
 ---
 id: p-97d6
 title: 'Close-out rides in the PR: done is recorded on the branch, landed is derived'
-status: review
+status: approved
 specs: [verbs, store, ladder]
-approved: null
-ledger: []
+approved: 2026-09-18T04:50Z claude/e181e04b-6d2a
+ledger: [p-97d6#t1 minted→t-8e7a, p-97d6#t2 minted→t-4e2c, p-97d6#t3 minted→t-f621]
 created: 2026-09-03
 ---
 ## Why
