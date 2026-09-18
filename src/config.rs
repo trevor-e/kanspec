@@ -39,6 +39,7 @@ pub struct Config {
     pub ci: CiCfg,
     pub hooks: HooksCfg,
     pub prime: PrimeCfg,
+    pub review: ReviewCfg,
 }
 
 impl Default for Config {
@@ -58,6 +59,31 @@ impl Default for Config {
             ci: CiCfg::default(),
             hooks: HooksCfg::default(),
             prime: PrimeCfg::default(),
+            review: ReviewCfg::default(),
+        }
+    }
+}
+
+/// When a `[tN]` is flagged at review as a cut to look at again (p-67f0 c2). Every one
+/// is a threshold on something the budget line already shows — never an estimate of the
+/// work — and a flag blocks nothing: the human approving over it is the recorded waiver.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewCfg {
+    /// rules in scope for the ticket's capability, in tokens; the prime budget by default
+    pub rules_tokens_max: usize,
+    /// code under the ticket's globs, in lines
+    pub surface_lines_max: usize,
+    /// `[cN]` items one ticket implements
+    pub changes_max: usize,
+}
+
+impl Default for ReviewCfg {
+    fn default() -> ReviewCfg {
+        ReviewCfg {
+            rules_tokens_max: 2_000,
+            surface_lines_max: 4_000,
+            changes_max: 3,
         }
     }
 }
@@ -332,6 +358,13 @@ landcheck = {landcheck}         # the Stop hook. Opt-in; v0.2.
 spec_budget_tokens = {spec_budget}   # spec rules `prime` injects, in tokens; 0 = no budget.
                                  # Matched specs show in rank order until it is spent;
                                  # the rest are named. `rules --full` lifts it.
+
+[review]
+rules_tokens_max  = {rules_max}    # a [tN] whose capability reads more than this is flagged
+surface_lines_max = {surface_max}    # ... or whose code surface is longer than this, in lines
+changes_max       = {changes_max}       # ... or that implements more [cN] than this
+                                 # A flag names the cut; it blocks nothing — approving over
+                                 # it is the recorded waiver.
 "#,
             main = d.main,
             id_width = d.id_width,
@@ -359,6 +392,9 @@ spec_budget_tokens = {spec_budget}   # spec rules `prime` injects, in tokens; 0 
             hr_api = d.ci.homerunner.api,
             landcheck = d.hooks.landcheck,
             spec_budget = d.prime.spec_budget_tokens,
+            rules_max = d.review.rules_tokens_max,
+            surface_max = d.review.surface_lines_max,
+            changes_max = d.review.changes_max,
         )
     }
 }
@@ -446,6 +482,13 @@ mod tests {
         assert!(
             text.contains("[prime]") && text.contains("spec_budget_tokens"),
             "the scaffold must carry the budget knob, or nobody finds it:\n{text}"
+        );
+        assert_eq!(c.review.rules_tokens_max, d.review.rules_tokens_max);
+        assert_eq!(c.review.surface_lines_max, d.review.surface_lines_max);
+        assert_eq!(c.review.changes_max, d.review.changes_max);
+        assert!(
+            text.contains("[review]") && text.contains("changes_max"),
+            "the scaffold must carry the review thresholds:\n{text}"
         );
     }
 }

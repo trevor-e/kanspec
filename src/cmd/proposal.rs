@@ -266,6 +266,8 @@ pub struct ReviewReport {
     pub exported: Option<String>,
     /// the context budget under every `[tN]` — what each ticket will have to read (p-67f0)
     pub budgets: Vec<crate::cmd::budget::ItemBudget>,
+    /// `[cN]` items no ticket implements
+    pub unimplemented: Vec<crate::cmd::budget::Flag>,
     pub next: Vec<String>,
 }
 
@@ -338,11 +340,13 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
     };
 
     let budgets = crate::cmd::budget::for_proposal(ctx, &snap, live(&snap, &id)?)?;
+    let unimplemented = crate::cmd::budget::unimplemented(live(&snap, &id)?);
     Ok(ReviewReport {
         url: format!("http://127.0.0.1:{}/p/{id}", ctx.cfg.port),
         unresolved: open,
         exported,
         budgets,
+        unimplemented,
         // The URL is only live while `up` is running, and saying so beats a dead link.
         next: vec![format!("{} up", ctx.invoked_as)],
         status: S::Review,
@@ -378,16 +382,17 @@ impl Render for ReviewReport {
                 .dim("static, comment-less — threads stay on the served page")
                 .write(w, st)?;
         }
-        budget_lines(&self.budgets, w, st)?;
+        budget_lines(&self.budgets, &self.unimplemented, w, st)?;
         next_lines(&self.next, w, st)
     }
 }
 
 /// The budget line under every `[tN]`, as `review` and `approve` print it: what the
-/// ticket reads, never what the work will cost. Nothing is printed for a proposal with
-/// no ticket items.
+/// ticket reads, never what the work will cost — and under it, each flag with its cut
+/// named. Nothing is printed for a proposal with no ticket items.
 fn budget_lines(
     budgets: &[crate::cmd::budget::ItemBudget],
+    unimplemented: &[crate::cmd::budget::Flag],
     w: &mut dyn std::io::Write,
     st: &Style,
 ) -> std::io::Result<()> {
@@ -403,6 +408,22 @@ fn budget_lines(
             ),
             b.line
         )?;
+        for f in &b.flags {
+            writeln!(
+                w,
+                "        {} {}",
+                crate::out::paint("⚠", crate::out::Color::Yellow, st.color),
+                f.text()
+            )?;
+        }
+    }
+    for f in unimplemented {
+        writeln!(
+            w,
+            "   {} {}",
+            crate::out::paint("⚠", crate::out::Color::Yellow, st.color),
+            f.text()
+        )?;
     }
     Ok(())
 }
@@ -416,6 +437,8 @@ pub struct ApproveReport {
     pub minted: Vec<TicketId>,
     /// the context budget under every `[tN]`, as it stood at approval (p-67f0)
     pub budgets: Vec<crate::cmd::budget::ItemBudget>,
+    /// `[cN]` items no ticket implements, as approved over
+    pub unimplemented: Vec<crate::cmd::budget::Flag>,
     pub next: Vec<String>,
 }
 
@@ -480,6 +503,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
     // The budget under every `[tN]` is read here, before the mint, so the report says what
     // the human approved over — the same lines the review page showed them.
     let budgets = crate::cmd::budget::for_proposal(ctx, &snap, p)?;
+    let unimplemented = crate::cmd::budget::unimplemented(p);
 
     // A re-run must not mint a second copy of every ticket, so anything already linked to
     // this proposal counts as minted. The `[tN]` anchor rides in the ledger.
@@ -558,6 +582,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
         ],
         minted,
         budgets,
+        unimplemented,
         id,
     })
 }
@@ -692,7 +717,7 @@ impl Render for ApproveReport {
         for t in &self.minted {
             Line::new('○', "spawned").id(t.to_string()).write(w, st)?;
         }
-        budget_lines(&self.budgets, w, st)?;
+        budget_lines(&self.budgets, &self.unimplemented, w, st)?;
         next_lines(&self.next, w, st)
     }
 }
@@ -1214,6 +1239,8 @@ pub struct PageItem {
     pub budget: Option<crate::cmd::budget::ItemBudget>,
     /// the item's indented sub-bullets — a `[tN]`'s steps-to-be
     pub steps: Vec<String>,
+    /// a `[cN]` no ticket implements says so on its own card
+    pub flags: Vec<crate::cmd::budget::Flag>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1248,6 +1275,7 @@ pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
     };
 
     let mut budgets = crate::cmd::budget::for_proposal(ctx, s, p)?;
+    let mut unimplemented = crate::cmd::budget::unimplemented(p);
     let items = p
         .items
         .iter()
@@ -1287,6 +1315,18 @@ pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
                 dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
                 budget,
                 steps: i.steps.clone(),
+                flags: {
+                    let mine: Vec<usize> = unimplemented
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| f.why.starts_with(&format!("{tag}:")))
+                        .map(|(n, _)| n)
+                        .collect();
+                    mine.into_iter()
+                        .rev()
+                        .map(|n| unimplemented.remove(n))
+                        .collect()
+                },
                 id: i.id.clone(),
             }
         })

@@ -648,6 +648,12 @@ pub fn render_page_html(p: &crate::cmd::proposal::ProposalPage) -> String {
             }
             if let Some(b) = &i.budget {
                 let _ = write!(h, "<div class=\"budget\">{}</div>", esc(&b.line));
+                for f in &b.flags {
+                    let _ = write!(h, "<div class=\"flag\">⚠ {}</div>", esc(&f.text()));
+                }
+            }
+            for f in &i.flags {
+                let _ = write!(h, "<div class=\"flag\">⚠ {}</div>", esc(&f.text()));
             }
             let open = i.threads.iter().filter(|t| t.resolved.is_none()).count();
             if !i.threads.is_empty() {
