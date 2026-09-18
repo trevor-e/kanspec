@@ -815,6 +815,44 @@ pub fn spec_budget(s: &Snapshot, name: &SpecName, files: &[String]) -> Result<Sp
     })
 }
 
+impl SpecBudget {
+    /// `reads 6 rules (~440 tokens) · 1 decision · 2 quirks` — the reading-list half of a
+    /// budget line, shared by `rules --budget` and the `[tN]` line at review so the two
+    /// never drift.
+    pub fn reads_phrase(&self) -> String {
+        let mut o = format!(
+            "reads {} rule{} ({} tokens",
+            self.rules,
+            if self.rules == 1 { "" } else { "s" },
+            tokens_short(self.tokens),
+        );
+        if self.injected_tokens != self.tokens {
+            o.push_str(&format!(
+                ", {} under the prime budget, {} spec{} named not shown",
+                tokens_short(self.injected_tokens),
+                self.elided,
+                if self.elided == 1 { "" } else { "s" }
+            ));
+        }
+        o.push(')');
+        if self.decisions > 0 {
+            o.push_str(&format!(
+                " · {} decision{}",
+                self.decisions,
+                if self.decisions == 1 { "" } else { "s" }
+            ));
+        }
+        if self.quirks > 0 {
+            o.push_str(&format!(
+                " · {} quirk{}",
+                self.quirks,
+                if self.quirks == 1 { "" } else { "s" }
+            ));
+        }
+        o
+    }
+}
+
 /// `~0.9k` — tokens as a human reads them on a budget line. Under a thousand the exact
 /// count is short enough to print.
 pub fn tokens_short(n: usize) -> String {

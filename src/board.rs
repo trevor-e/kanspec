@@ -637,6 +637,11 @@ pub fn render_page_html(p: &crate::cmd::proposal::ProposalPage) -> String {
             if let Some(t) = &i.ticket {
                 let _ = write!(h, "<span class=\"badge ticket\">{}</span>", esc(t.as_str()));
             }
+            // What the ticket will have to read — one dim line under the item, the same
+            // text `review` prints, so a human sees the cut before they approve it.
+            if let Some(b) = &i.budget {
+                let _ = write!(h, "<div class=\"budget\">{}</div>", esc(&b.line));
+            }
             let open = i.threads.iter().filter(|t| t.resolved.is_none()).count();
             if !i.threads.is_empty() {
                 let _ = write!(

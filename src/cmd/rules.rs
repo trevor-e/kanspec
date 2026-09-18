@@ -214,35 +214,10 @@ impl Render for RulesReport {
             // One line, the shape `review` prints under a `[tN]`: what the agent reads,
             // then the surface it was measured on.
             let mut line = format!(
-                " {}  reads {} rule{} ({} tokens",
+                " {}  {}",
                 crate::out::paint(b.spec.as_str(), Color::Cyan, st.color),
-                b.rules,
-                if b.rules == 1 { "" } else { "s" },
-                rulesdoc::tokens_short(b.tokens),
+                b.reads_phrase()
             );
-            if b.injected_tokens != b.tokens {
-                line.push_str(&format!(
-                    ", {} under the prime budget, {} spec{} named not shown",
-                    rulesdoc::tokens_short(b.injected_tokens),
-                    b.elided,
-                    if b.elided == 1 { "" } else { "s" }
-                ));
-            }
-            line.push(')');
-            if b.decisions > 0 {
-                line.push_str(&format!(
-                    " · {} decision{}",
-                    b.decisions,
-                    if b.decisions == 1 { "" } else { "s" }
-                ));
-            }
-            if b.quirks > 0 {
-                line.push_str(&format!(
-                    " · {} quirk{}",
-                    b.quirks,
-                    if b.quirks == 1 { "" } else { "s" }
-                ));
-            }
             if !b.scoped {
                 line.push_str(" · surface unknown — spec names no code");
             } else {

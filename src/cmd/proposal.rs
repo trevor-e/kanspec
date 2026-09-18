@@ -239,6 +239,8 @@ pub struct ReviewReport {
     pub unresolved: usize,
     /// where `--export` wrote the static page
     pub exported: Option<String>,
+    /// the context budget under every `[tN]` — what each ticket will have to read (p-67f0)
+    pub budgets: Vec<crate::cmd::budget::ItemBudget>,
     pub next: Vec<String>,
 }
 
@@ -310,10 +312,12 @@ pub fn review(ctx: &Ctx, a: &ReviewArgs) -> Result<ReviewReport> {
         }
     };
 
+    let budgets = crate::cmd::budget::for_proposal(ctx, &snap, live(&snap, &id)?)?;
     Ok(ReviewReport {
         url: format!("http://127.0.0.1:{}/p/{id}", ctx.cfg.port),
         unresolved: open,
         exported,
+        budgets,
         // The URL is only live while `up` is running, and saying so beats a dead link.
         next: vec![format!("{} up", ctx.invoked_as)],
         status: S::Review,
@@ -349,8 +353,33 @@ impl Render for ReviewReport {
                 .dim("static, comment-less — threads stay on the served page")
                 .write(w, st)?;
         }
+        budget_lines(&self.budgets, w, st)?;
         next_lines(&self.next, w, st)
     }
+}
+
+/// The budget line under every `[tN]`, as `review` and `approve` print it: what the
+/// ticket reads, never what the work will cost. Nothing is printed for a proposal with
+/// no ticket items.
+fn budget_lines(
+    budgets: &[crate::cmd::budget::ItemBudget],
+    w: &mut dyn std::io::Write,
+    st: &Style,
+) -> std::io::Result<()> {
+    for b in budgets {
+        writeln!(
+            w,
+            "   [{}] {} · {}",
+            b.item,
+            crate::out::paint(
+                b.spec.as_ref().map(|s| s.as_str()).unwrap_or("no spec"),
+                crate::out::Color::Cyan,
+                st.color
+            ),
+            b.line
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -360,6 +389,8 @@ pub struct ApproveReport {
     pub approved: String,
     /// the `[tN]` items minted into board tickets
     pub minted: Vec<TicketId>,
+    /// the context budget under every `[tN]`, as it stood at approval (p-67f0)
+    pub budgets: Vec<crate::cmd::budget::ItemBudget>,
     pub next: Vec<String>,
 }
 
@@ -412,6 +443,10 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
             (i.id.clone(), bullet.title, bullet.deps, spec)
         })
         .collect();
+
+    // The budget under every `[tN]` is read here, before the mint, so the report says what
+    // the human approved over — the same lines the review page showed them.
+    let budgets = crate::cmd::budget::for_proposal(ctx, &snap, p)?;
 
     // A re-run must not mint a second copy of every ticket, so anything already linked to
     // this proposal counts as minted. The `[tN]` anchor rides in the ledger.
@@ -481,6 +516,7 @@ pub fn approve(ctx: &Ctx, a: &ApproveArgs) -> Result<ApproveReport> {
             format!("{} close {id}", ctx.invoked_as),
         ],
         minted,
+        budgets,
         id,
     })
 }
@@ -494,13 +530,13 @@ fn stamp_tail(p: &Proposal) -> String {
 
 /// A `[tN]` bullet, taken apart.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct TicketBullet {
-    title: String,
-    deps: Vec<String>,
+pub(crate) struct TicketBullet {
+    pub(crate) title: String,
+    pub(crate) deps: Vec<String>,
     /// `(spec: playbooks)` at the head of the bullet
-    spec: Option<String>,
+    pub(crate) spec: Option<String>,
     /// the `[cN]` tags the bullet says it implements: `· implements: c1, c2` or `· c1`
-    changes: Vec<String>,
+    pub(crate) changes: Vec<String>,
 }
 
 /// `(spec: playbooks) Rate-limit login endpoint · S · deps: t-31aa · implements: c1`
@@ -508,7 +544,7 @@ struct TicketBullet {
 ///
 /// The estimate segment is dropped on purpose: `new` has no estimate flag, and inventing a
 /// place to put it would be a field the board never reads.
-fn split_ticket_bullet(text: &str) -> TicketBullet {
+pub(crate) fn split_ticket_bullet(text: &str) -> TicketBullet {
     let mut b = TicketBullet::default();
     let mut text = text.trim();
     if let Some(rest) = text.strip_prefix("(spec:") {
@@ -560,7 +596,7 @@ fn is_change_tag(s: &str) -> bool {
 /// 2. the spec of the first `[cN]` the bullet names — a change bullet opens with its spec,
 ///    `- [c1] auth: 5 failed logins …` (DESIGN.md), when the proposal spans several;
 /// 3. the proposal's first spec.
-fn ticket_spec(p: &Proposal, b: &TicketBullet) -> Option<String> {
+pub(crate) fn ticket_spec(p: &Proposal, b: &TicketBullet) -> Option<String> {
     if let Some(s) = &b.spec {
         return Some(s.clone());
     }
@@ -593,6 +629,7 @@ impl Render for ApproveReport {
         for t in &self.minted {
             Line::new('○', "spawned").id(t.to_string()).write(w, st)?;
         }
+        budget_lines(&self.budgets, w, st)?;
         next_lines(&self.next, w, st)
     }
 }
@@ -1108,6 +1145,9 @@ pub struct PageItem {
     /// a `[tN]` item's minted ticket, once `approve` has run
     pub ticket: Option<TicketId>,
     pub dispositioned: bool,
+    /// a `[tN]` item's context budget — what the ticket will have to read (p-67f0)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget: Option<crate::cmd::budget::ItemBudget>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1141,10 +1181,16 @@ pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
             .and_then(|t| TicketId::parse(&t).ok())
     };
 
+    let mut budgets = crate::cmd::budget::for_proposal(ctx, s, p)?;
     let items = p
         .items
         .iter()
         .map(|i| {
+            let tag = format!("{}{}", i.id.kind.letter(), i.id.n);
+            let budget = budgets
+                .iter()
+                .position(|b| b.item == tag)
+                .map(|at| budgets.remove(at));
             // The `(promote: decision)` marker becomes the badge, so leaving it in the
             // text too would render it twice on the card.
             let text = strip_marker(&i.text);
@@ -1173,6 +1219,7 @@ pub fn page_of(ctx: &Ctx, s: &Snapshot, raw: &str) -> Result<ProposalPage> {
                     .collect(),
                 ticket: ticket_of(&i.id),
                 dispositioned: crate::derive::dispositioned(&p.fm.ledger, &i.id),
+                budget,
                 id: i.id.clone(),
             }
         })

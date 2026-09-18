@@ -11,6 +11,7 @@
 //! Owner: **F** (foundation). FROZEN.
 
 pub mod board;
+pub mod budget;
 pub mod comment;
 pub mod decision;
 pub mod doctor;
