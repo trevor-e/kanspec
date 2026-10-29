@@ -235,6 +235,11 @@ pub fn start(ctx: &Ctx, a: &StartArgs) -> Result<StartReport> {
     // the second half, and is what §2.16 asks of every other subprocess in this handler.
     let movable = wt_abs.is_none() && primary_is_movable(ctx);
 
+    // The claim on the shared board, if there is one: an agent in another clone or repo
+    // that already holds this ticket there refuses this claim here, before a branch is cut.
+    // An unreachable board only warns (`crate::hub`).
+    crate::hub::claim(ctx, t, &ctx.actor.label())?;
+
     let made = create_branch(ctx, &id, &branch, &base, existed, wt_abs.as_deref())?;
 
     let f = StartFacts {

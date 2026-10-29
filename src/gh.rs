@@ -459,7 +459,7 @@ fn detail(s: &str) -> String {
 ///
 /// `None` for anything `gh` cannot speak for — a bare local path (every `TestRepo`), a
 /// non-GitHub host, or a URL with no `owner/name` in it.
-fn parse_slug(url: &str) -> Option<String> {
+pub(crate) fn parse_slug(url: &str) -> Option<String> {
     let url = url.trim().trim_end_matches('/');
     let url = url.strip_suffix(".git").unwrap_or(url);
     let (host, path) = match url.split_once("://") {

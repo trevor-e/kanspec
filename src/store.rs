@@ -35,6 +35,24 @@ use crate::{fix, fixes};
 /// shared across processes would need the very store it is meant to describe.
 static REV: AtomicU64 = AtomicU64::new(0);
 
+/// Every ticket a plan writes, once each, in plan order.
+fn touched_tickets(plan: &Plan) -> Vec<TicketId> {
+    let mut ids: Vec<TicketId> = Vec::new();
+    for op in &plan.ops {
+        let id = match op {
+            Op::Transition { id, .. } | Op::MarkSteps { id, .. } => Some(id),
+            _ => match op.entity() {
+                Some(EntityRef::Ticket(id)) => Some(id),
+                _ => None,
+            },
+        };
+        if let Some(id) = id.filter(|id| !ids.contains(id)) {
+            ids.push(id.clone());
+        }
+    }
+    ids
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Loading
 // ─────────────────────────────────────────────────────────────────────────────
@@ -652,6 +670,12 @@ impl<'c> Store<'c> {
         let rev = REV.fetch_add(1, Ordering::Relaxed) + 1;
         snapshot.rev = rev;
         drop(token);
+
+        // 12 — mirror the tickets this plan touched to the shared board, if there is one.
+        // AFTER the lock: a slow board must not hold up another verb, and nothing it says
+        // can undo a write that already happened (`crate::hub`).
+        crate::hub::mirror(ctx, &snapshot, &touched_tickets(&plan));
+
         Ok(Committed {
             snapshot,
             touched,

@@ -40,6 +40,7 @@ pub mod fm;
 pub mod gh;
 pub mod git;
 pub mod hooks;
+pub mod hub;
 pub mod ids;
 pub mod instructions;
 pub mod keys;
@@ -101,13 +102,19 @@ pub fn run(invoked_as: &'static str) -> ExitCode {
         }
     };
 
-    match dispatch(&ctx, &cli) {
-        Ok(c) => ExitCode::from(c),
+    let code = match dispatch(&ctx, &cli) {
+        Ok(c) => c,
         Err(e) => {
             e.render(&ctx.out, ctx.invoked_as);
-            ExitCode::from(e.exit_code())
+            e.exit_code()
         }
+    };
+    // What the mirror to the shared board had to say, after the command's own output and
+    // on stderr, so `--json` on stdout stays one parseable document.
+    for w in hub::take_warnings() {
+        eprintln!("{invoked_as}: board: {w}");
     }
+    ExitCode::from(code)
 }
 
 /// Returns `Result<u8>` rather than `Result<()>` so a **successful** run can still exit
@@ -169,6 +176,7 @@ pub fn dispatch(ctx: &Ctx, cli: &Cli) -> Result<u8> {
         C::Quirk(a) => ok(&cmd::quirk::quirk(ctx, a)?, ctx),
         C::Quirks(a) => ok(&cmd::quirk::quirks(ctx, a)?, ctx),
         C::Prime(a) => ok(&cmd::prime::prime(ctx, a)?, ctx),
+        C::Hub(a) => ok(&hub::hub(ctx, a)?, ctx),
 
         // ── PROPOSALS & REVIEW (v0.2) ────────────────────────────────────────
         C::Propose(a) => ok(&cmd::proposal::propose(ctx, a)?, ctx),

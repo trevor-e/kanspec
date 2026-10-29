@@ -152,6 +152,34 @@ working tree. It is **off by default and installed only when this is true** — 
 that blocks is the single most disruptive thing kanspec can do to a session, so it is a
 deliberate opt-in rather than a surprise.
 
+## `[hub]` — the shared board
+
+```toml
+[hub]
+url          = "https://telkins.com/api/tickets"  # the board's ticket API; empty = off
+project      = "kanspec"                          # this repo's project there
+repo         = ""                                 # owner/name for PR links; read from origin
+token_env    = "KANSPEC_HUB_TOKEN"                # checked first
+token_file   = "~/.telkins-tickets-token"         # read when the variable is unset
+timeout_secs = 5                                  # per request
+```
+
+Off by default. With a `url`, every verb that writes a ticket also pushes it to the board
+after the write, so agents in other repos and other clones see each claim the moment it
+happens, not when it reaches git. The repo stays the truth: nothing is read back into
+`.kanspec/`, and merge state is still git's to answer.
+
+Two things go the other way. `start` takes the claim on the board first and is refused
+(`claimed_on_board`) when another session already holds the ticket there. `prime` adds a
+`BOARD` section with the last few comments other sessions left on this project's tickets.
+
+A board that is down never costs a verb: the push becomes a warning on stderr, and
+`kanspec hub sync` re-pushes every ticket once it is back. `hub sync` also starts mirroring
+a repo whose tickets predate its `[hub]`. The project is created on the board on first push.
+
+The token never belongs in this file, which is committed: keep it in the environment or a
+file only you can read.
+
 ## Git hooks, and re-installing them
 
 `init` installs four git hooks, resolved through `git rev-parse --git-path hooks` so

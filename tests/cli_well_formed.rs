@@ -186,7 +186,7 @@ fn the_dispatch_arms_and_the_clap_tree_agree() {
     // between waves as a request to F.
     let n = Cli::command().get_subcommands().count();
     assert_eq!(
-        n, 46,
+        n, 47,
         "the CLI surface changed — update `dispatch` and this count together"
     );
     let _ = std::mem::size_of::<Command>();

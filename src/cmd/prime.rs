@@ -62,6 +62,9 @@ pub struct LiveSlice {
     pub anomalies: Vec<Attention>,
     /// the bounded failure excerpt, when the claimed branch has a fresh failed local job
     pub ci_digest: Option<String>,
+    /// recent comments other sessions left on this project's tickets on the shared board
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub board: Vec<crate::hub::BoardComment>,
 }
 
 pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
@@ -93,10 +96,15 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
     // The payload, produced in exactly ONE place. `rules` writes the first half of this and
     // stops; `prime` writes all of it. That is the whole of invariant 3.
     let standing = crate::rulesdoc::build(&snap, &scope);
+    // the one network read: what other sessions said on the shared board, if there is one
+    let board = crate::hub::recent_comments(ctx);
     let text = format!(
-        "{}\n{}",
+        "{}\n{}{}",
         crate::rulesdoc::render_text(&standing),
-        live_slice(ctx, &snap, &dv, claimed, unresolved)
+        live_slice(ctx, &snap, &dv, claimed, unresolved),
+        board
+            .as_deref()
+            .map_or_else(String::new, |b| board_slice(b, &snap, ctx.now)),
     );
 
     Ok(PrimeReport {
@@ -109,6 +117,7 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
             // The CI provider layer is v0.2 (`ci.rs`, ARCHITECTURE §1); until it lands
             // there is no digest to ride in, and inventing one would be a guess.
             ci_digest: None,
+            board: board.unwrap_or_default(),
         },
         standing,
         scope: scope.paths.clone(),
@@ -207,6 +216,50 @@ fn live_slice(
     if dv.attention.is_empty() {
         o.push_str("  nothing owed — every open item has its next verb\n");
     }
+    o
+}
+
+/// The shared board, for a repo that has one: what goes there instead of `kanspec new`,
+/// and the comments other sessions left — the cross-repo channel. A repo without a board
+/// primes exactly as before.
+fn board_slice(
+    comments: &[crate::hub::BoardComment],
+    s: &Snapshot,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let mut o = String::from(
+        " BOARD    every ticket here is mirrored to the shared board. Chores that teach the project \
+         nothing (dep bumps, renames, formatting) go straight onto the board with its MCP tools, \
+         not `kanspec new`\n",
+    );
+    if comments.is_empty() {
+        return o;
+    }
+    o.push_str(&format!(
+        "  {} recent comments from other sessions:\n",
+        comments.len()
+    ));
+    for c in comments {
+        // a mirrored ticket wears its label like every other id here
+        let ticket = TicketId::parse(&c.ticket)
+            .ok()
+            .filter(|id| s.tickets.contains_key(id))
+            .map_or_else(|| format!("{} {}", c.ticket, c.title), |id| s.label(&id));
+        let first: String = c
+            .body
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(160)
+            .collect();
+        o.push_str(&format!(
+            "  {ticket}  {} ({}): {first}\n",
+            c.author,
+            crate::out::rel_time(c.created, now)
+        ));
+    }
+    o.push_str("  answer on the board with add_comment\n");
     o
 }
 

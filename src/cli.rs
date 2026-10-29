@@ -156,6 +156,8 @@ pub enum Command {
     Quirks(QuirksArgs),
     /// The agent working set, injected by hooks (~1.5k tokens)
     Prime(PrimeArgs),
+    /// The shared board tickets are mirrored to ([hub] in config.toml)
+    Hub(HubArgs),
 
     // ── PROPOSALS & REVIEW ───────────────────────────────────────────────────
     /// Scaffold a one-page proposal
@@ -685,6 +687,18 @@ pub struct PrimeArgs {
     /// Scope the standing-rules section to these paths; repeatable
     #[arg(long = "path", value_name = "FILE")]
     pub paths: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct HubArgs {
+    #[command(subcommand)]
+    pub cmd: HubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HubCommand {
+    /// Push every ticket to the board: after it was down, or to start mirroring a repo
+    Sync,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
