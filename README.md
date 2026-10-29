@@ -105,6 +105,17 @@ ship inside the binary: `kanspec instructions [start|done|review|close|config]`.
 - **Nothing gets stuck**: every non-terminal item has one owed verb and one owner, and `kanspec
   status` prints them all with the fix command.
 
+## A shared board across branches, clones and repos
+
+Tickets live in git, so an agent on one branch cannot see what an agent on another branch
+proposed, decided or started until it merges. Point `[hub]` in `.kanspec/config.toml` at a
+ticket board (the one at telkins.com speaks the right API) and every ticket, proposal and
+decision is mirrored there as verbs change it. `start` refuses a ticket another session
+already holds there, and `prime` lists the work this checkout cannot see (a decision
+proposed on another branch, a ticket started elsewhere) plus the comments other sessions
+left. The repo stays the truth; a board that is down only warns. `kanspec hub sync` pushes
+everything again. Details: `kanspec instructions config`.
+
 ## Configuration
 
 `.kanspec/config.toml`, written commented by `init`. Notable knobs: `sync` (`batch` default — leaves

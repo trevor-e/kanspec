@@ -40,6 +40,8 @@ pub struct Config {
     pub hooks: HooksCfg,
     pub prime: PrimeCfg,
     pub review: ReviewCfg,
+    /// The shared board tickets are mirrored to. Off unless `url` is set (`crate::hub`).
+    pub hub: crate::hub::HubCfg,
 }
 
 impl Default for Config {
@@ -60,6 +62,7 @@ impl Default for Config {
             hooks: HooksCfg::default(),
             prime: PrimeCfg::default(),
             review: ReviewCfg::default(),
+            hub: crate::hub::HubCfg::default(),
         }
     }
 }

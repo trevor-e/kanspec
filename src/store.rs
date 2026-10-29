@@ -35,6 +35,44 @@ use crate::{fix, fixes};
 /// shared across processes would need the very store it is meant to describe.
 static REV: AtomicU64 = AtomicU64::new(0);
 
+/// The tickets whose state a plan sets: created or transitioned. The board takes state and
+/// claim from these only.
+fn moved(plan: &Plan) -> Vec<TicketId> {
+    plan.ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Transition { id, .. } => Some(id.clone()),
+            Op::CreateEntity {
+                entity: EntityRef::Ticket(id),
+                ..
+            } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every ticket, proposal and decision a plan writes, once each, in plan order: what the
+/// shared board hears about.
+fn board_items(plan: &Plan) -> Vec<EntityRef> {
+    let mut out: Vec<EntityRef> = Vec::new();
+    for op in &plan.ops {
+        let e = match op {
+            Op::Transition { id, .. } | Op::MarkSteps { id, .. } => EntityRef::Ticket(id.clone()),
+            Op::CreateProposal { id, .. } => EntityRef::Proposal(id.clone()),
+            _ => match op.entity() {
+                Some(
+                    e @ (EntityRef::Ticket(_) | EntityRef::Proposal(_) | EntityRef::Decision(_)),
+                ) => e.clone(),
+                _ => continue,
+            },
+        };
+        if !out.contains(&e) {
+            out.push(e);
+        }
+    }
+    out
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Loading
 // ─────────────────────────────────────────────────────────────────────────────
@@ -652,6 +690,12 @@ impl<'c> Store<'c> {
         let rev = REV.fetch_add(1, Ordering::Relaxed) + 1;
         snapshot.rev = rev;
         drop(token);
+
+        // 12 — mirror the tickets this plan touched to the shared board, if there is one.
+        // AFTER the lock: a slow board must not hold up another verb, and nothing it says
+        // can undo a write that already happened (`crate::hub`).
+        crate::hub::mirror(ctx, &snapshot, &board_items(&plan), &moved(&plan));
+
         Ok(Committed {
             snapshot,
             touched,

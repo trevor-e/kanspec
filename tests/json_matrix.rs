@@ -194,6 +194,8 @@ fn cases() -> Vec<Case> {
         ),
         c("quirks", &["quirks"], Needs::Bare),
         c("prime", &["prime"], Needs::Todo),
+        // no [hub] in the fixture: says so and exits 0
+        c("hub sync", &["hub", "sync"], Needs::Bare),
         // ── PROPOSALS & REVIEW (v0.2) ────────────────────────────────────────
         skip("propose", &["propose", "A proposal"], Run::V02),
         skip("review", &["review", "p-7de2"], Run::V02),
