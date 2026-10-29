@@ -223,6 +223,7 @@ impl Hub {
     /// step.
     fn put(&self, id: &str, body: &Value) -> std::result::Result<Reply, String> {
         let path = format!("/refs/{}/{id}", self.project);
+        let body = &fit(body.clone());
         let reply = self.call("PUT", &path, Some(body))?;
         if reply.status == 404 && reply.error().starts_with("No project") {
             self.ensure_project()?;
@@ -323,6 +324,37 @@ fn payload(
         }
         EntityRef::Spec(_) | EntityRef::Quirk(_) => return None,
     })
+}
+
+/// The board's limits, in characters. Past them it refuses the whole item.
+const MAX_TITLE: usize = 200;
+const MAX_BODY: usize = 50_000;
+
+/// Shorten what the board would refuse rather than lose the item: a long title is cut, and
+/// the whole title leads the body so nothing is lost; a long body is cut with a pointer home.
+fn fit(mut v: Value) -> Value {
+    let Some(o) = v.as_object_mut() else { return v };
+    if let Some(title) = o.get("title").and_then(Value::as_str).map(str::to_string) {
+        if title.chars().count() > MAX_TITLE {
+            let short: String = title.chars().take(MAX_TITLE - 1).collect();
+            let rest = o.get("body").and_then(Value::as_str).unwrap_or_default();
+            let body = format!("**{}**\n\n{rest}", title.trim());
+            o.insert(
+                "title".into(),
+                Value::from(format!("{}…", short.trim_end())),
+            );
+            o.insert("body".into(), Value::from(body.trim_end()));
+        }
+    }
+    if let Some(body) = o.get("body").and_then(Value::as_str) {
+        if body.chars().count() > MAX_BODY {
+            let note = "\n\n… (cut for the board; the repo has the rest)";
+            let keep = MAX_BODY - note.chars().count();
+            let cut: String = body.chars().take(keep).collect();
+            o.insert("body".into(), Value::from(format!("{cut}{note}")));
+        }
+    }
+    v
 }
 
 /// A proposal is open for discussion until it is approved; its tickets carry it after that.
@@ -826,6 +858,25 @@ mod tests {
         assert_eq!(ids, ["D-2c77", "kanspec-4"]);
         assert_eq!(got[0].branch.as_deref(), Some("ks/t-9c41-x"));
         assert_eq!(got[1].claimed_by.as_deref(), Some("claude/other"));
+    }
+
+    #[test]
+    fn long_titles_and_bodies_fit_the_board() {
+        let long = "word ".repeat(60);
+        let v = fit(json!({"title": long, "body": "Why."}));
+        let title = v["title"].as_str().unwrap();
+        assert!(title.chars().count() <= MAX_TITLE);
+        assert!(title.ends_with('…'));
+        let body = v["body"].as_str().unwrap();
+        assert!(body.starts_with(&format!("**{}**", long.trim())));
+        assert!(body.ends_with("Why."));
+
+        let v = fit(json!({"title": "ok", "body": "x".repeat(MAX_BODY + 10)}));
+        assert_eq!(v["title"], "ok");
+        assert_eq!(v["body"].as_str().unwrap().chars().count(), MAX_BODY);
+
+        // a state-only push has nothing to fit
+        assert_eq!(fit(json!({"state": "done"})), json!({"state": "done"}));
     }
 
     #[test]
