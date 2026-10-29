@@ -65,6 +65,9 @@ pub struct LiveSlice {
     /// recent comments other sessions left on this project's tickets on the shared board
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub board: Vec<crate::hub::BoardComment>,
+    /// work on the shared board that this checkout cannot see: other branches, other clones
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub elsewhere: Vec<crate::hub::Elsewhere>,
 }
 
 pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
@@ -96,17 +99,18 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
     // The payload, produced in exactly ONE place. `rules` writes the first half of this and
     // stops; `prime` writes all of it. That is the whole of invariant 3.
     let standing = crate::rulesdoc::build(&snap, &scope);
-    // the one network read: what other sessions said on the shared board, if there is one
-    let board = crate::hub::recent_comments(ctx);
+    // the one network read: what other sessions are doing and said, if there is a board
+    let board = crate::hub::board_view(ctx, &snap);
     let text = format!(
         "{}\n{}{}",
         crate::rulesdoc::render_text(&standing),
         live_slice(ctx, &snap, &dv, claimed, unresolved),
         board
-            .as_deref()
+            .as_ref()
             .map_or_else(String::new, |b| board_slice(b, &snap, ctx.now)),
     );
 
+    let (board, elsewhere) = board.map(|b| (b.comments, b.elsewhere)).unwrap_or_default();
     Ok(PrimeReport {
         live: LiveSlice {
             claimed: claimed.map(|t| t.fm.id.clone()),
@@ -117,7 +121,8 @@ pub fn prime(ctx: &Ctx, a: &PrimeArgs) -> Result<PrimeReport> {
             // The CI provider layer is v0.2 (`ci.rs`, ARCHITECTURE §1); until it lands
             // there is no digest to ride in, and inventing one would be a guess.
             ci_digest: None,
-            board: board.unwrap_or_default(),
+            board,
+            elsewhere,
         },
         standing,
         scope: scope.paths.clone(),
@@ -219,27 +224,49 @@ fn live_slice(
     o
 }
 
-/// The shared board, for a repo that has one: what goes there instead of `kanspec new`,
-/// and the comments other sessions left — the cross-repo channel. A repo without a board
-/// primes exactly as before.
+/// The shared board, for a repo that has one: what goes there instead of `kanspec new`, the
+/// work other sessions have that this checkout cannot see, and the comments they left. A
+/// repo without a board primes exactly as before.
 fn board_slice(
-    comments: &[crate::hub::BoardComment],
+    b: &crate::hub::BoardView,
     s: &Snapshot,
     now: chrono::DateTime<chrono::Utc>,
 ) -> String {
     let mut o = String::from(
-        " BOARD    every ticket here is mirrored to the shared board. Chores that teach the project \
-         nothing (dep bumps, renames, formatting) go straight onto the board with its MCP tools, \
-         not `kanspec new`\n",
+        " BOARD    every ticket, proposal and decision here is mirrored to the shared board. \
+         Chores that teach the project nothing (dep bumps, renames, formatting) go straight onto \
+         the board with its MCP tools, not `kanspec new`\n",
     );
-    if comments.is_empty() {
+    if !b.elsewhere.is_empty() {
+        o.push_str(
+            "  on the board but not on this branch — check before you build the same thing:\n",
+        );
+        for e in &b.elsewhere {
+            let mut who = Vec::new();
+            if let Some(h) = &e.claimed_by {
+                who.push(format!("held by {h}"));
+            }
+            if let Some(br) = &e.branch {
+                who.push(format!("on {br}"));
+            }
+            who.push(crate::out::rel_time(e.updated, now));
+            o.push_str(&format!(
+                "  {}  {}  [{}] {}\n",
+                e.id,
+                e.title,
+                e.state,
+                who.join(", ")
+            ));
+        }
+    }
+    if b.comments.is_empty() {
         return o;
     }
     o.push_str(&format!(
         "  {} recent comments from other sessions:\n",
-        comments.len()
+        b.comments.len()
     ));
-    for c in comments {
+    for c in &b.comments {
         // a mirrored ticket wears its label like every other id here
         let ticket = TicketId::parse(&c.ticket)
             .ok()

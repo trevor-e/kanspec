@@ -164,17 +164,25 @@ token_file   = "~/.telkins-tickets-token"         # read when the variable is un
 timeout_secs = 5                                  # per request
 ```
 
-Off by default. With a `url`, every verb that writes a ticket also pushes it to the board
-after the write, so agents in other repos and other clones see each claim the moment it
-happens, not when it reaches git. The repo stays the truth: nothing is read back into
+Off by default. With a `url`, every verb that writes a ticket, proposal or decision also
+pushes it to the board after the write, so agents on other branches, in other clones and in
+other repos see it the moment it happens, not when it merges. Tickets keep their states;
+an open proposal or a proposed decision sits in the board's `backlog` until it is approved,
+accepted, abandoned or revoked. The repo stays the truth: nothing is read back into
 `.kanspec/`, and merge state is still git's to answer.
+
+A branch that shows a ticket as free in `todo` does not push its state or claim, only its
+text: another branch may have started it since this one was cut, and the board keeps that
+claim. `hub sync` follows the same rule.
 
 Two things go the other way. `start` takes the claim on the board first and is refused
 (`claimed_on_board`) when another session already holds the ticket there. `prime` adds a
-`BOARD` section with the last few comments other sessions left on this project's tickets.
+`BOARD` section listing what this checkout cannot see (items that exist only on other
+branches, tickets held there that look free here, board-only chores other sessions are
+on) and the last few comments other sessions left on this project's tickets.
 
 A board that is down never costs a verb: the push becomes a warning on stderr, and
-`kanspec hub sync` re-pushes every ticket once it is back. `hub sync` also starts mirroring
+`kanspec hub sync` re-pushes every ticket and open proposal and decision once it is back. `hub sync` also starts mirroring
 a repo whose tickets predate its `[hub]`. The project is created on the board on first push.
 
 The token never belongs in this file, which is committed: keep it in the environment or a

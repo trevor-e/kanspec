@@ -1,20 +1,20 @@
-//! The hub: a shared ticket board that every repo's tickets are MIRRORED to, so agents in
-//! different repos and worktrees can see each other's claims and talk through comments
-//! before anything reaches git.
+//! The hub: a shared ticket board that every repo's tickets, proposals and decisions are
+//! MIRRORED to, so agents on other branches, in other clones and in other repos can see each
+//! other's work and talk through comments before anything merges.
 //!
 //! The repo stays the truth. The board is a copy that `transact` pushes after every write
-//! that touches a ticket, and nothing here is ever read back into `.kanspec/`. Two calls go
-//! the other way, and both are about OTHER sessions: `start` asks the board for the claim
-//! first, so an agent in another clone cannot hold the same ticket, and `prime` reads the
-//! comments left on this project's tickets.
+//! that touches one of those, and nothing here is ever read back into `.kanspec/`. Two calls
+//! go the other way, and both are about OTHER sessions: `start` asks the board for the claim
+//! first, so an agent on another branch cannot hold the same ticket, and `prime` reads what
+//! this checkout cannot see and the comments left on this project's tickets.
 //!
 //! Off unless `[hub] url` is set. Every failure but a refused claim is a WARNING, printed
 //! once to stderr after the command's own output: a board that is down or slow must never
 //! cost a verb. `kanspec hub sync` re-pushes everything once it is back.
 //!
 //! The wire is the board's REST surface (telkins.com's `/api/tickets`):
-//! `PUT /refs/<project>/<id>` upserts a ticket by its kanspec id and claims or releases it
-//! in the same call, `POST /projects` creates the project, `GET /comments` reads.
+//! `PUT /refs/<project>/<id>` upserts an item by its kanspec id and claims or releases it
+//! in the same call, `POST /projects` creates the project, `GET /` and `GET /comments` read.
 //!
 //! **Shells out to `curl`**, as git and gh are shelled out to, so the binary gains no HTTP
 //! stack. The token goes to curl on stdin (`--config -`), never in argv where `ps` shows it.
@@ -31,7 +31,8 @@ use serde_json::{json, Value};
 use crate::ctx::Ctx;
 use crate::error::{GateCode, KsError, Result};
 use crate::ids::TicketId;
-use crate::model::{Snapshot, Ticket};
+use crate::model::{DecisionStatus, ProposalStatus, Snapshot, Ticket};
+use crate::plan::EntityRef;
 use crate::transitions::State;
 use crate::{fix, fixes};
 
@@ -69,9 +70,12 @@ impl Default for HubCfg {
 
 /// `prime` runs from SessionStart, so it waits less than a verb does.
 const PRIME_TIMEOUT_SECS: u64 = 3;
-/// How far back `prime` looks for comments, and how many it shows.
+/// How far back `prime` looks for comments and for work decided elsewhere, and how many
+/// comments it shows.
 const COMMENT_DAYS: i64 = 3;
 const COMMENT_TOP: usize = 5;
+/// How many items from other branches `prime` lists.
+const ELSEWHERE_TOP: usize = 8;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // warnings — collected here, printed once by `run()` after the command's output
@@ -214,15 +218,15 @@ impl Hub {
         })
     }
 
-    /// Upsert one ticket. A board that has never heard of this project gets it created and
-    /// the push retried once, so pointing a repo at the board needs no other step.
-    fn put(&self, t: &Ticket, claimed_by: Option<&str>) -> std::result::Result<Reply, String> {
-        let path = format!("/refs/{}/{}", self.project, t.fm.id);
-        let body = self.payload(t, claimed_by);
-        let reply = self.call("PUT", &path, Some(&body))?;
+    /// Upsert one item by its kanspec id. A board that has never heard of this project gets
+    /// it created and the push retried once, so pointing a repo at the board needs no other
+    /// step.
+    fn put(&self, id: &str, body: &Value) -> std::result::Result<Reply, String> {
+        let path = format!("/refs/{}/{id}", self.project);
+        let reply = self.call("PUT", &path, Some(body))?;
         if reply.status == 404 && reply.error().starts_with("No project") {
             self.ensure_project()?;
-            return self.call("PUT", &path, Some(&body));
+            return self.call("PUT", &path, Some(body));
         }
         Ok(reply)
     }
@@ -238,9 +242,12 @@ impl Hub {
         }
     }
 
-    fn payload(&self, t: &Ticket, claimed_by: Option<&str>) -> Value {
+    /// `moved`: this write changed the ticket's state. A branch that merely edits a ticket
+    /// it shows as free in `todo` says nothing about its state or claim, because another
+    /// branch may have started it since this one was cut, and the board has that claim.
+    fn ticket(&self, t: &Ticket, claimed_by: Option<&str>, moved: bool) -> Value {
         let fm = &t.fm;
-        json!({
+        let mut body = json!({
             "title": fm.title,
             // the `## Log` is this repo's audit trail, not something the board shows
             "body": without_log(&t.body),
@@ -254,12 +261,89 @@ impl Hub {
             "deps": fm.deps.iter().map(ToString::to_string).collect::<Vec<_>>(),
             // a closed ticket is nobody's; the board clears the claim itself
             "claimed_by": if fm.state.terminal() { None } else { claimed_by },
-        })
+        });
+        if fm.state == State::Todo && claimed_by.is_none() && !moved {
+            if let Some(o) = body.as_object_mut() {
+                o.remove("state");
+                o.remove("claimed_by");
+            }
+        }
+        body
     }
 }
 
-/// kanspec's five states onto the board's columns. The board's `backlog` has no kanspec
-/// counterpart and is never sent.
+/// What one write put on the board, by kanspec id. Proposals and decisions go up too: an
+/// agent on another branch cannot see a proposal or a proposed decision until it merges,
+/// and that is exactly when two sessions decide the same thing two ways.
+fn payload(
+    hub: &Hub,
+    snap: &Snapshot,
+    e: &EntityRef,
+    branch: Option<&str>,
+    moved: &[TicketId],
+) -> Option<(String, Value)> {
+    Some(match e {
+        EntityRef::Ticket(id) => {
+            let t = snap.tickets.get(id)?;
+            let body = hub.ticket(t, t.fm.claimed_by.as_deref(), moved.contains(id));
+            (id.to_string(), body)
+        }
+        EntityRef::Proposal(id) => match snap.proposals.get(id) {
+            Some(p) => (
+                id.to_string(),
+                json!({
+                    "title": format!("Proposal: {}", p.fm.title),
+                    "body": p.body.trim(),
+                    "state": proposal_state(p.fm.status),
+                    "branch": branch,
+                }),
+            ),
+            // `close` moved it to proposals/closed/, where the snapshot keeps the id only
+            None if snap.closed_ids.contains(&id.to_string()) => {
+                (id.to_string(), json!({ "state": "done" }))
+            }
+            None => return None,
+        },
+        EntityRef::Decision(id) => {
+            let d = snap.decisions.get(id)?;
+            let scope = if d.fm.scope.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nScope: {}", d.fm.scope.join(", "))
+            };
+            (
+                id.to_string(),
+                json!({
+                    "title": format!("Decision: {}", d.fm.title),
+                    "body": format!("{}{scope}", d.body.trim()),
+                    "state": decision_state(d.fm.status),
+                    "branch": branch,
+                }),
+            )
+        }
+        EntityRef::Spec(_) | EntityRef::Quirk(_) => return None,
+    })
+}
+
+/// A proposal is open for discussion until it is approved; its tickets carry it after that.
+fn proposal_state(s: ProposalStatus) -> &'static str {
+    match s {
+        ProposalStatus::Draft | ProposalStatus::Review => "backlog",
+        ProposalStatus::Approved | ProposalStatus::Closed => "done",
+        ProposalStatus::Abandoned => "canceled",
+    }
+}
+
+fn decision_state(s: DecisionStatus) -> &'static str {
+    match s {
+        DecisionStatus::Proposed => "backlog",
+        DecisionStatus::Accepted => "done",
+        DecisionStatus::Superseded | DecisionStatus::Revoked => "canceled",
+    }
+}
+
+/// kanspec's five ticket states onto the board's columns. `backlog` is left for proposals
+/// and decisions still being discussed.
 fn board_state(s: State) -> &'static str {
     match s {
         State::Todo => "todo",
@@ -332,19 +416,23 @@ fn origin_slug(ctx: &Ctx) -> Option<String> {
 // the calls kanspec makes
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// After a write: push every ticket the plan touched, as the post-write snapshot has it.
-/// Runs after the lock is released, so a slow board never holds up another verb.
-pub fn mirror(ctx: &Ctx, snap: &Snapshot, ids: &[TicketId]) {
-    if ids.is_empty() {
+/// After a write: push every ticket, proposal and decision the plan touched, as the
+/// post-write snapshot has it; `moved` are the tickets whose state the write changed. Runs
+/// after the lock is released, so a slow board never holds up another verb.
+pub fn mirror(ctx: &Ctx, snap: &Snapshot, touched: &[EntityRef], moved: &[TicketId]) {
+    if touched.is_empty() {
         return;
     }
     let Some(hub) = Hub::open(ctx) else { return };
-    for id in ids {
-        let Some(t) = snap.tickets.get(id) else {
+    let branch = ctx.git.current_branch();
+    for e in touched {
+        let Some((id, body)) = payload(&hub, snap, e, branch.as_deref(), moved) else {
             continue;
         };
-        match hub.put(t, t.fm.claimed_by.as_deref()) {
+        match hub.put(&id, &body) {
             Ok(r) if r.ok() => {}
+            // a proposal closed before the board ever heard of it has nothing to close there
+            Ok(_) if body.get("title").is_none() => {}
             Ok(r) if r.status == 409 => warn(format!(
                 "the board disagrees about {id}: {}. `kanspec show {id}` has this repo's view",
                 r.error()
@@ -373,7 +461,7 @@ pub fn claim(ctx: &Ctx, t: &Ticket, who: &str) -> Result<()> {
     };
     let mut claimed = t.clone();
     claimed.fm.state = State::Doing;
-    match hub.put(&claimed, Some(who)) {
+    match hub.put(&t.fm.id.to_string(), &hub.ticket(&claimed, Some(who), true)) {
         Ok(r) if r.ok() => Ok(()),
         Ok(r) if r.status == 409 => {
             let id = &t.fm.id;
@@ -413,38 +501,76 @@ pub struct BoardComment {
     pub created: DateTime<Utc>,
 }
 
-/// For `prime`: recent comments on this project's tickets that someone else wrote — what
-/// other sessions want this one to know. `None` when the hub is off; empty when it is
-/// unreachable or quiet.
-pub fn recent_comments(ctx: &Ctx) -> Option<Vec<BoardComment>> {
+/// Work on the board this checkout cannot see: a ticket, proposal or decision that so far
+/// lives only on another branch or clone, a ticket someone else holds there although this
+/// branch shows it free, and a board-only chore another session is on.
+#[derive(Debug, Serialize)]
+pub struct Elsewhere {
+    /// the kanspec id, or the board's key for a chore
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub claimed_by: Option<String>,
+    pub branch: Option<String>,
+    pub updated: DateTime<Utc>,
+}
+
+/// What `prime` shows from the board.
+#[derive(Debug, Default, Serialize)]
+pub struct BoardView {
+    pub comments: Vec<BoardComment>,
+    pub elsewhere: Vec<Elsewhere>,
+}
+
+/// For `prime`: what other sessions are doing and said, on any branch or in any clone. `None`
+/// when the hub is off; empty when the board is unreachable or quiet. The first failure ends
+/// it, so a board that is down costs `prime` one timeout, not three.
+pub fn board_view(ctx: &Ctx, snap: &Snapshot) -> Option<BoardView> {
     let mut hub = Hub::open(ctx)?;
     hub.timeout = hub.timeout.min(PRIME_TIMEOUT_SECS);
-    let since = (ctx.now - chrono::Duration::days(COMMENT_DAYS)).to_rfc3339();
-    let path = format!(
-        "/comments?project={}&since={}",
-        hub.project,
-        since.replace('+', "%2B")
-    );
-    let reply = match hub.call("GET", &path, None) {
-        Ok(r) if r.ok() => r,
+    let me = ctx.actor.label();
+    let since = (ctx.now - chrono::Duration::days(COMMENT_DAYS))
+        .to_rfc3339()
+        .replace('+', "%2B");
+    let p = hub.project.clone();
+    let mut view = BoardView::default();
+    let get = |path: String| match hub.call("GET", &path, None) {
+        Ok(r) if r.ok() => Some(r.body),
         Ok(r) => {
-            warn(format!(
-                "the board's comments are unavailable: {}",
-                r.error()
-            ));
-            return Some(Vec::new());
+            warn(format!("prime could not read the board: {}", r.error()));
+            None
         }
         Err(e) => {
             warn(format!(
-                "the board is unreachable ({e}); prime shows no board comments"
+                "the board is unreachable ({e}); prime shows nothing from it"
             ));
-            return Some(Vec::new());
+            None
         }
     };
-    let me = ctx.actor.label();
-    let mut out: Vec<BoardComment> = reply
-        .body
-        .as_array()
+    let Some(open) = get(format!("?project={p}")) else {
+        return Some(view);
+    };
+    // decided elsewhere and not merged here yet is the case that bites
+    let decided = get(format!("?project={p}&state=done&since={since}"));
+    let comments = decided
+        .is_some()
+        .then(|| get(format!("/comments?project={p}&since={since}")))
+        .flatten();
+
+    view.elsewhere = elsewhere(
+        snap,
+        &me,
+        open.as_array().into_iter().flatten().chain(
+            decided
+                .as_ref()
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten(),
+        ),
+    );
+    view.comments = comments
+        .as_ref()
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|c| {
@@ -461,9 +587,71 @@ pub fn recent_comments(ctx: &Ctx) -> Option<Vec<BoardComment>> {
         })
         .collect();
     // newest last, and only the last few
-    let skip = out.len().saturating_sub(COMMENT_TOP);
-    out.drain(..skip);
-    Some(out)
+    let skip = view.comments.len().saturating_sub(COMMENT_TOP);
+    view.comments.drain(..skip);
+    Some(view)
+}
+
+fn elsewhere<'a>(
+    snap: &Snapshot,
+    me: &str,
+    board: impl Iterator<Item = &'a Value>,
+) -> Vec<Elsewhere> {
+    let mut out: Vec<Elsewhere> = board
+        .filter_map(|t| {
+            let state = t["state"].as_str()?;
+            let holder = t["claimed_by"].as_str().filter(|h| *h != me);
+            let shown = match t["ref"].as_str() {
+                // a board-only chore matters while someone is on it
+                None => holder.is_some() && matches!(state, "in_progress" | "in_review"),
+                Some(r) => match known(snap, r) {
+                    Known::No => true,
+                    // this branch says free; the board says someone has it
+                    Known::Ticket(local) => holder.is_some() && holder != local.as_deref(),
+                    Known::Other => false,
+                },
+            };
+            shown.then(|| Elsewhere {
+                id: t["ref"]
+                    .as_str()
+                    .or_else(|| t["key"].as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                title: t["title"].as_str().unwrap_or_default().to_string(),
+                state: state.to_string(),
+                claimed_by: holder.map(str::to_string),
+                branch: t["branch"].as_str().map(str::to_string),
+                updated: t["updated"]
+                    .as_str()
+                    .and_then(|u| u.parse().ok())
+                    .unwrap_or(snap.now),
+            })
+        })
+        .collect();
+    out.sort_by_key(|e| std::cmp::Reverse(e.updated));
+    out.truncate(ELSEWHERE_TOP);
+    out
+}
+
+enum Known {
+    No,
+    /// a ticket this checkout has, with its local claim
+    Ticket(Option<String>),
+    Other,
+}
+
+fn known(snap: &Snapshot, id: &str) -> Known {
+    if let Some(t) = TicketId::parse(id).ok().and_then(|t| snap.tickets.get(&t)) {
+        return Known::Ticket(t.fm.claimed_by.clone());
+    }
+    let seen = snap.proposals.keys().any(|p| p.to_string() == id)
+        || snap.decisions.keys().any(|d| d.to_string() == id)
+        || snap.closed_ids.contains(id);
+    if seen {
+        Known::Other
+    } else {
+        Known::No
+    }
 }
 
 /// `kanspec hub <cmd>`
@@ -482,7 +670,7 @@ pub struct SyncReport {
     pub failed: Vec<String>,
 }
 
-/// `kanspec hub sync`: push every ticket, for a board that was down, a repo just pointed
+/// `kanspec hub sync`: push every ticket and open proposal and decision, for a board that was down, a repo just pointed
 /// at the board, or a claim made offline.
 pub fn sync(ctx: &Ctx, snap: &Snapshot) -> Result<SyncReport> {
     let Some(hub) = Hub::open(ctx) else {
@@ -495,17 +683,35 @@ pub fn sync(ctx: &Ctx, snap: &Snapshot) -> Result<SyncReport> {
     };
     hub.ensure_project()
         .map_err(|e| unreachable(&hub.base, &e))?;
+    let branch = ctx.git.current_branch();
     // dependencies first, so the board can link a ticket to the ones it waits on
-    let mut ids: Vec<&TicketId> = snap.tickets.keys().collect();
-    ids.sort_by_key(|id| snap.tickets[*id].fm.deps.len());
+    let mut tickets: Vec<&TicketId> = snap.tickets.keys().collect();
+    tickets.sort_by_key(|id| snap.tickets[*id].fm.deps.len());
+    let all: Vec<EntityRef> = tickets
+        .into_iter()
+        .map(|id| EntityRef::Ticket(id.clone()))
+        .chain(
+            snap.proposals
+                .keys()
+                .map(|id| EntityRef::Proposal(id.clone())),
+        )
+        .chain(
+            snap.decisions
+                .keys()
+                .map(|id| EntityRef::Decision(id.clone())),
+        )
+        .collect();
     let mut pushed = 0;
     let mut failed = Vec::new();
     for _pass in 0..2 {
         pushed = 0;
         failed.clear();
-        for id in &ids {
-            let t = &snap.tickets[*id];
-            match hub.put(t, t.fm.claimed_by.as_deref()) {
+        for e in &all {
+            // a free `todo` here may be started on another branch; the board keeps that
+            let Some((id, body)) = payload(&hub, snap, e, branch.as_deref(), &[]) else {
+                continue;
+            };
+            match hub.put(&id, &body) {
                 Ok(r) if r.ok() => pushed += 1,
                 Ok(r) => failed.push(format!("{id}: {}", r.error())),
                 Err(e) => return Err(unreachable(&hub.base, &e)),
@@ -546,7 +752,7 @@ impl crate::out::Render for SyncReport {
         }
         writeln!(
             w,
-            "pushed {} tickets to {}",
+            "pushed {} tickets, proposals and decisions to {}",
             self.pushed,
             self.project.as_deref().unwrap_or("the board")
         )?;
@@ -584,6 +790,42 @@ mod tests {
         );
         assert_eq!(without_log(&body), "Do it.\n\n## Steps\n- [ ] a");
         assert_eq!(without_log("plain"), "plain");
+    }
+
+    #[test]
+    fn proposals_and_decisions_close_when_decided() {
+        assert_eq!(proposal_state(ProposalStatus::Review), "backlog");
+        assert_eq!(proposal_state(ProposalStatus::Approved), "done");
+        assert_eq!(proposal_state(ProposalStatus::Abandoned), "canceled");
+        assert_eq!(decision_state(DecisionStatus::Proposed), "backlog");
+        assert_eq!(decision_state(DecisionStatus::Accepted), "done");
+        assert_eq!(decision_state(DecisionStatus::Revoked), "canceled");
+    }
+
+    #[test]
+    fn elsewhere_is_what_this_checkout_cannot_see() {
+        let now = Utc::now();
+        let mut snap = Snapshot::empty(crate::config::Config::default(), now);
+        snap.closed_ids.insert("p-1111".into());
+        let board = [
+            // proposed on another branch: shown
+            json!({"ref": "D-2c77", "title": "Decision: dates", "state": "backlog",
+                   "branch": "ks/t-9c41-x", "updated": now.to_rfc3339()}),
+            // this checkout has it: not shown
+            json!({"ref": "p-1111", "title": "Proposal: old", "state": "done"}),
+            // a chore someone else is on: shown
+            json!({"key": "kanspec-4", "title": "bump deps", "state": "in_progress",
+                   "claimed_by": "claude/other"}),
+            // my own chore, and an idle one: not shown
+            json!({"key": "kanspec-5", "title": "mine", "state": "in_progress",
+                   "claimed_by": "claude/me"}),
+            json!({"key": "kanspec-6", "title": "idle", "state": "todo"}),
+        ];
+        let got = elsewhere(&snap, "claude/me", board.iter());
+        let ids: Vec<&str> = got.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["D-2c77", "kanspec-4"]);
+        assert_eq!(got[0].branch.as_deref(), Some("ks/t-9c41-x"));
+        assert_eq!(got[1].claimed_by.as_deref(), Some("claude/other"));
     }
 
     #[test]
