@@ -634,11 +634,11 @@ fn check_dead_globs(s: &Snapshot) -> Vec<Finding> {
                  `prime` and the PostToolUse hook inject it for no path",
                 dead.join(", ")
             ),
-            format!("path globs match no files: {}", dead.join(", ")),
             format!(
-                "kanspec quirks --touch {}",
-                dead.first().map(String::as_str).unwrap_or_default()
+                "path globs match no files: {} — repeat --paths for every glob to keep",
+                dead.join(", ")
             ),
+            format!("kanspec quirk paths {id} --paths '<replacement-glob>'"),
         );
     }
     for (name, anchor) in &s.git.specs {
@@ -1524,7 +1524,7 @@ mod tests {
             "warns nobody: CI fails"
         );
         assert!(by("q-3c4d").message.contains("warns nobody"));
-        assert!(by("q-3c4d").fix.contains("quirks --touch"));
+        assert!(by("q-3c4d").fix.contains("quirk paths q-3c4d --paths"));
 
         // Nothing recorded, nothing found — the cache carries only rotted entries.
         s.git.decision_dead_globs.clear();

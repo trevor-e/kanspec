@@ -655,6 +655,14 @@ pub enum QuirkCommand {
         #[arg(long, value_name = "TICKET")]
         from: Option<String>,
     },
+    /// Replace the complete set of path globs where this quirk applies
+    Paths {
+        /// The quirk whose paths changed
+        id: String,
+        /// A replacement glob; repeat for every path the quirk should cover
+        #[arg(long = "paths", value_name = "GLOB", required = true)]
+        paths: Vec<String>,
+    },
     /// Retire a quirk by evidence — the ticket that actually fixed it
     Fix {
         /// The quirk that is now genuinely fixed

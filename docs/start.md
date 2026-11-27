@@ -55,7 +55,9 @@ any path you are about to touch.
   costs nothing.
 - **A landmine you learned the hard way** is a quirk:
   `kanspec quirk add "..." --paths 'src/billing/**'`. The `PostToolUse` hook re-warns the
-  next agent at the moment it writes a matching file.
+  next agent at the moment it writes a matching file. After a move, replace the full set
+  with `kanspec quirk paths q-11ba --paths 'src/payments/**' --paths 'src/refunds/**'`.
+  Repeat `--paths` for each glob to keep, then run `kanspec doctor`.
 - **A real architectural call** made mid-implementation is a decision:
   `kanspec decide "..." --from t-9c41`. It lands as *proposed*; only a human accepts it.
 - **Stopping for now?** `kanspec park t-9c41 --why "..."` puts it back in todo and releases

@@ -77,3 +77,55 @@ fn a_record_whose_every_glob_rotted_fails_doctor_and_a_partial_one_warns() {
         "the spec is still adrift:\n{out}"
     );
 }
+
+#[test]
+fn a_moved_file_can_be_repointed_without_losing_the_quirk() {
+    let repo = TestRepo::new();
+    let title = "Retry charges carefully";
+    let added: serde_json::Value = repo.json(&[
+        "quirk",
+        "add",
+        title,
+        "--paths",
+        "src/billing/**",
+        "--sev",
+        "landmine",
+    ]);
+    let id = added["id"].as_str().unwrap();
+    repo.git(&["mv", "src/billing/charge.ts", "src/auth/payment.ts"]);
+    let doctor = repo.ks(["doctor"]);
+    assert_ne!(doctor.code, 0);
+    assert!(doctor.stdout.contains(&format!("quirk paths {id} --paths")));
+
+    let file = format!(".kanspec/quirks/{id}.md");
+    let original = repo.read(&file);
+    let invalid = repo.ks(["quirk", "paths", id, "--paths", "README.md", "--paths", "["]);
+    assert_ne!(invalid.code, 0);
+    assert_eq!(repo.read(&file), original);
+
+    let updated: serde_json::Value = repo.json(&[
+        "quirk",
+        "paths",
+        id,
+        "--paths",
+        "src/auth/payment.ts",
+        "--paths",
+        "README.md",
+    ]);
+    assert_eq!(
+        updated["paths"],
+        serde_json::json!(["src/auth/payment.ts", "README.md"])
+    );
+    repo.ks(["doctor"]).ok();
+    for file in ["src/auth/payment.ts", "README.md"] {
+        let listed: serde_json::Value = repo.json(&["quirks", "--touch", file]);
+        let quirk = &listed["rows"][0];
+        assert_eq!(quirk["id"], id);
+        assert_eq!(quirk["severity"], "landmine");
+    }
+    assert!(repo
+        .ks(["quirks", "--touch", "src/billing/charge.ts"])
+        .ok()
+        .stdout
+        .is_empty());
+}

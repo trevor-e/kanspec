@@ -188,6 +188,11 @@ fn cases() -> Vec<Case> {
             Needs::Bare,
         ),
         c(
+            "quirk paths",
+            &["quirk", "paths", "q-11ba", "--paths", "src/billing/**"],
+            Needs::Bare,
+        ),
+        c(
             "quirk fix",
             &["quirk", "fix", "q-11ba", "--by", "{id}"],
             Needs::Todo,
