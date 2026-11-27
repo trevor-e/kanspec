@@ -310,6 +310,7 @@ KNOWLEDGE
   kanspec features [--stale]          render the feature map; --stale lists tripwired specs
   kanspec spec show auth | kanspec spec grep "lockout"
   kanspec quirk add "..." --paths glob [--sev landmine] [--from t-x]
+  kanspec quirk paths q-11ba --paths glob [--paths glob ...]   replace all path globs
   kanspec quirk fix q-11ba --by t-x | kanspec quirks [--paths src/billing/**]
   kanspec prime [--json]              the agent working set (injected by hooks, ~1.5k tokens)
 ```

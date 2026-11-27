@@ -1,4 +1,4 @@
-//! `quirk add|fix` and `quirks [--paths] [--touch]`.
+//! `quirk add|paths|fix` and `quirks [--paths] [--touch]`.
 //!
 //! Capture friction near zero is why this registry accretes where ADR-era logs died; the
 //! `--touch` form is the PostToolUse hook, which re-warns **at the moment an agent writes
@@ -33,6 +33,12 @@ pub enum QuirkReport {
         source: Option<TicketId>,
         next: Vec<String>,
     },
+    PathsUpdated {
+        id: QuirkId,
+        title: String,
+        paths: Vec<String>,
+        next: Vec<String>,
+    },
     Fixed {
         id: QuirkId,
         title: String,
@@ -50,6 +56,7 @@ pub fn quirk(ctx: &Ctx, a: &QuirkArgs) -> Result<QuirkReport> {
             severity,
             from,
         } => add(ctx, title, paths, severity_of(*severity), from.as_deref()),
+        QuirkCommand::Paths { id, paths } => set_paths(ctx, id, paths),
         QuirkCommand::Fix { id, by } => fix_quirk(ctx, id, by),
     }
 }
@@ -108,6 +115,26 @@ fn add(
         paths: paths.to_vec(),
         severity,
         source,
+    })
+}
+
+fn set_paths(ctx: &Ctx, raw: &str, paths: &[String]) -> Result<QuirkReport> {
+    let id = QuirkId::parse(raw)?;
+    Scope::of(paths)?;
+    let done = Store::open(ctx).transact(None, &ctx.invocation(), |s, _m| {
+        s.quirk(&id)?;
+        Ok(Plan::of(vec![Op::SetFields {
+            entity: EntityRef::Quirk(id.clone()),
+            sets: vec![(Key::Quirk(QuirkKey::Paths), Yv::list(paths.to_vec()))],
+        }]))
+    })?;
+
+    let quirk = done.snapshot.quirk(&id)?;
+    Ok(QuirkReport::PathsUpdated {
+        id,
+        title: quirk.fm.title.clone(),
+        paths: quirk.fm.paths.clone(),
+        next: vec![format!("{} doctor", ctx.invoked_as)],
     })
 }
 
@@ -198,6 +225,14 @@ impl Render for QuirkReport {
                     )),
                 self.next(),
             ),
+            QuirkReport::PathsUpdated {
+                id, title, paths, ..
+            } => (
+                Line::new(glyph::OK, title.as_str())
+                    .id(crate::ids::label(id, title))
+                    .dim(format!("· paths: {}", paths.join(" "))),
+                self.next(),
+            ),
             QuirkReport::Fixed { id, title, by, .. } => (
                 Line::new(glyph::OK, format!("{title} — retired by {by}"))
                     .id(crate::ids::label(id, title)),
@@ -212,7 +247,9 @@ impl Render for QuirkReport {
 impl QuirkReport {
     fn next(&self) -> &[String] {
         match self {
-            QuirkReport::Added { next, .. } | QuirkReport::Fixed { next, .. } => next,
+            QuirkReport::Added { next, .. }
+            | QuirkReport::PathsUpdated { next, .. }
+            | QuirkReport::Fixed { next, .. } => next,
         }
     }
 }
